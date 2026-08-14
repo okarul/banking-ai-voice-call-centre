@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Operator surface. Deliberately not linked from the customer page. -->
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Agent Operations — ABC Demo Bank</title>
+    <link rel="stylesheet" href="dashboard.css" />
+  </head>
+  <body>
+    <header class="masthead">
+      <h1><span class="bank">ABC Demo Bank</span> — AI Voice Banking, Agent Operations Dashboard</h1>
+      <p>Live monitoring of voice banking agent sessions</p>
+    </header>
+
+    <main>
+      <section class="cards" id="summary-cards" aria-label="Summary metrics"></section>
+
+      <section class="capacity" aria-label="Voice agent capacity">
+        <h2>Voice Agent Capacity</h2>
+        <dl>
+          <div><dt>Active</dt><dd id="cap-active">—</dd></div>
+          <div><dt>Available</dt><dd id="cap-available">—</dd></div>
+          <div><dt>Configured</dt><dd id="cap-configured">—</dd></div>
+          <div><dt>Status</dt><dd id="cap-state">—</dd></div>
+        </dl>
+      </section>
+
+      <div class="controls">
+        <input
+          type="search"
+          id="search"
+          placeholder="Search agent session or client ID"
+          aria-label="Search by agent session or client ID"
+        />
+        <label>
+          Status
+          <select id="filter-status">
+            <option value="all">All</option>
+            <option value="active">Active</option>
+            <option value="completed">Completed</option>
+            <option value="error">Error</option>
+            <option value="rejected">Rejected</option>
+          </select>
+        </label>
+        <label>
+          Domain
+          <select id="filter-domain">
+            <option value="all">All</option>
+            <option value="authentication">Authentication</option>
+            <option value="account">Account</option>
+            <option value="loan">Loan</option>
+          </select>
+        </label>
+        <label>
+          Date
+          <select id="filter-period">
+            <option value="all">All</option>
+            <option value="today">Today</option>
+          </select>
+        </label>
+        <button type="button" id="refresh">Refresh</button>
+        <span class="refreshed">Last refreshed: <span id="last-refreshed">—</span></span>
+      </div>
+
+      <!-- Shown only when a refresh fails. The table keeps its last good data. -->
+      <p class="retrying" id="refresh-status" role="status" hidden></p>
+
+      <div class="split">
+        <div>
+          <div class="table-wrap">
+            <table id="agents">
+              <thead>
+                <tr>
+                  <th data-sort="agent_session_id">Agent Session</th>
+                  <th data-sort="status">Status</th>
+                  <th data-sort="client_id">Client ID</th>
+                  <th>Auth</th>
+                  <th data-sort="started_at">Start Time</th>
+                  <th>End Time</th>
+                  <th data-sort="duration_seconds">Active Time</th>
+                  <th data-sort="current_domain">Domain</th>
+                  <th>Last Intent</th>
+                  <th data-sort="tool_calls">Tools</th>
+                  <th>In</th>
+                  <th>Out</th>
+                  <th data-sort="total_tokens">Total Tokens</th>
+                  <th>Est. Cost</th>
+                  <th>Est. CO2e</th>
+                  <th>Disconnect</th>
+                  <th>Conversation</th>
+                </tr>
+              </thead>
+              <tbody id="agents-body">
+                <tr>
+                  <td colspan="17" class="notice">Loading agent sessions…</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="controls" style="margin-top: 12px">
+            <button type="button" id="prev-page">Previous</button>
+            <span id="page-info" class="refreshed" style="margin-left: 0">—</span>
+            <button type="button" id="next-page">Next</button>
+          </div>
+
+          <p class="footnote" id="estimate-note"></p>
+        </div>
+
+        <aside class="panel" aria-label="Recent events">
+          <h2>Recent Events</h2>
+          <ul class="events" id="events">
+            <li>No events yet.</li>
+          </ul>
+        </aside>
+      </div>
+    </main>
+
+    <script type="module" src="dashboard.js"></script>
+  </body>
+</html>

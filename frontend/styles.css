@@ -1,0 +1,312 @@
+/* A handset, drawn plainly. Restraint is the point: a bank's phone line
+   should look calm, and every pixel here is in service of one obvious button. */
+
+:root {
+  --ink: #0f1b2d;
+  --muted: #5b6b80;
+  --line: #dfe5ec;
+  --page: #eef1f5;
+  --card: #ffffff;
+  --brand: #0b4f8a;
+  --brand-dark: #083c69;
+  --danger: #b3261e;
+  --live: #1a7f47;
+  --warn: #b06f00;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--page);
+  color: var(--ink);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+.handset {
+  width: 100%;
+  max-width: 420px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 32px 28px 24px;
+  box-shadow: 0 10px 30px rgba(15, 27, 45, 0.08);
+}
+
+.brand {
+  text-align: center;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 18px;
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 24px;
+  letter-spacing: 0.02em;
+  color: var(--brand);
+}
+
+.product {
+  margin: 6px 0 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.reassurance {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 20px;
+  font-size: 14px;
+}
+
+.status-label {
+  color: var(--muted);
+}
+
+#status-text {
+  font-weight: 600;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.dot[data-state="Connecting"],
+.dot[data-state="Ending"] {
+  background: var(--warn);
+}
+
+.dot[data-state="Connected"] {
+  background: var(--live);
+}
+
+.dot[data-state="Muted"] {
+  background: var(--brand);
+}
+
+.dot[data-state="Error"] {
+  background: var(--danger);
+}
+
+.timer {
+  margin-top: 14px;
+  text-align: center;
+}
+
+.timer-label {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+#timer {
+  font-size: 30px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 300;
+}
+
+.indicators {
+  display: flex;
+  justify-content: center;
+  gap: 20px;
+  margin-top: 12px;
+  min-height: 20px;
+}
+
+.indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  opacity: 0.35;
+  transition: opacity 0.15s ease;
+}
+
+.indicator.active {
+  opacity: 1;
+  color: var(--ink);
+}
+
+.pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.indicator.active .pulse {
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.5);
+    opacity: 0.45;
+  }
+}
+
+.controls {
+  margin-top: 22px;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.primary {
+  width: 100%;
+  padding: 15px;
+  font-size: 17px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--brand);
+}
+
+.primary:hover:not(:disabled) {
+  background: var(--brand-dark);
+}
+
+.secondary-row {
+  display: flex;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.secondary,
+.danger {
+  flex: 1;
+  padding: 11px;
+  font-size: 14px;
+  font-weight: 600;
+  background: #fff;
+}
+
+.secondary {
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.secondary.on {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+}
+
+.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.danger:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
+}
+
+.message {
+  margin: 14px 0 0;
+  min-height: 18px;
+  font-size: 13px;
+  text-align: center;
+  color: var(--danger);
+}
+
+.foot {
+  margin-top: 20px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  text-align: center;
+}
+
+.synthetic {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.link {
+  margin-top: 8px;
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: 11px;
+  color: var(--muted);
+  text-decoration: underline;
+}
+
+.debug {
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fafbfc;
+  font-size: 12px;
+}
+
+.debug dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin: 0;
+}
+
+.debug dt {
+  color: var(--muted);
+}
+
+.debug dd {
+  margin: 0;
+  font-family: Consolas, "SF Mono", monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.debug-heading {
+  margin: 12px 0 4px;
+  color: var(--muted);
+}
+
+.transcript {
+  margin: 0;
+  padding-left: 16px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.transcript li {
+  margin-bottom: 4px;
+}

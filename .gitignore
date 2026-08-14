@@ -1,0 +1,83 @@
+# Repository-wide exclusions.
+#
+# `backend/.gitignore` already protects the backend tree. This file is the
+# root-level backstop so the same rules apply everywhere, including anything
+# added later outside backend/ — the cost of a missed rule here is a credential
+# in history, which cannot be taken back by deleting the file afterwards.
+
+# --- secrets: never commit any of these -------------------------------------
+.env
+.env.*
+!.env.example
+*.env
+!*.env.example
+secrets/
+credentials/
+credentials.json
+*credentials*.json
+*.pem
+*.key
+*.pfx
+*.p12
+*.keystore
+service-account*.json
+*token*.json
+!package.json
+!package-lock.json
+
+# --- virtual environments and dependencies ----------------------------------
+.venv/
+venv/
+env/
+ENV/
+node_modules/
+
+# --- Python build and cache artifacts ---------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# --- test and tooling caches ------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# --- logs and temporary files -----------------------------------------------
+# Logs can carry request detail, so they stay out of the repository entirely.
+*.log
+logs/
+tmp/
+temp/
+scratch/
+*.tmp
+*.bak
+*.orig
+
+# --- generated audio from voice checks --------------------------------------
+backend/scripts/voice_output/
+*.wav
+*.pcm
+
+# --- IDE and OS -------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+ehthumbs.db
+.DS_Store
+
+# --- backups (kept outside the repository, never inside it) -----------------
+backups/
+*-backup/
+*.zip
+*.7z
+*.tar.gz

@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ABC Demo Bank — AI Voice Banking</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!--
+      A telephone, not a chat window. There is deliberately no text field
+      anywhere on this page: the only way to speak to the bank is to speak.
+    -->
+    <main class="handset">
+      <header class="brand">
+        <h1>ABC Demo Bank</h1>
+        <p class="product">AI Voice Banking</p>
+        <p class="reassurance">Secure Demo Banking Session</p>
+      </header>
+
+      <section class="status" aria-live="polite">
+        <span id="status-dot" class="dot" data-state="Disconnected"></span>
+        <span class="status-label">Status:</span>
+        <span id="status-text">Disconnected</span>
+      </section>
+
+      <section class="timer">
+        <span class="timer-label">Call Duration</span>
+        <span id="timer">00:00</span>
+      </section>
+
+      <section class="indicators" aria-hidden="true">
+        <span id="caller-indicator" class="indicator">
+          <span class="pulse"></span> You
+        </span>
+        <span id="assistant-indicator" class="indicator">
+          <span class="pulse"></span> ABC Demo Bank
+        </span>
+      </section>
+
+      <section class="controls">
+        <button id="start-call" class="primary" type="button">Start Call</button>
+        <div class="secondary-row">
+          <button id="mute" class="secondary" type="button" disabled>Mute</button>
+          <button id="end-call" class="danger" type="button" disabled>End Call</button>
+        </div>
+      </section>
+
+      <p id="message" class="message" role="status"></p>
+
+      <footer class="foot">
+        <p class="synthetic">
+          Demonstration only. All customers, accounts and loans are synthetic.
+        </p>
+        <button id="debug-toggle" class="link" type="button">Developer view</button>
+      </footer>
+
+      <!--
+        Developer view. Hidden by default and never required to make a call.
+        It shows the assistant's own words only — the caller's speech, which
+        includes the spoken PIN, is never transcribed or displayed.
+      -->
+      <section id="debug" class="debug" hidden>
+        <dl>
+          <dt>Banking session</dt>
+          <dd id="debug-session">—</dd>
+          <dt>Realtime session</dt>
+          <dd id="debug-realtime">—</dd>
+          <dt>Connection</dt>
+          <dd id="debug-connection">—</dd>
+          <dt>Authenticated</dt>
+          <dd id="debug-authenticated">—</dd>
+          <dt>Customer</dt>
+          <dd id="debug-customer">—</dd>
+          <dt>Current domain</dt>
+          <dd id="debug-domain">—</dd>
+          <dt>Last event</dt>
+          <dd id="debug-event">—</dd>
+          <dt>Tools called</dt>
+          <dd id="debug-tools">—</dd>
+        </dl>
+        <p class="debug-heading">Assistant transcript</p>
+        <ul id="debug-transcript" class="transcript"></ul>
+      </section>
+    </main>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

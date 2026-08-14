@@ -1,0 +1,19 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pytest
+httpx
+
+# Phase 2 - database
+sqlalchemy
+psycopg[binary]
+
+# Phase 9 - OpenAI Realtime voice.
+# `openai-agents` is the official OpenAI Agents SDK for Python; its realtime
+# layer (agents.realtime) connects to OpenAI over a server-side WebSocket.
+# The `voice` extra is for the SDK's separate speech pipeline and is not
+# required by the realtime layer, so it is deliberately not installed.
+# Pinned: the realtime API surface is still moving, and Phase 9 was written
+# against these exact versions.
+openai-agents==0.20.0
+openai==2.54.0

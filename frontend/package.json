@@ -1,0 +1,10 @@
+{
+  "name": "abc-demo-bank-voice-frontend",
+  "private": true,
+  "type": "module",
+  "description": "Browser telephone for the ABC Demo Bank voice banking demonstration.",
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.js\"",
+    "start": "python serve.py"
+  }
+}

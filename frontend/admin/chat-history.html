@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Conversation History — ABC Demo Bank</title>
+    <link rel="stylesheet" href="dashboard.css" />
+  </head>
+  <body>
+    <header class="masthead">
+      <h1><span class="bank">ABC Demo Bank</span> — Voice Banking Conversation History</h1>
+      <p>One agent session only. Authentication turns are redacted.</p>
+    </header>
+
+    <main>
+      <a class="back" href="agents.html">&larr; Back to Agent Operations</a>
+
+      <section class="panel" aria-label="Session information">
+        <h2>Session</h2>
+        <dl class="summary-grid" id="session-summary">
+          <dt>Agent Session ID</dt><dd id="s-id">—</dd>
+        </dl>
+      </section>
+
+      <section class="panel" style="margin-top: 16px" aria-label="Conversation">
+        <h2>Conversation</h2>
+        <ul class="turns" id="turns">
+          <li class="notice">Loading conversation…</li>
+        </ul>
+      </section>
+
+      <p class="footnote">
+        The customer's spoken PIN is never recorded. Authentication turns appear
+        as placeholders because the underlying speech contained a credential.
+      </p>
+    </main>
+
+    <script type="module" src="history.js"></script>
+  </body>
+</html>

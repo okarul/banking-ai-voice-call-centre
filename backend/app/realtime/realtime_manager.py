@@ -1,0 +1,531 @@
+"""Lifecycle for realtime voice calls, keyed by banking session.
+
+One banking session may have at most one realtime call attached to it:
+
+    SESSION-<uuid>  (customer identity, authentication, context)
+            |
+            +-- REALTIME-<uuid>  (audio in, audio out)
+
+The banking session stays the source of truth. A realtime call is an interface
+onto it and nothing more, which is why closing a call never destroys the
+session behind it — those are two separate lifecycles and Phase 10's End Call
+button will drive them in order.
+
+There is no module-level customer state here. Connections live in a dictionary
+keyed by banking session id, guarded by a lock, in the same shape as the
+existing SessionManager. Nothing about a customer is ever stored at module
+level, so two calls can never see each other.
+
+How the OpenAI connection is opened is injected (`connect`), so the lifecycle
+can be tested exhaustively without a network, an API key or paid usage.
+"""
+
+import asyncio
+import logging
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable
+
+from app.realtime.context import BankingRealtimeContext
+from app.realtime.events import log_event
+from app.realtime.turn_gate import open_turn, record_turn
+from app.sessions import SessionManager, SessionNotFoundError
+from app.sessions import session_manager as default_manager
+
+logger = logging.getLogger("app.realtime")
+
+
+class Reason:
+    """Reasons a realtime lifecycle operation can fail."""
+
+    SESSION_NOT_FOUND = "SESSION_NOT_FOUND"
+    REALTIME_ALREADY_ACTIVE = "REALTIME_ALREADY_ACTIVE"
+    REALTIME_NOT_ACTIVE = "REALTIME_NOT_ACTIVE"
+    REALTIME_NOT_CONFIGURED = "REALTIME_NOT_CONFIGURED"
+    REALTIME_CONNECTION_FAILED = "REALTIME_CONNECTION_FAILED"
+    REALTIME_AT_CAPACITY = "REALTIME_AT_CAPACITY"
+
+
+# What the caller is told. Short, and about the bank rather than about its
+# suppliers: no provider name, no limit figure, no configuration, no error code.
+MESSAGES = {
+    Reason.SESSION_NOT_FOUND: "No active banking session with that id.",
+    Reason.REALTIME_ALREADY_ACTIVE: "A voice call is already active on this session.",
+    Reason.REALTIME_NOT_ACTIVE: "No voice call is active on this session.",
+    Reason.REALTIME_NOT_CONFIGURED: "Realtime voice is not configured on this server.",
+    Reason.REALTIME_CONNECTION_FAILED: "Could not open the voice connection.",
+    Reason.REALTIME_AT_CAPACITY: (
+        "Voice banking is temporarily busy. Please try again shortly."
+    ),
+}
+
+
+class RealtimeSessionError(Exception):
+    """Raised when a realtime call cannot be started, used or closed.
+
+    Named to avoid confusion with `agents.realtime.RealtimeError`, which is an
+    event type from the SDK rather than an exception. Carries a
+    machine-readable reason and a message that never contains a key, a PIN or
+    any provider detail.
+    """
+
+    def __init__(self, reason: str, **details) -> None:
+        self.reason = reason
+        self.message = MESSAGES.get(reason, "Voice call unavailable.")
+        self.details = details
+        super().__init__(self.message)
+
+    def to_dict(self) -> dict:
+        return {"success": False, "reason": self.reason, **self.details}
+
+
+def new_realtime_session_id() -> str:
+    """Return a unique realtime call identifier, e.g. REALTIME-9f4c2e78-...."""
+    return f"REALTIME-{uuid.uuid4()}"
+
+
+@dataclass
+class RealtimeConnection:
+    """One live voice call and the banking session it is bound to."""
+
+    banking_session_id: str
+    realtime_session_id: str
+    session: Any
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    pump: asyncio.Task | None = None
+
+    def to_safe_dict(self) -> dict:
+        """Safe view for development endpoints.
+
+        Deliberately carries no API key, no customer identity and no audio.
+        """
+        return {
+            "session_id": self.banking_session_id,
+            "realtime_session_id": self.realtime_session_id,
+            "started_at": self.started_at.isoformat(),
+            "active": True,
+        }
+
+
+Connector = Callable[[BankingRealtimeContext], Awaitable[Any]]
+EventHandler = Callable[[str, Any], Any]
+
+
+def _user_text(item: Any) -> str:
+    """What the caller said, from a user history item.
+
+    Content entries carry either a transcript (spoken) or text (typed). Used to
+    classify the turn and then discarded — it is never stored or logged, because
+    on the authentication turns it contains the spoken PIN.
+    """
+    parts = []
+    for entry in getattr(item, "content", None) or []:
+        said = getattr(entry, "transcript", None) or getattr(entry, "text", None)
+        if said:
+            parts.append(said)
+    return " ".join(parts)
+
+
+async def open_openai_session(context: BankingRealtimeContext):
+    """Open a real OpenAI Realtime session for one banking call.
+
+    Transport is the SDK's server-side WebSocket model: this Python process
+    connects to OpenAI directly. No browser and no WebRTC is involved, and the
+    API key never leaves this process. Imports are local so the rest of the
+    application — and the whole deterministic test suite — does not depend on
+    the OpenAI SDK being importable.
+    """
+    from agents.realtime import RealtimeRunner
+
+    from app.config import settings
+    from app.realtime.banking_realtime import build_banking_agent, run_config
+
+    if not settings.realtime_configured:
+        raise RealtimeSessionError(Reason.REALTIME_NOT_CONFIGURED)
+
+    runner = RealtimeRunner(starting_agent=build_banking_agent(), config=run_config())
+    session = await runner.run(
+        context=context,
+        model_config={"api_key": settings.openai_api_key},
+    )
+    await session.enter()
+    return session
+
+
+class RealtimeManager:
+    """Starts, tracks and closes realtime voice calls."""
+
+    def __init__(
+        self,
+        *,
+        connect: Connector | None = None,
+        manager: SessionManager = default_manager,
+        max_active: int | None = None,
+    ) -> None:
+        self._connect = connect or open_openai_session
+        self._manager = manager
+        self._connections: dict[str, RealtimeConnection] = {}
+        # Slots claimed by callers whose provider connection is still being
+        # opened. They hold capacity but are not yet callable connections.
+        self._reserved: set[str] = set()
+        self._lock = asyncio.Lock()
+        # None means "read the configured limit each time", so an operator can
+        # change REALTIME_MAX_ACTIVE_SESSIONS without rebuilding the manager.
+        # An explicit value is for tests.
+        self._max_active = max_active
+
+    @property
+    def max_active(self) -> int:
+        """How many calls may be open at once. 0 means no limit."""
+        if self._max_active is not None:
+            return self._max_active
+        from app.config import settings
+
+        return settings.realtime_max_active_sessions
+
+    def used_capacity(self) -> int:
+        """Slots in use: established calls plus attempts still connecting.
+
+        Reservations are counted because opening a provider connection takes
+        seconds, and a slot that is being filled is not free. Counting only
+        established connections would let every caller who arrives during that
+        window pass the check.
+
+        Banking sessions are deliberately not counted. A session with no voice
+        call attached consumes no provider capacity, and one that has ended
+        consumes none either.
+        """
+        return len(self._connections) + len(self._reserved)
+
+    def at_capacity(self) -> bool:
+        """Whether a new call would exceed the configured ceiling."""
+        limit = self.max_active
+        return bool(limit) and self.used_capacity() >= limit
+
+    # --- admission --------------------------------------------------------
+
+    def _admit(self, banking_session_id: str) -> None:
+        """Claim one slot. **The lock must already be held.**
+
+        Check and reserve happen in the same critical section, which is the
+        whole point: reading the count, deciding, and taking the slot cannot be
+        interleaved with another caller doing the same.
+        """
+        if self._manager.get_session(banking_session_id) is None:
+            raise RealtimeSessionError(Reason.SESSION_NOT_FOUND)
+
+        if banking_session_id in self._connections or (
+            banking_session_id in self._reserved
+        ):
+            raise RealtimeSessionError(Reason.REALTIME_ALREADY_ACTIVE)
+
+        if self.at_capacity():
+            logger.warning(
+                "realtime[%s] refused: at capacity (%s in use, limit %s)",
+                banking_session_id,
+                self.used_capacity(),
+                self.max_active,
+            )
+            raise RealtimeSessionError(Reason.REALTIME_AT_CAPACITY)
+
+        self._reserved.add(banking_session_id)
+
+    async def reserve(self, banking_session_id: str) -> None:
+        """Atomically claim a capacity slot before doing anything expensive.
+
+        Callers that must spend something before connecting — the browser path
+        mints a paid client secret first — reserve here, so the spend only
+        happens for a caller that has actually been admitted. The reservation is
+        consumed by `start(reserved=True)`, or returned by `release()`.
+        """
+        async with self._lock:
+            self._admit(banking_session_id)
+
+    async def release(self, banking_session_id: str) -> None:
+        """Return an unused reservation. Safe to call when none is held."""
+        async with self._lock:
+            self._reserved.discard(banking_session_id)
+
+    # --- queries ----------------------------------------------------------
+
+    def get(self, banking_session_id: str) -> RealtimeConnection | None:
+        """The live call on this banking session, or None."""
+        return self._connections.get(banking_session_id)
+
+    def is_active(self, banking_session_id: str) -> bool:
+        return banking_session_id in self._connections
+
+    def active_count(self) -> int:
+        return len(self._connections)
+
+    def active_session_ids(self) -> list[str]:
+        return sorted(self._connections)
+
+    def require(self, banking_session_id: str) -> RealtimeConnection:
+        """The live call, or raise REALTIME_NOT_ACTIVE."""
+        connection = self._connections.get(banking_session_id)
+        if connection is None:
+            raise RealtimeSessionError(Reason.REALTIME_NOT_ACTIVE)
+        return connection
+
+    # --- lifecycle --------------------------------------------------------
+
+    async def start(
+        self,
+        banking_session_id: str,
+        *,
+        on_event: EventHandler | None = None,
+        reserved: bool = False,
+    ) -> RealtimeConnection:
+        """Open a voice call on an existing banking session.
+
+        The banking session need not be authenticated: verifying the caller by
+        voice is the first thing the call does. It must exist, though — a voice
+        call is never the thing that creates a customer session.
+
+        Three phases, and only the first and last hold the lock:
+
+        1. **reserve** — check capacity and take a slot, atomically
+        2. **connect** — talk to the provider, *outside* the lock
+        3. **register** — convert the reservation into a live connection
+
+        Connecting outside the lock matters: a live provider handshake takes
+        several seconds, and holding the lock across it would serialise every
+        caller behind the one currently connecting. Three students starting
+        together would wait eight, sixteen and twenty-four seconds instead of
+        eight each.
+
+        Pass `reserved=True` if the caller already holds a slot from
+        `reserve()`. Either way this method consumes the reservation: on success
+        it becomes a connection, on any failure it is released.
+
+        If the connection cannot be opened, the banking session is left exactly
+        as it was: no realtime id is recorded, no state is cleared, and the slot
+        is given back immediately.
+        """
+        if not reserved:
+            await self.reserve(banking_session_id)
+
+        context = BankingRealtimeContext(
+            session_id=banking_session_id, manager=self._manager
+        )
+
+        try:
+            session = await self._connect(context)
+        except RealtimeSessionError:
+            await self.release(banking_session_id)
+            raise
+        except Exception as error:
+            # Nothing has been written to the banking session yet, so it is
+            # already intact. Do not leak the provider's error text.
+            await self.release(banking_session_id)
+            logger.error(
+                "realtime[%s] connection failed: %s",
+                banking_session_id,
+                type(error).__name__,
+            )
+            raise RealtimeSessionError(Reason.REALTIME_CONNECTION_FAILED) from error
+
+        connection = RealtimeConnection(
+            banking_session_id=banking_session_id,
+            realtime_session_id=new_realtime_session_id(),
+            session=session,
+        )
+
+        async with self._lock:
+            # The slot stops being a reservation and starts being a call. Both
+            # are counted, so capacity never dips between the two.
+            self._reserved.discard(banking_session_id)
+
+            try:
+                self._manager.update_session(
+                    banking_session_id,
+                    realtime_session_id=connection.realtime_session_id,
+                )
+            except SessionNotFoundError as error:
+                # The call ended while the connection was being opened.
+                await self._shutdown(connection)
+                raise RealtimeSessionError(Reason.SESSION_NOT_FOUND) from error
+
+            self._connections[banking_session_id] = connection
+
+            # Pumped whenever there is a stream to pump, handler or not: the
+            # scope gate is fed from this stream, so it must run even when
+            # nobody is watching the events.
+            #
+            # A browser call has no stream on this side — its audio and its
+            # events belong to the page's own peer connection, and its turns are
+            # classified through POST /api/call/scope. Starting a pump on one
+            # would spawn a task per call that could only fail.
+            if hasattr(session, "__aiter__"):
+                connection.pump = asyncio.create_task(
+                    self._pump_events(connection, on_event)
+                )
+
+            logger.info(
+                "realtime[%s] started as %s",
+                banking_session_id,
+                connection.realtime_session_id,
+            )
+            return connection
+
+    async def close(self, banking_session_id: str) -> bool:
+        """End the voice call, leaving the banking session in place.
+
+        Returns False if there was no call, so ending one twice is harmless.
+        This never destroys the customer session and never touches any other
+        session's connection.
+        """
+        async with self._lock:
+            connection = self._connections.pop(banking_session_id, None)
+            if connection is None:
+                return False
+
+            await self._shutdown(connection)
+
+            try:
+                self._manager.update_session(
+                    banking_session_id, realtime_session_id=None
+                )
+            except SessionNotFoundError:
+                # The banking session has already ended. Nothing to clear.
+                pass
+
+            logger.info(
+                "realtime[%s] closed %s",
+                banking_session_id,
+                connection.realtime_session_id,
+            )
+            return True
+
+    async def close_all(self) -> int:
+        """Close every live call. Used on shutdown and by tests."""
+        count = 0
+        for banking_session_id in list(self._connections):
+            if await self.close(banking_session_id):
+                count += 1
+        return count
+
+    # --- conversation -----------------------------------------------------
+
+    async def send_audio(self, banking_session_id: str, audio: bytes) -> None:
+        """Send one chunk of caller audio (PCM16) into the call."""
+        connection = self.require(banking_session_id)
+        await connection.session.send_audio(audio)
+
+    async def send_message(self, banking_session_id: str, text: str) -> None:
+        """Send a text message into the call, mainly for development checks."""
+        connection = self.require(banking_session_id)
+        await connection.session.send_message(text)
+
+    async def interrupt(self, banking_session_id: str) -> None:
+        """Stop the assistant's current spoken response.
+
+        Ordinary barge-in is handled by the model's own semantic VAD; this is
+        for an explicit interruption such as a Mute or Stop control.
+        """
+        connection = self.require(banking_session_id)
+        await connection.session.interrupt()
+
+    # --- internals --------------------------------------------------------
+
+    async def _pump_events(
+        self, connection: RealtimeConnection, on_event: EventHandler | None
+    ) -> None:
+        """Drive the scope gate from the event stream, and forward events on.
+
+        The pump runs whether or not anyone passed a handler, because the gate
+        depends on it: if events were only drained when a caller wanted to watch
+        them, a call with no observer would answer banking questions with no
+        turn ever classified.
+        """
+        try:
+            async for event in connection.session:
+                log_event(connection.banking_session_id, event)
+                self._feed_gate(connection.banking_session_id, event)
+                if on_event is None:
+                    continue
+                result = on_event(connection.banking_session_id, event)
+                if asyncio.iscoroutine(result):
+                    await result
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            # A failed pump must not take down the banking session.
+            logger.error(
+                "realtime[%s] event stream ended: %s",
+                connection.banking_session_id,
+                type(error).__name__,
+            )
+
+    def _feed_gate(self, banking_session_id: str, event: Any) -> None:
+        """Open and rule on caller turns as the events for them arrive.
+
+        Two signals matter, and nothing else here does:
+
+        * the caller starts speaking — the previous turn's ruling stops applying
+        * the caller's transcript is ready — this turn is classified
+
+        Text turns carry no audio and no transcription, so a user history item
+        is classified directly. A failure here must never break the call, but it
+        must also never quietly open the gate, so the turn is left pending and
+        the tools refuse.
+        """
+        session = self._manager.get_session(banking_session_id)
+        if session is None:
+            return
+
+        try:
+            kind = getattr(event, "type", "")
+
+            if kind == "raw_model_event":
+                data = getattr(event, "data", None)
+                raw_type = getattr(data, "type", None)
+                if raw_type == "input_audio_transcription_completed":
+                    record_turn(session, getattr(data, "transcript", "") or "")
+                    return
+                inner = getattr(data, "data", None)
+                if (
+                    isinstance(inner, dict)
+                    and inner.get("type") == "input_audio_buffer.speech_started"
+                ):
+                    open_turn(session)
+                return
+
+            if kind == "history_added":
+                item = getattr(event, "item", None)
+                if getattr(item, "role", None) == "user":
+                    text = _user_text(item)
+                    if text:
+                        record_turn(session, text)
+        except Exception as error:
+            logger.error(
+                "realtime[%s] scope gate could not read an event: %s",
+                banking_session_id,
+                type(error).__name__,
+            )
+
+    async def _shutdown(self, connection: RealtimeConnection) -> None:
+        """Release provider resources for one call, tolerating failures."""
+        if connection.pump is not None:
+            connection.pump.cancel()
+            try:
+                await connection.pump
+            except (asyncio.CancelledError, Exception):
+                pass
+            connection.pump = None
+
+        try:
+            await connection.session.close()
+        except Exception as error:
+            logger.error(
+                "realtime[%s] close failed: %s",
+                connection.banking_session_id,
+                type(error).__name__,
+            )
+
+
+# Shared manager for the running process. Holds connections keyed by banking
+# session id — never a place to put one customer's state.
+realtime_manager = RealtimeManager()
