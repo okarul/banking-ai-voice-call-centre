@@ -26,6 +26,7 @@ from app.database.connection import session_scope
 from app.database.models import AgentSession, AgentToolEvent, ConversationMessage
 from app.observability.estimates import estimate_carbon_grams, estimate_cost_usd
 from app.observability.redaction import redact_transcript
+from app.telephony.channels import Channel, normalise_channel
 
 logger = logging.getLogger("app.observability")
 
@@ -96,8 +97,18 @@ def _find(db, banking_session_id: str) -> AgentSession | None:
 
 
 @_safe("start_session")
-def start_session(banking_session_id: str) -> str | None:
-    """Record that a voice call has begun. Returns its operator-facing id."""
+def start_session(
+    banking_session_id: str,
+    *,
+    channel: Channel | str = Channel.WEBRTC,
+    provider_call_id: str | None = None,
+) -> str | None:
+    """Record that a voice call has begun. Returns its operator-facing id.
+
+    `channel` is how the audio arrived and nothing more. It is never read to
+    decide who the caller is: `customer_id` stays null here and is only written
+    by `record_authentication`, after the deterministic PIN check has passed.
+    """
     now = _now()
     with session_scope() as db:
         agent_session_id = _next_agent_session_id(db)
@@ -105,6 +116,8 @@ def start_session(banking_session_id: str) -> str | None:
             AgentSession(
                 agent_session_id=agent_session_id,
                 banking_session_id=banking_session_id,
+                channel=normalise_channel(channel).value,
+                provider_call_id=provider_call_id,
                 status=ACTIVE,
                 auth_status=PENDING,
                 authenticated=False,
@@ -342,7 +355,12 @@ def reconcile_active_sessions() -> int:
 
 
 @_safe("record_rejection")
-def record_rejection(reason: str = "CAPACITY_REJECTED") -> str | None:
+def record_rejection(
+    reason: str = "CAPACITY_REJECTED",
+    *,
+    channel: Channel | str = Channel.WEBRTC,
+    provider_call_id: str | None = None,
+) -> str | None:
     """Record a call that was refused admission and never became a session.
 
     It has no customer and no banking session — that is the point of refusing
@@ -356,6 +374,8 @@ def record_rejection(reason: str = "CAPACITY_REJECTED") -> str | None:
             AgentSession(
                 agent_session_id=agent_session_id,
                 banking_session_id=None,
+                channel=normalise_channel(channel).value,
+                provider_call_id=provider_call_id,
                 customer_id=None,
                 authenticated=False,
                 auth_status=PENDING,

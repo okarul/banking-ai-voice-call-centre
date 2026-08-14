@@ -148,7 +148,7 @@ async function refresh() {
     setStatus("Unable to refresh dashboard. Retrying…");
     if (!state.loadedOnce) {
       el("agents-body").innerHTML =
-        '<tr><td colspan="17" class="notice">Waiting for agent operations data…</td></tr>';
+        '<tr><td colspan="18" class="notice">Waiting for agent operations data…</td></tr>';
     }
     return false;
   } finally {

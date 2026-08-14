@@ -32,11 +32,13 @@ const HISTORY_HTML = admin("chat-history.html");
 const DASHBOARD_JS = admin("dashboard.js");
 const HISTORY_JS = admin("history.js");
 const RENDER_JS = admin("render.js");
+const DASHBOARD_CSS_TEXT = admin("dashboard.css");
 const CUSTOMER_HTML = readFileSync(join(HERE, "..", "index.html"), "utf8");
 const CUSTOMER_APP = readFileSync(join(HERE, "..", "app.js"), "utf8");
 
 const liveRow = {
   agent_session_id: "AGT-000001",
+  channel: "WEBRTC",
   status: "ACTIVE",
   client_id: "DEMO001",
   auth_status: "VERIFIED",
@@ -304,6 +306,39 @@ test("escapeHtml handles the characters that matter", () => {
 });
 
 // --- error handling ---------------------------------------------------------
+
+// --- channel column (telephony Phase 1) ------------------------------------
+
+test("a browser session shows the Web channel", () => {
+  const html = renderRow(liveRow, { now: Date.parse(liveRow.started_at) });
+
+  assert.match(html, /badge channel-webrtc/);
+  assert.match(html, />Web</);
+});
+
+test("a telephone session shows the Phone channel", () => {
+  const html = renderRow({ ...liveRow, channel: "PHONE" }, { now: Date.now() });
+
+  assert.match(html, /badge channel-phone/);
+  assert.match(html, />Phone</);
+});
+
+test("an unknown or missing channel reads as Web, never blank", () => {
+  for (const value of [undefined, null, "", "TELEPATHY"]) {
+    const html = renderRow({ ...liveRow, channel: value }, { now: Date.now() });
+    assert.match(html, /badge channel-webrtc/, String(value));
+  }
+});
+
+test("the channel is a neutral label, not a status", () => {
+  // A channel says how the audio arrived; it must not read as good or bad.
+  assert.match(DASHBOARD_CSS_TEXT, /\.badge\.channel-webrtc/);
+  assert.match(DASHBOARD_CSS_TEXT, /\.badge\.channel-phone/);
+});
+
+test("the dashboard offers a Channel column", () => {
+  assert.match(AGENTS_HTML, /<th data-sort="channel">Channel<\/th>/);
+});
 
 test("an API failure produces a safe operator message", () => {
   // The dashboard keeps its last good data and says it is retrying, rather

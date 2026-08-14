@@ -107,6 +107,46 @@ class Settings:
         # Where the dashboard is read. Times are stored in UTC and displayed in
         # this zone; the demo is run in Singapore.
         self.dashboard_timezone: str = os.getenv("DASHBOARD_TIMEZONE", "Asia/Singapore")
+
+        # --- telephony (Phase 1: foundation only) ------------------------
+        # Off unless deliberately switched on. While false, no SIP code
+        # initialises, no provider is contacted, no telephony route is
+        # registered, and the browser channel behaves exactly as before.
+        self.telephony_enabled: bool = _flag(os.getenv("TELEPHONY_ENABLED"), False)
+        self.telephony_provider: str = os.getenv("TELEPHONY_PROVIDER", "DIDWW")
+
+        # Public identifiers only. A DID number is published to callers by
+        # definition, and a SIP URI is a destination — neither is a secret.
+        # Credentials are deliberately absent from this object: see
+        # `docs/TELEPHONY_SECURITY_PRIVACY_DESIGN.md` for why they will be read
+        # at point of use rather than held here.
+        self.didww_did_number: str | None = os.getenv("DIDWW_DID_NUMBER") or None
+        self.sip_public_uri: str | None = os.getenv("SIP_PUBLIC_URI") or None
+        self.sip_provider_domain: str | None = os.getenv("SIP_PROVIDER_DOMAIN") or None
+
+        # Synthetic data only. This is a demonstration bank; turning it off
+        # would imply a real banking connector, and there is none.
+        self.demo_mode: bool = _flag(os.getenv("DEMO_MODE"), True)
+
+        # Tell callers they are speaking to an AI. Configuration exists now;
+        # the greeting itself is unchanged in Phase 1.
+        self.ai_disclosure_enabled: bool = _flag(
+            os.getenv("AI_DISCLOSURE_ENABLED"), True
+        )
+        self.ai_disclosure_text: str = os.getenv(
+            "AI_DISCLOSURE_TEXT",
+            "This is an AI-powered demonstration using synthetic banking data.",
+        )
+
+        # Retention intent, recorded so it is a decision rather than an
+        # accident. Phase 1 implements no deletion job — see the design note.
+        self.audit_retention_days: int = _positive_int(
+            os.getenv("AUDIT_RETENTION_DAYS"), default=30
+        )
+        self.transcript_retention_days: int = _positive_int(
+            os.getenv("TRANSCRIPT_RETENTION_DAYS"), default=7
+        )
+
         # Origins allowed to call the customer API. Named explicitly rather
         # than wildcarded: this list is what stops another page on this machine
         # from opening banking calls.
@@ -116,6 +156,39 @@ class Settings:
                 "http://127.0.0.1:5173,http://localhost:5173",
             )
         )
+
+    @property
+    def telephony_configured(self) -> bool:
+        """Whether a telephone channel could be opened at all.
+
+        Both halves are required: the flag *and* a destination. A flag switched
+        on against blank configuration is a misconfiguration, and it should read
+        as "not available" rather than as an attempt that fails later.
+        """
+        return bool(self.telephony_enabled and self.sip_public_uri)
+
+    def public_settings(self) -> dict:
+        """Non-sensitive settings, safe to log or show an operator.
+
+        An allow-list, not a filter. A denylist of secret names would silently
+        start leaking the first time somebody added a setting and forgot to
+        update it; this can only ever expose what is named here.
+        """
+        return {
+            "app_name": self.app_name,
+            "app_env": self.app_env,
+            "demo_mode": self.demo_mode,
+            "telephony_enabled": self.telephony_enabled,
+            "telephony_provider": self.telephony_provider,
+            "telephony_configured": self.telephony_configured,
+            "ai_disclosure_enabled": self.ai_disclosure_enabled,
+            "realtime_model": self.realtime_model,
+            "realtime_voice": self.realtime_voice,
+            "realtime_max_active_sessions": self.realtime_max_active_sessions,
+            "dashboard_timezone": self.dashboard_timezone,
+            "audit_retention_days": self.audit_retention_days,
+            "transcript_retention_days": self.transcript_retention_days,
+        }
 
     @property
     def realtime_configured(self) -> bool:

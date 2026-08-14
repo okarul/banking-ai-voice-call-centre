@@ -160,6 +160,20 @@ function orNa(value, render = (v) => String(v)) {
   return escapeHtml(render(value));
 }
 
+/**
+ * How the call arrived: browser or telephone.
+ *
+ * Operational information only. A channel says nothing about who the customer
+ * is — identity comes from the backend's PIN check — so this is a label, never
+ * a trust signal. Anything unrecognised reads as WEBRTC, matching the backend.
+ */
+export function channelBadge(value) {
+  const channel = String(value ?? "WEBRTC").toUpperCase();
+  const known = channel === "PHONE" ? "PHONE" : "WEBRTC";
+  const label = known === "PHONE" ? "Phone" : "Web";
+  return `<span class="badge channel-${known.toLowerCase()}">${escapeHtml(label)}</span>`;
+}
+
 function badge(value, fallback = "—") {
   if (!value) return escapeHtml(fallback);
   const kind = String(value).toLowerCase().replace(/[^a-z]/g, "");
@@ -182,6 +196,7 @@ export function renderRow(row, options = {}) {
     .join(" ");
   return `<tr class="${classes}">
     <td class="mono">${escapeHtml(row.agent_session_id)}</td>
+    <td>${channelBadge(row.channel)}</td>
     <td>${badge(row.status)}</td>
     <td>${row.client_id ? escapeHtml(row.client_id) : "—"}</td>
     <td>${badge(row.auth_status, "—")}</td>
@@ -207,7 +222,7 @@ export function renderRow(row, options = {}) {
 
 export function renderRows(rows, options = {}) {
   if (!rows || rows.length === 0) {
-    return '<tr><td colspan="17" class="notice">No agent sessions yet. Start a voice call to see one here.</td></tr>';
+    return '<tr><td colspan="18" class="notice">No agent sessions yet. Start a voice call to see one here.</td></tr>';
   }
   const fresh = new Set(options.newIds ?? []);
   return rows

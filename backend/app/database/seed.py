@@ -223,8 +223,52 @@ DEMO_CUSTOMERS: list[dict] = [
 
 
 def create_tables() -> None:
-    """Create any tables that do not exist yet."""
-    Base.metadata.create_all(get_engine())
+    """Create any tables that do not exist yet, and add any missing columns.
+
+    `create_all` only creates tables that are absent; it will not alter one
+    that already exists. The operational tables gain columns as the dashboard
+    grows, so a plain `create_all` on an existing database leaves the code
+    expecting columns the database does not have.
+
+    This is deliberately not a migration framework. It adds nullable columns
+    with defaults and never drops, renames or retypes anything, so it cannot
+    lose data — appropriate for a demonstration database that is rebuilt freely.
+    A production system would use Alembic.
+    """
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    _add_missing_columns(engine)
+
+
+# Columns added after the operational tables first shipped, with the SQL to add
+# them. Additive only: nothing here drops or rewrites existing data.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("agent_sessions", "channel", "VARCHAR(10) DEFAULT 'WEBRTC'"),
+    ("agent_sessions", "provider_call_id", "VARCHAR(64)"),
+)
+
+
+def _add_missing_columns(engine) -> list[str]:
+    """Add any column the models declare and the database lacks."""
+    from sqlalchemy import inspect as sqla_inspect
+    from sqlalchemy import text
+
+    inspector = sqla_inspect(engine)
+    added = []
+
+    for table, column, definition in _ADDED_COLUMNS:
+        if table not in inspector.get_table_names():
+            continue
+        existing = {info["name"] for info in inspector.get_columns(table)}
+        if column in existing:
+            continue
+        with engine.begin() as connection:
+            connection.execute(
+                text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            )
+        added.append(f"{table}.{column}")
+
+    return added
 
 
 def _insert_customer(session: Session, data: dict) -> None:

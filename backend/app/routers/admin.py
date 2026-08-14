@@ -30,6 +30,7 @@ from app.database.models import AgentSession, AgentToolEvent, ConversationMessag
 from app.observability.estimates import CARBON_NOTE, COST_NOTE
 from app.realtime.browser_calls import browser_call_manager
 from app.sessions import session_manager
+from app.telephony.channels import normalise_channel
 
 logger = logging.getLogger("app.admin")
 
@@ -81,6 +82,8 @@ def _row(record: AgentSession) -> dict:
     ended = _aware(record.ended_at)
     return {
         "agent_session_id": record.agent_session_id,
+        # How the audio arrived. Operational only — never an identity signal.
+        "channel": normalise_channel(record.channel).value,
         "status": record.status,
         "client_id": record.customer_id,
         "auth_status": record.auth_status,
@@ -264,6 +267,17 @@ def dashboard_summary() -> dict:
             "carbon_note": CARBON_NOTE,
         },
         "timezone": settings.dashboard_timezone,
+        # Which voice channels the bank is answering on. Telephony is off by
+        # default; the dashboard shows it so an operator can see that at a
+        # glance rather than inferring it from an absence of calls.
+        "channels": {
+            "webrtc_enabled": True,
+            "phone_enabled": settings.telephony_configured,
+            "telephony_provider": settings.telephony_provider
+            if settings.telephony_enabled
+            else None,
+        },
+        "demo_mode": settings.demo_mode,
         "server_time": datetime.now(timezone.utc).isoformat(),
     }
 

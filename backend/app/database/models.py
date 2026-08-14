@@ -137,6 +137,16 @@ class AgentSession(Base):
     authenticated: Mapped[bool] = mapped_column(default=False)
     auth_status: Mapped[str] = mapped_column(String(20), default="PENDING")
 
+    # How the audio reached the bank: WEBRTC today, PHONE once the telephone
+    # channel exists. Operational reporting only — a channel never decides who
+    # the customer is. See `app.telephony.channels`.
+    channel: Mapped[str] = mapped_column(String(10), default="WEBRTC", index=True)
+    # The provider's own call identifier, for correlating a telephone call with
+    # a provider's records. Null for browser calls, and never a customer id.
+    provider_call_id: Mapped[str | None] = mapped_column(
+        String(64), index=True, nullable=True
+    )
+
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE", index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     ended_at: Mapped[datetime | None] = mapped_column(

@@ -316,6 +316,11 @@ span.na {
 .badge.disconnected { background: var(--neutral-bg); color: var(--neutral); }
 .badge.error { background: var(--bad-bg); color: var(--bad); }
 .badge.rejected { background: var(--warn-bg); color: var(--bad); }
+/* Channel is neutral by design: it says how the audio arrived, not whether
+ * anything about the call is good or bad, so it must not read as a status. */
+.badge.channel-webrtc { background: var(--neutral-bg); color: var(--neutral); }
+.badge.channel-phone { background: var(--info-bg); color: var(--info); }
+
 .badge.verified { background: var(--ok-bg); color: var(--ok); }
 .badge.pending { background: var(--warn-bg); color: var(--warn); }
 .badge.failed { background: var(--bad-bg); color: var(--bad); }
