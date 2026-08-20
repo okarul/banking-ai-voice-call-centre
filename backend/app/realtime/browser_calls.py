@@ -53,6 +53,19 @@ async def open_browser_call(context: BankingRealtimeContext) -> BrowserCall:
 # `active_count()` ambiguous.
 browser_call_manager = RealtimeManager(connect=open_browser_call)
 
+# The same object under a channel-neutral name.
+#
+# This one manager is the application-wide voice ceiling: every live call, on
+# any channel, is registered here, so `used_capacity()` is the whole bank's
+# usage rather than one channel's. Its original name predates the telephone
+# channel, and renaming it would touch the working browser path for cosmetic
+# reasons — so new code refers to it by what it now is.
+#
+# A telephone call passes its own connector to `start(connect=...)`, because it
+# needs a real server-side model session where a browser call needs only a
+# stand-in. Same ceiling, same lifecycle, different transport.
+voice_call_manager = browser_call_manager
+
 
 def _last_touched(session) -> datetime:
     stamp = getattr(session, "updated_at", None) or getattr(session, "created_at", None)

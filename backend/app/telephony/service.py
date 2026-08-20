@@ -30,15 +30,45 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 
+import asyncio
+import time
+
+from app.config import settings
 from app.observability import recorder
 from app.observability.events import AuditEvent, safe_event
-from app.realtime.browser_calls import browser_call_manager
+from app.realtime.browser_calls import voice_call_manager
 from app.realtime.realtime_manager import Reason, RealtimeSessionError
 from app.sessions import session_manager
+from app.telephony.bridge import PhoneCallBridge, phone_call_registry
 from app.telephony.channels import Channel
+from app.telephony.media import LoopbackMediaTransport, WebSocketMediaTransport
 from app.telephony.schemas import InboundCallEvent, TelephonyEventType
 
 logger = logging.getLogger("app.telephony")
+
+
+async def open_phone_realtime_session(context):
+    """Open the model session that will talk to one telephone caller.
+
+    A thin named seam over the existing server-side connector. It exists so the
+    phone path has one place to be substituted in tests, and so the browser
+    path's connector can never be reached for a telephone call by accident.
+    """
+    from app.realtime.realtime_manager import open_openai_session
+
+    return await open_openai_session(context)
+
+
+def build_transport():
+    """The media transport for one call, chosen by configuration.
+
+    Provider specifics stop here. Everything above this line deals in µ-law
+    frames and knows nothing about sockets, gateways or SIP.
+    """
+    frames = settings.telephony_audio_queue_frames
+    if settings.telephony_media_transport == "loopback":
+        return LoopbackMediaTransport(max_frames=frames)
+    return WebSocketMediaTransport(max_frames=frames)
 
 
 class Outcome(str, Enum):
@@ -92,8 +122,70 @@ async def handle_event(payload: InboundCallEvent) -> EventResult:
     return await _end_call(payload)
 
 
+async def _on_call_lost(provider_call_id: str, banking_session_id: str) -> None:
+    """A call whose media or model failed underneath it.
+
+    Converges on the same teardown as every other ending, so a dropped model
+    session releases its capacity slot immediately rather than waiting minutes
+    for the idle sweep to notice a silent call.
+    """
+    logger.warning("telephony call lost: %s", provider_call_id)
+    await tear_down(provider_call_id, banking_session_id)
+    recorder.close_phone_call(provider_call_id, reason="PROVIDER_FAILURE")
+
+
+async def _watch_for_media(bridge: PhoneCallBridge) -> None:
+    """Give up on a call whose gateway never attaches its audio socket.
+
+    Without this a call announced by the provider but never streamed would hold
+    a capacity slot until the idle sweep, turning one gateway failure into a
+    slot missing from a five-slot bank for a quarter of an hour.
+    """
+    transport = bridge.transport
+    if not hasattr(transport, "wait_for_attach"):
+        return
+    if await transport.wait_for_attach(settings.telephony_media_connect_timeout):
+        return
+    logger.warning("telephony media never attached: %s", bridge.provider_call_id)
+    await tear_down(bridge.provider_call_id, bridge.banking_session_id)
+    recorder.mark_phone_call_rejected(
+        bridge.provider_call_id, reason="MEDIA_ATTACH_TIMEOUT"
+    )
+
+
+async def sweep_idle_calls() -> int:
+    """Close calls that have carried no audio for the configured timeout.
+
+    The backstop for the ending that never arrives: a provider that forgets to
+    send an `ended` event, a gateway that vanishes without closing its socket.
+    Neither is exotic, and both would otherwise hold a capacity slot until the
+    process restarted.
+
+    Run on each new call rather than on a timer, matching how the browser
+    channel sweeps: no background loop to supervise, and the check happens at
+    the only moment a leaked slot actually costs anybody anything.
+    """
+    timeout = settings.telephony_idle_call_timeout
+    if not timeout:
+        return 0
+
+    now = time.monotonic()
+    closed = 0
+    for bridge in phone_call_registry.all_bridges():
+        if now - bridge.last_activity < timeout:
+            continue
+        logger.info("telephony call idle, closing: %s", bridge.provider_call_id)
+        await tear_down(bridge.provider_call_id, bridge.banking_session_id)
+        recorder.close_phone_call(bridge.provider_call_id, reason="SILENCE_TIMEOUT")
+        closed += 1
+    return closed
+
+
 async def _register_incoming(payload: InboundCallEvent) -> EventResult:
     """Admit a new telephone call, or discover that it is already admitted."""
+    # Reclaim anything abandoned before deciding this caller cannot be served.
+    await sweep_idle_calls()
+
     # A banking session must exist before capacity can be claimed for it — the
     # admission check refuses to reserve a slot for a session it cannot find.
     # It is created unauthenticated, which is the only state a provider event
@@ -114,42 +206,125 @@ async def _register_incoming(payload: InboundCallEvent) -> EventResult:
         _audit(AuditEvent.CALL_RECEIVED, payload, reason="DUPLICATE_IGNORED")
         return EventResult(Outcome.DUPLICATE, payload.provider_event_id)
 
+    # The media path and the model session, built for this call and reachable
+    # from nothing else. The bridge is created before the model session because
+    # the session needs the bridge's event handler: that is what routes this
+    # caller's assistant audio to this caller's queue and no other.
+    bridge = PhoneCallBridge(
+        provider_call_id=payload.provider_call_id,
+        banking_session_id=session.session_id,
+        transport=build_transport(),
+        realtime_manager=voice_call_manager,
+        outbound_max_frames=settings.telephony_audio_queue_frames,
+        on_call_lost=_on_call_lost,
+    )
+
     try:
-        # `start` reserves a slot and registers the call in one step, the same
-        # way the browser path does. Registering rather than merely reserving
-        # matters for cleanup: a reservation is invisible to `close_all()` and
-        # to the idle sweep, so a telephone call whose end event never arrived
-        # would hold a capacity slot until the process restarted. A registered
-        # call can be closed by every route that already closes calls.
+        # `start` reserves a capacity slot and opens the model session in one
+        # step, on the single application-wide manager, so a telephone call
+        # consumes the same slot a browser call would. `connect` gives this call
+        # a real server-side session where a browser call needs only a stand-in;
+        # `on_event` binds the model's output to this bridge.
         #
-        # There is no media object on this side in Phase 2 — the same is true
-        # of a browser call, whose audio path belongs to the page — so the
-        # stand-in the manager creates is exactly the right shape. Phase 3
-        # replaces it with a real SIP media session.
-        await browser_call_manager.start(session.session_id)
-    except RealtimeSessionError as error:
+        # Registering rather than merely reserving matters for cleanup: a
+        # reservation is invisible to `close_all()` and to the idle sweep, so a
+        # call whose end event never arrived would hold a slot until restart.
+        await asyncio.wait_for(
+            voice_call_manager.start(
+                session.session_id,
+                on_event=bridge.on_realtime_event,
+                connect=open_phone_realtime_session,
+            ),
+            timeout=settings.telephony_realtime_connect_timeout,
+        )
+    except Exception as error:
         # Nothing half-open is left behind: the claim becomes a visible
         # refusal, the session is destroyed, and no slot is held. The claim row
         # stays so the same provider call cannot be admitted by a retry that
         # arrives a moment later when a slot has freed — a caller who was told
         # the lines were busy has been told, and a second answer to the same
         # call would be a surprise, not a recovery.
+        # Unwind everything this attempt created, in the reverse order it was
+        # created. `start` releases the capacity slot on any failure of its own,
+        # so what is left here is the bridge, the session and the claim row.
+        await bridge.close()
+        await voice_call_manager.release(session.session_id)
         recorder.mark_phone_call_rejected(payload.provider_call_id)
         session_manager.destroy_session(session.session_id)
-        reason = (
-            "CAPACITY_REJECTED"
-            if error.reason == Reason.REALTIME_AT_CAPACITY
-            else "UNAVAILABLE"
+
+        at_capacity = (
+            isinstance(error, RealtimeSessionError)
+            and error.reason == Reason.REALTIME_AT_CAPACITY
         )
+        if at_capacity:
+            reason = "CAPACITY_REJECTED"
+        elif isinstance(error, asyncio.TimeoutError):
+            reason = "REALTIME_TIMEOUT"
+        else:
+            reason = "UNAVAILABLE"
+        if not at_capacity:
+            # Type only. A provider or SDK message may carry request detail.
+            logger.error("telephony call could not start: %s", type(error).__name__)
         _audit(AuditEvent.CALL_REJECTED, payload, reason=reason)
         return EventResult(
             Outcome.REJECTED_CAPACITY, payload.provider_event_id, agent_session_id
         )
 
-    _audit(
-        AuditEvent.CALL_ACCEPTED, payload, agent_session_id=agent_session_id
-    )
+    # Registered only once the call is fully built. A bridge in the registry is
+    # a call that can carry audio, so putting it there any earlier would let a
+    # media socket attach to a call whose model session had not opened.
+    if not await phone_call_registry.register(bridge):
+        # Another event built this call between the database claim and here.
+        # The claim makes that all but impossible; unwinding anyway is cheaper
+        # than reasoning about whether "all but" is good enough.
+        await bridge.close()
+        await voice_call_manager.close(session.session_id)
+        session_manager.destroy_session(session.session_id)
+        _audit(AuditEvent.CALL_RECEIVED, payload, reason="DUPLICATE_IGNORED")
+        return EventResult(Outcome.DUPLICATE, payload.provider_event_id)
+
+    try:
+        await bridge.start()
+    except Exception as error:
+        await tear_down(payload.provider_call_id, session.session_id)
+        recorder.mark_phone_call_rejected(payload.provider_call_id)
+        logger.error("telephony media failed to start: %s", type(error).__name__)
+        _audit(AuditEvent.CALL_REJECTED, payload, reason="MEDIA_UNAVAILABLE")
+        return EventResult(
+            Outcome.REJECTED_CAPACITY, payload.provider_event_id, agent_session_id
+        )
+
+    # Watches for a gateway that never turns up. Exits by itself when the call
+    # ends, because ending the transport marks it attached.
+    asyncio.ensure_future(_watch_for_media(bridge))
+
+    _audit(AuditEvent.CALL_ACCEPTED, payload, agent_session_id=agent_session_id)
     return EventResult(Outcome.ACCEPTED, payload.provider_event_id, agent_session_id)
+
+
+async def tear_down(provider_call_id: str, banking_session_id: str) -> None:
+    """Release everything one call holds, in any state, more than once safely.
+
+    The single place a call's resources are freed, because a call can end from
+    several directions at once — the caller hangs up, the provider sends an
+    event, the model session drops, a timeout fires — and every one of them has
+    to converge here rather than each releasing a different subset.
+
+    Deliberately *not* released: the persistent PIN lockout. That is customer
+    security state and outlives the call by design. Clearing it on hang-up
+    would make hanging up the way to reset it, which is the exact loop the
+    lockout was built to close.
+    """
+    bridge = await phone_call_registry.remove(provider_call_id)
+    if bridge is not None:
+        await bridge.close()
+
+    # `close` returns the capacity slot and returns False when there was
+    # nothing to close, so arriving here twice cannot release two slots. The
+    # `release` is for a call that failed before it became a connection.
+    await voice_call_manager.close(banking_session_id)
+    await voice_call_manager.release(banking_session_id)
+    session_manager.destroy_session(banking_session_id)
 
 
 async def _end_call(payload: InboundCallEvent) -> EventResult:
@@ -173,8 +348,7 @@ async def _end_call(payload: InboundCallEvent) -> EventResult:
 
     # The conditional update above returned a row, so this is the one execution
     # that closed this call, and therefore the one that may hand the slot back.
-    await browser_call_manager.close(banking_session_id)
-    session_manager.destroy_session(banking_session_id)
+    await tear_down(payload.provider_call_id, banking_session_id)
 
     _audit(AuditEvent.CALL_ENDED, payload, reason="CUSTOMER_ENDED")
     return EventResult(Outcome.ENDED, payload.provider_event_id)

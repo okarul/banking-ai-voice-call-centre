@@ -290,6 +290,7 @@ class RealtimeManager:
         *,
         on_event: EventHandler | None = None,
         reserved: bool = False,
+        connect: Connector | None = None,
     ) -> RealtimeConnection:
         """Open a voice call on an existing banking session.
 
@@ -316,6 +317,16 @@ class RealtimeManager:
         If the connection cannot be opened, the banking session is left exactly
         as it was: no realtime id is recorded, no state is cleared, and the slot
         is given back immediately.
+
+        `connect` overrides how *this one call* reaches a provider, defaulting
+        to the manager's own connector. That exists so both channels can share
+        a single manager, and therefore a single capacity ceiling, while
+        needing different things from it: a browser call registers a local
+        stand-in because its audio belongs to the page, and a telephone call
+        opens a real server-side model session because its audio belongs to
+        this process. Giving each channel its own manager would be tidier to
+        read and would split the ceiling in two, which is the one thing the
+        capacity design must not do.
         """
         if not reserved:
             await self.reserve(banking_session_id)
@@ -325,7 +336,7 @@ class RealtimeManager:
         )
 
         try:
-            session = await self._connect(context)
+            session = await (connect or self._connect)(context)
         except RealtimeSessionError:
             await self.release(banking_session_id)
             raise

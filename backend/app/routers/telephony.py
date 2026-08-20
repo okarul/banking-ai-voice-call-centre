@@ -30,13 +30,24 @@ anything has no safe behaviour available to it, so it does not exist.
 
 import logging
 
-from fastapi import APIRouter, Header, Request, Response, status
+from fastapi import (
+    APIRouter,
+    Header,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from pydantic import ValidationError
 
 from app.config import settings
+from app.observability import recorder
 from app.observability.events import AuditEvent, safe_event
 from app.telephony import service
+from app.telephony.bridge import phone_call_registry
 from app.telephony.channels import Channel
+from app.telephony.media import WebSocketMediaTransport
 from app.telephony.schemas import InboundCallEvent, InboundEventAccepted
 from app.telephony.signature import (
     MAX_BODY_BYTES,
@@ -47,6 +58,9 @@ from app.telephony.signature import (
 logger = logging.getLogger("app.telephony")
 
 router = APIRouter(prefix="/api/telephony", tags=["telephony"])
+
+# Closed without explanation when a media socket names a call that is not open.
+WS_POLICY_VIOLATION = 1008
 
 def _refuse(reason: str, *, provider_call_id: str | None = None) -> None:
     """Record why an event was turned away. Categories only, never the body."""
@@ -151,3 +165,80 @@ async def incoming_event(
         provider_event_id=result.provider_event_id,
         duplicate=result.duplicate,
     )
+
+
+@router.websocket("/media/{provider_call_id}")
+async def media_socket(websocket: WebSocket, provider_call_id: str) -> None:
+    """Carry one call's audio between the media gateway and its bridge.
+
+    One socket, one call. The path names the call, and the only thing that name
+    can do is select a bridge that a verified provider event already created —
+    so a socket for a call that was never announced, or for one that has
+    finished, is closed without creating anything. A media socket can never
+    bring a call into existence, because that would be a way to open a banking
+    session without passing the signature check.
+
+    Frames are µ-law, 20 ms, binary. Text messages are ignored rather than
+    parsed: this socket carries audio, and a control channel here would be a
+    second way to affect a call.
+
+    **This socket is not authenticated by itself.** It is protected by
+    obscurity of the call id plus the fact that the id must already be
+    registered — which is weaker than the webhook's HMAC, and is called out in
+    `docs/TELEPHONY_MEDIA.md` as the thing to close before this faces anything
+    but a gateway on a trusted network.
+    """
+    bridge = phone_call_registry.get(provider_call_id)
+    transport = getattr(bridge, "transport", None) if bridge else None
+
+    if bridge is None or bridge.closed or not isinstance(
+        transport, WebSocketMediaTransport
+    ):
+        # Refused before the handshake completes. Nothing is told apart: an
+        # unknown call, a finished call and a call on another transport all
+        # look identical from outside.
+        await websocket.close(code=WS_POLICY_VIOLATION)
+        _refuse("MEDIA_SOCKET_UNKNOWN_CALL", provider_call_id=provider_call_id)
+        return
+
+    await websocket.accept()
+    transport.attach(websocket)
+    logger.info(
+        "telephony media attached: %s",
+        safe_event(
+            AuditEvent.CALL_STARTED,
+            channel=Channel.PHONE.value,
+            provider_call_id=provider_call_id,
+        ),
+    )
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            frame = message.get("bytes")
+            if frame:
+                # Straight into this call's bounded queue. Never awaited on a
+                # full queue: a socket read that blocked would stop this call
+                # reading while the gateway kept sending.
+                transport.deliver(frame)
+    except WebSocketDisconnect:
+        pass
+    except Exception as error:
+        logger.info(
+            "telephony media socket ended: %s", type(error).__name__
+        )
+    finally:
+        # The caller has gone. Converge on the one cleanup path, which is
+        # idempotent, so an end event arriving at the same moment is harmless.
+        await service.tear_down(provider_call_id, bridge.banking_session_id)
+        try:
+            recorder.close_phone_call(provider_call_id, reason="CUSTOMER_ENDED")
+        except Exception as error:
+            # This runs in a `finally`. An observability failure here would
+            # replace whatever actually ended the call, and the call is already
+            # released either way.
+            logger.error(
+                "telephony call record not closed: %s", type(error).__name__
+            )

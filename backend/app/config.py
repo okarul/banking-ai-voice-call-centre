@@ -159,6 +159,46 @@ class Settings:
             os.getenv("PIN_LOCKOUT_MINUTES"), default=15
         )
 
+        # --- telephony media (Phase 3) -----------------------------------
+        # Which transport carries a telephone call's audio.
+        #
+        #   websocket  a media gateway streams the call to this application
+        #   loopback   in-memory, for tests and local development
+        #
+        # There is deliberately no "sip" value: terminating SIP and RTM in this
+        # process would need a SIP stack, and terminating it outside needs a
+        # gateway. See docs/TELEPHONY_MEDIA.md.
+        self.telephony_media_transport: str = (
+            os.getenv("TELEPHONY_MEDIA_TRANSPORT", "websocket").strip().lower()
+        )
+
+        # How long the media gateway has to attach its audio socket after the
+        # call event arrives. Beyond this the call is torn down rather than
+        # left holding a capacity slot for a caller who will never be heard.
+        self.telephony_media_connect_timeout: int = _positive_int(
+            os.getenv("TELEPHONY_MEDIA_CONNECT_TIMEOUT"), default=15
+        )
+        # How long opening the model session may take before the call is
+        # abandoned. Generous: a realtime handshake is seconds, and a timeout
+        # tighter than reality turns normal calls into failures.
+        self.telephony_realtime_connect_timeout: int = _positive_int(
+            os.getenv("TELEPHONY_REALTIME_CONNECT_TIMEOUT"), default=30
+        )
+        # A call with no audio in either direction for this long is assumed
+        # dead and cleaned up, so a provider that never sends an end event
+        # cannot leak a capacity slot for ever.
+        self.telephony_idle_call_timeout: int = _positive_int(
+            os.getenv("TELEPHONY_IDLE_CALL_TIMEOUT"), default=900
+        )
+
+        # Audio queue ceilings, in frames of 20 ms. 200 frames is four seconds
+        # of speech — long enough to ride out a slow model turn, short enough
+        # that a caller cannot make this process hold unbounded memory. When
+        # full the oldest frame is dropped: see app.telephony.media.
+        self.telephony_audio_queue_frames: int = _positive_int(
+            os.getenv("TELEPHONY_AUDIO_QUEUE_FRAMES"), default=200
+        )
+
         # Synthetic data only. This is a demonstration bank; turning it off
         # would imply a real banking connector, and there is none.
         self.demo_mode: bool = _flag(os.getenv("DEMO_MODE"), True)
@@ -227,6 +267,7 @@ class Settings:
             "telephony_enabled": self.telephony_enabled,
             "telephony_provider": self.telephony_provider,
             "telephony_configured": self.telephony_configured,
+            "telephony_media_transport": self.telephony_media_transport,
             "ai_disclosure_enabled": self.ai_disclosure_enabled,
             "realtime_model": self.realtime_model,
             "realtime_voice": self.realtime_voice,
