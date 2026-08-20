@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The SIP profile Channel 2 answers on.
+
+  Written for LOCAL LOOPBACK TESTING. Two settings must change before this is
+  reachable from a carrier, and both are called out inline: `sip-ip` and the
+  absence of any authentication for the eventual DIDWW source.
+
+  NOT YET RUN. See deploy/freeswitch/README.md.
+-->
+<profile name="channel2">
+  <settings>
+
+    <!-- Listen. Inside a container this is the container's interface; the port
+         is published to the Windows host, and nothing beyond it. Before live
+         use this becomes the host's real address and the firewall opens to
+         DIDWW's signalling ranges only. -->
+    <param name="sip-ip" value="$${local_ip_v4}"/>
+    <param name="sip-port" value="5060"/>
+    <param name="rtp-ip" value="$${local_ip_v4}"/>
+
+    <!-- What the SDP advertises. Behind Docker's NAT the container's own
+         address is not reachable from the caller, so both are set explicitly.
+         Getting this wrong is the classic one-way-audio failure: the call
+         connects, signalling looks perfect, and no media arrives. -->
+    <param name="ext-sip-ip" value="$${external_sip_ip}"/>
+    <param name="ext-rtp-ip" value="$${external_rtp_ip}"/>
+
+    <param name="context" value="public"/>
+    <param name="dialplan" value="XML"/>
+
+    <!-- Inbound only. This profile places no calls, so it registers nowhere
+         and needs no credentials of its own. -->
+    <param name="auth-calls" value="false"/>
+    <param name="accept-blind-reg" value="false"/>
+    <param name="accept-blind-auth" value="false"/>
+    <param name="inbound-late-negotiation" value="false"/>
+
+    <!-- IMPORTANT, before live use: `auth-calls=false` is safe only while the
+         port is loopback-bound. Once a carrier can reach it, calls must be
+         restricted to DIDWW — by an ACL on their signalling ranges, or by SIP
+         digest credentials. An unauthenticated SIP port on a public address is
+         found by scanners within hours. -->
+    <param name="apply-inbound-acl" value="loopback.auto"/>
+
+    <!-- One codec. See the README: a second would add a transcoding step for
+         no benefit, and the bank already converts once for the model. -->
+    <param name="inbound-codec-prefs" value="PCMU,PCMA"/>
+    <param name="outbound-codec-prefs" value="PCMU"/>
+    <param name="inbound-codec-negotiation" value="generous"/>
+    <param name="disable-transcoding" value="true"/>
+
+    <!-- Media flows through FreeSWITCH rather than directly between endpoints:
+         a call whose media bypassed us could not be forked to the gateway. -->
+    <param name="media-option" value="resume-media-on-hold"/>
+    <param name="inbound-bypass-media" value="false"/>
+    <param name="inbound-proxy-media" value="false"/>
+
+    <!-- Keep the RTP range small and bounded; every port in it is a firewall
+         rule. These must match switch.conf's rtp-start/rtp-end. -->
+    <param name="rtp-timeout-sec" value="60"/>
+    <param name="rtp-hold-timeout-sec" value="120"/>
+
+    <!-- No TLS on this leg while it is loopback-only. Before live use, prefer
+         SIP-TLS on 5061 with SRTP, or a private link to the carrier. The
+         gateway's own leg to the bank is TLS-verified regardless — see
+         GATEWAY_VERIFY_TLS, which stays true. -->
+    <param name="tls" value="false"/>
+
+  </settings>
+</profile>

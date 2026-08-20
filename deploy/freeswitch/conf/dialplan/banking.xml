@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Channel 2 inbound dialplan.
+
+  One extension, and it does four things: answer, fix the codec, fork the audio
+  to the gateway, and park the call until one side hangs up. There is no
+  banking logic here and there must never be any — FreeSWITCH terminates the
+  telephone network, and everything about who is calling and what they may see
+  is decided by the banking application behind the authenticated gateway.
+
+  NOT YET RUN. See deploy/freeswitch/README.md.
+-->
+<include>
+  <context name="public">
+
+    <extension name="channel2_banking_inbound">
+      <!-- Match the demonstration DID, and the loopback test number. Anything
+           else falls through and is rejected: an open dialplan on a
+           publicly-reachable SIP port is a free long-distance service. -->
+      <condition field="destination_number" expression="^(6531252836|1000)$">
+
+        <!-- One codec, both directions, no transcoding inside FreeSWITCH.
+             The bank converts µ-law once, for the model, and back. -->
+        <action application="set" data="absolute_codec_string=PCMU"/>
+
+        <!-- Answer before forking: `unicast` needs established media. -->
+        <action application="answer"/>
+
+        <!-- Fork this call's audio to the gateway and read the replies back.
+             `unicast` is mod_dptools — core FreeSWITCH, no third-party module.
+
+               local-ip/local-port    where FreeSWITCH sends from
+               remote-ip/remote-port  the gateway's media port for this call
+               transport=udp          datagrams, one 20 ms frame each
+               flags=native           send the call's own codec (PCMU),
+                                      not FreeSWITCH's internal L16
+
+             FIXED PORT — single call only. Two concurrent calls forking here
+             would mix two callers into one stream. Concurrent calls need a
+             port allocated per call over mod_event_socket; see the README. -->
+        <action application="unicast"
+                data="local-ip=$${local_ip_v4} local-port=16399
+                      remote-ip=$${gateway_media_ip} remote-port=16384
+                      transport=udp flags=native"/>
+
+        <!-- Hold the call open. The audio is already flowing through the fork;
+             this simply keeps the leg alive until the caller hangs up or the
+             bank ends the call. -->
+        <action application="park"/>
+
+      </condition>
+    </extension>
+
+    <!-- Everything else. An unmatched number is not a call this bank answers. -->
+    <extension name="channel2_reject_everything_else">
+      <condition field="destination_number" expression="^.*$">
+        <action application="respond" data="404 Not Found"/>
+      </condition>
+    </extension>
+
+  </context>
+</include>

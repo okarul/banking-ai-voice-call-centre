@@ -74,6 +74,31 @@ class GatewaySettings:
             os.getenv("GATEWAY_ATTACH_TIMEOUT"), default=10
         )
 
+        # --- media ports (Phase 4B) --------------------------------------
+        # Where FreeSWITCH forks call audio to. One port per call, taken from
+        # this range and released when the call ends.
+        #
+        # Bounded deliberately: an RTP range is a firewall rule, and every port
+        # in it has to be open. A range far larger than the call ceiling is a
+        # larger opening than the service needs. 24 ports leaves generous room
+        # above the five-call application target.
+        self.media_port_low: int = _positive_int(
+            os.getenv("GATEWAY_MEDIA_PORT_LOW"), default=16384
+        )
+        self.media_port_high: int = _positive_int(
+            os.getenv("GATEWAY_MEDIA_PORT_HIGH"), default=16407
+        )
+        # What the media ports listen on. Loopback by default: until a media
+        # server is deployed alongside, nothing outside this machine has any
+        # business sending audio here.
+        self.media_bind_host: str = os.getenv(
+            "GATEWAY_MEDIA_BIND_HOST", "127.0.0.1"
+        )
+
+    @property
+    def media_ports(self) -> int:
+        return max(0, self.media_port_high - self.media_port_low + 1)
+
     @property
     def configured(self) -> bool:
         """Whether this gateway may run at all."""
@@ -95,6 +120,8 @@ class GatewaySettings:
             "configured": self.configured,
             "request_timeout": self.request_timeout,
             "attach_timeout": self.attach_timeout,
+            "media_bind_host": self.media_bind_host,
+            "media_port_range": f"{self.media_port_low}-{self.media_port_high}",
         }
 
 
