@@ -94,8 +94,18 @@ class InboundEventAccepted(BaseModel):
     `duplicate` is reported honestly rather than hidden, because a provider
     seeing its retries acknowledged as duplicates is a provider behaving
     correctly, and an operator reading the logs should be able to see it.
+
+    `media_token` is present **only on acceptance**, and only there. It is the
+    short-lived, single-use credential that lets the gateway attach audio to
+    this one call, and it is issued on the channel the gateway just proved it
+    controls by signing the request. A duplicate or a refusal has no call to
+    attach to, so it is given no way to try.
+
+    The token carries no identity. See `PhoneCallBridge.media_token`.
     """
 
     status: str
     provider_event_id: str
     duplicate: bool = False
+    media_token: str | None = None
+    media_url: str | None = None

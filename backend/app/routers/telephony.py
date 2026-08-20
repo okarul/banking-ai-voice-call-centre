@@ -59,8 +59,13 @@ logger = logging.getLogger("app.telephony")
 
 router = APIRouter(prefix="/api/telephony", tags=["telephony"])
 
-# Closed without explanation when a media socket names a call that is not open.
+# Closed without explanation when a media socket names a call that is not open,
+# or presents no valid credential for it.
 WS_POLICY_VIOLATION = 1008
+
+# Where the gateway presents its per-call media credential. A header, not a
+# query parameter: query strings are routinely written to access logs.
+MEDIA_TOKEN_HEADER = "x-telephony-media-token"
 
 def _refuse(reason: str, *, provider_call_id: str | None = None) -> None:
     """Record why an event was turned away. Categories only, never the body."""
@@ -75,7 +80,13 @@ def _refuse(reason: str, *, provider_call_id: str | None = None) -> None:
     )
 
 
-@router.post("/incoming", status_code=status.HTTP_200_OK)
+@router.post(
+    "/incoming",
+    status_code=status.HTTP_200_OK,
+    # Absent fields are omitted rather than rendered as null, so a refusal's
+    # response carries no `media_token` key at all.
+    response_model_exclude_none=True,
+)
 async def incoming_event(
     request: Request,
     response: Response,
@@ -164,6 +175,12 @@ async def incoming_event(
         status=result.outcome.value,
         provider_event_id=result.provider_event_id,
         duplicate=result.duplicate,
+        media_token=result.media_token,
+        media_url=(
+            f"{router.prefix}/media/{payload.provider_call_id}"
+            if result.media_token
+            else None
+        ),
     )
 
 
@@ -182,11 +199,15 @@ async def media_socket(websocket: WebSocket, provider_call_id: str) -> None:
     parsed: this socket carries audio, and a control channel here would be a
     second way to affect a call.
 
-    **This socket is not authenticated by itself.** It is protected by
-    obscurity of the call id plus the fact that the id must already be
-    registered — which is weaker than the webhook's HMAC, and is called out in
-    `docs/TELEPHONY_MEDIA.md` as the thing to close before this faces anything
-    but a gateway on a trusted network.
+    **Authentication.** The gateway must present the short-lived, single-use
+    token it was given when the call was accepted, in the
+    `X-Telephony-Media-Token` header. Knowing a `provider_call_id` is not
+    enough and was never meant to be: an identifier is not a credential, and a
+    private network is a deployment assumption rather than a control.
+
+    The token is checked in constant time, spent on first use, and expires with
+    the attach window. It carries no customer identity and no authentication
+    state — attaching audio must never be a way to assert either.
     """
     bridge = phone_call_registry.get(provider_call_id)
     transport = getattr(bridge, "transport", None) if bridge else None
@@ -199,6 +220,22 @@ async def media_socket(websocket: WebSocket, provider_call_id: str) -> None:
         # look identical from outside.
         await websocket.close(code=WS_POLICY_VIOLATION)
         _refuse("MEDIA_SOCKET_UNKNOWN_CALL", provider_call_id=provider_call_id)
+        return
+
+    # The credential, and the reason knowing a call id is not enough.
+    #
+    # Without this, anything that learned or guessed a `provider_call_id` could
+    # attach to a live banking call and both hear the caller and speak to them.
+    # Knowing an identifier is not authorisation, and a network being private is
+    # a deployment assumption, not a control — it is one misconfigured proxy
+    # away from being false.
+    #
+    # Read from a header rather than the query string: query strings are
+    # written to proxy and server access logs as a matter of routine, and a
+    # credential in an access log is a credential in a backup.
+    if not bridge.consume_media_token(websocket.headers.get(MEDIA_TOKEN_HEADER)):
+        await websocket.close(code=WS_POLICY_VIOLATION)
+        _refuse("MEDIA_SOCKET_TOKEN_INVALID", provider_call_id=provider_call_id)
         return
 
     await websocket.accept()

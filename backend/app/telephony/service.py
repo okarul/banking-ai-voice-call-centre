@@ -89,6 +89,9 @@ class EventResult:
     outcome: Outcome
     provider_event_id: str
     agent_session_id: str | None = None
+    # Present only on acceptance. Never on a duplicate or a refusal: those have
+    # no call to attach audio to, so they are given no way to try.
+    media_token: str | None = None
 
     @property
     def duplicate(self) -> bool:
@@ -233,6 +236,9 @@ async def _register_incoming(payload: InboundCallEvent) -> EventResult:
         realtime_manager=voice_call_manager,
         outbound_max_frames=settings.telephony_audio_queue_frames,
         on_call_lost=_on_call_lost,
+        # The credential outlives nothing: it expires with the window the
+        # gateway has to attach, so a token that leaks is useless seconds later.
+        media_token_ttl=settings.telephony_media_connect_timeout,
     )
 
     try:
@@ -321,7 +327,12 @@ async def _register_incoming(payload: InboundCallEvent) -> EventResult:
     asyncio.ensure_future(_open_conversation(bridge))
 
     _audit(AuditEvent.CALL_ACCEPTED, payload, agent_session_id=agent_session_id)
-    return EventResult(Outcome.ACCEPTED, payload.provider_event_id, agent_session_id)
+    return EventResult(
+        Outcome.ACCEPTED,
+        payload.provider_event_id,
+        agent_session_id,
+        media_token=bridge.media_token,
+    )
 
 
 async def tear_down(provider_call_id: str, banking_session_id: str) -> None:

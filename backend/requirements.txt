@@ -17,3 +17,10 @@ psycopg[binary]
 # against these exact versions.
 openai-agents==0.20.0
 openai==2.54.0
+
+# Phase 4 - the reference media gateway (backend/gateway).
+# httpx above is used for the signed call-control events; websockets carries
+# the media socket. It already arrives via uvicorn[standard], but the gateway
+# imports it directly, and a dependency that is only present by accident is a
+# dependency that disappears the day the accident stops.
+websockets

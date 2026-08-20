@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 
 from app.telephony import audio as codec
@@ -75,6 +76,7 @@ class PhoneCallBridge:
         realtime_manager,
         outbound_max_frames: int,
         on_call_lost=None,
+        media_token_ttl: float = 15.0,
     ) -> None:
         self.provider_call_id = provider_call_id
         self.banking_session_id = banking_session_id
@@ -108,6 +110,21 @@ class PhoneCallBridge:
         # Monotonic, because a clock that can go backwards would make a live
         # call look idle. Read by the idle sweep.
         self.last_activity = time.monotonic()
+
+        # The credential that lets a gateway attach audio to *this* call.
+        #
+        # Opaque and random rather than signed: this process already holds
+        # per-call state, so there is nothing to gain from a stateless token and
+        # a great deal to lose — a random value carries no claims, cannot be
+        # forged from a leaked key, and can be revoked the instant it is used.
+        #
+        # It says nothing about who is calling. There is no customer id in it,
+        # no authentication state, and nothing derived from either, because a
+        # media credential that carried identity would make attaching a socket
+        # a way to assert one.
+        self._media_token = secrets.token_urlsafe(32)
+        self._media_token_expires_at = time.monotonic() + media_token_ttl
+        self._media_token_used = False
 
         # Counters, for the operator and for the tests. Not audio.
         self.frames_from_caller = 0
@@ -199,6 +216,34 @@ class PhoneCallBridge:
                 type(error).__name__,
             )
             self._signal_lost()
+
+    # --- the media credential ------------------------------------------------
+
+    @property
+    def media_token(self) -> str:
+        """The token to hand the gateway. Returned once, over the signed channel."""
+        return self._media_token
+
+    def consume_media_token(self, supplied: str | None) -> bool:
+        """Check a token and spend it. False means do not accept this socket.
+
+        Single-use on purpose. A media socket is attached once per call, so a
+        second presentation of the same token is either a gateway bug or a
+        replay, and neither should be able to take over a call that is already
+        carrying audio.
+
+        Constant-time comparison, for the same reason the webhook signature
+        uses one: a plain `==` returns as soon as two characters differ, and how
+        long it took is a measurement of how much of the token was right.
+        """
+        if self._closed or self._media_token_used or not supplied:
+            return False
+        if time.monotonic() > self._media_token_expires_at:
+            return False
+        if not secrets.compare_digest(supplied, self._media_token):
+            return False
+        self._media_token_used = True
+        return True
 
     @property
     def greeted(self) -> bool:
@@ -326,6 +371,8 @@ class PhoneCallBridge:
         return {
             "provider_call_id": self.provider_call_id,
             "closed": self._closed,
+            # Deliberately no media token: this is what an operator sees.
+            "media_attached": self._media_token_used,
             "frames_from_caller": self.frames_from_caller,
             "frames_to_caller": self.frames_to_caller,
             "outbound_queued": len(self.outbound),
