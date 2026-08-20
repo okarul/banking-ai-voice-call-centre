@@ -135,6 +135,18 @@ class MediaTransport(Protocol):
         """Prepare the transport. Raises `MediaTransportError` on failure."""
         ...
 
+    async def wait_until_ready(self, timeout: float) -> bool:
+        """Whether audio can actually reach the caller yet.
+
+        The distinction matters because of the greeting. A WebSocket transport
+        exists from the moment the call is registered, but the gateway attaches
+        its socket a little later — and anything sent before that is discarded,
+        so a greeting spoken too early is a greeting the caller never hears.
+
+        Returns False if the transport never became ready within `timeout`.
+        """
+        ...
+
     async def receive_audio(self) -> bytes | None:
         """One µ-law frame from the caller, or None when the call has ended."""
         ...
@@ -168,6 +180,10 @@ class LoopbackMediaTransport:
 
     async def on_call_started(self) -> None:
         self.started = True
+
+    async def wait_until_ready(self, timeout: float) -> bool:
+        """Immediately. There is no socket to wait for."""
+        return not self.ended
 
     async def receive_audio(self) -> bytes | None:
         return await self.inbound.get()
@@ -236,6 +252,16 @@ class WebSocketMediaTransport:
             return True
         except asyncio.TimeoutError:
             return False
+
+    async def wait_until_ready(self, timeout: float) -> bool:
+        """Ready once the gateway has attached — and not before.
+
+        `on_call_ended` also sets the attach event so a closing call releases
+        anybody waiting here, which is why the result is qualified: attached and
+        still open is ready; attached because it ended is not.
+        """
+        attached = await self.wait_for_attach(timeout)
+        return attached and not self._closed and self._websocket is not None
 
     async def on_call_started(self) -> None:
         return None

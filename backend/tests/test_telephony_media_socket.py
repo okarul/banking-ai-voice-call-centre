@@ -39,11 +39,15 @@ WEBHOOK = "/api/telephony/incoming"
 class FakePhoneSession:
     def __init__(self) -> None:
         self.audio_chunks: list[bytes] = []
+        self.messages: list[str] = []
         self.closed = False
         self._events: asyncio.Queue = asyncio.Queue()
 
     async def send_audio(self, audio: bytes) -> None:
         self.audio_chunks.append(audio)
+
+    async def send_message(self, text: str) -> None:
+        self.messages.append(text)
 
     async def close(self) -> None:
         self.closed = True
@@ -327,3 +331,68 @@ def test_the_media_socket_never_leaks_a_secret(client, sessions):
         assert TEST_SECRET not in str(error)
 
     assert TEST_SECRET not in client.get("/health").text
+
+
+# === the greeting, over the real socket =====================================
+
+
+def test_the_caller_is_greeted_when_the_gateway_attaches(client, sessions):
+    """End to end: announce, attach, and the agent opens the conversation."""
+    from app.telephony.bridge import GREETING_CUE, phone_call_registry
+
+    announce(client, "call-greet")
+    bridge = phone_call_registry.get("call-greet")
+
+    # Nothing said yet — there was nobody holding the line to say it to.
+    assert bridge.greeted is False
+    assert sessions[0].messages == []
+
+    with client.websocket_connect("/api/telephony/media/call-greet"):
+        for _ in range(200):
+            if bridge.greeted:
+                break
+            time.sleep(0.01)
+
+    assert bridge.greeted is True
+    assert sessions[0].messages == [GREETING_CUE]
+
+
+def test_two_attached_callers_are_greeted_once_each(client, sessions):
+    from app.telephony.bridge import GREETING_CUE, phone_call_registry
+
+    announce(client, "call-g1")
+    announce(client, "call-g2")
+
+    with client.websocket_connect("/api/telephony/media/call-g1"):
+        with client.websocket_connect("/api/telephony/media/call-g2"):
+            for _ in range(200):
+                if all(s.messages for s in sessions[:2]):
+                    break
+                time.sleep(0.01)
+            greeted = [
+                phone_call_registry.get("call-g1").greeted,
+                phone_call_registry.get("call-g2").greeted,
+            ]
+
+    assert greeted == [True, True]
+    assert sessions[0].messages == [GREETING_CUE]
+    assert sessions[1].messages == [GREETING_CUE]
+    # One greeting each, not two for one caller and none for the other.
+    assert sum(len(s.messages) for s in sessions[:2]) == 2
+
+
+def test_a_reattaching_socket_does_not_greet_again(client, sessions):
+    """A gateway that reconnects must not make the bank say hello twice."""
+    from app.telephony.bridge import GREETING_CUE
+
+    announce(client, "call-reattach")
+
+    with client.websocket_connect("/api/telephony/media/call-reattach"):
+        for _ in range(200):
+            if sessions[0].messages:
+                break
+            time.sleep(0.01)
+
+    # The first socket closing ended the call, so a second attach is refused
+    # outright — and in either case only one greeting was ever spoken.
+    assert sessions[0].messages == [GREETING_CUE]

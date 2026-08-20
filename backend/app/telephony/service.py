@@ -134,23 +134,39 @@ async def _on_call_lost(provider_call_id: str, banking_session_id: str) -> None:
     recorder.close_phone_call(provider_call_id, reason="PROVIDER_FAILURE")
 
 
-async def _watch_for_media(bridge: PhoneCallBridge) -> None:
-    """Give up on a call whose gateway never attaches its audio socket.
+async def _open_conversation(bridge: PhoneCallBridge) -> None:
+    """Wait for the caller's audio path, then have the agent say hello.
 
-    Without this a call announced by the provider but never streamed would hold
-    a capacity slot until the idle sweep, turning one gateway failure into a
-    slot missing from a five-slot bank for a quarter of an hour.
+    Two jobs that have to happen in this order, which is why they are one task
+    rather than two racing ones:
+
+    1. **Wait for the media to be ready.** A WebSocket transport exists from
+       the moment the call is registered, but the gateway attaches its socket a
+       moment later, and anything sent before that is discarded. Greeting on
+       registration would mean greeting into a socket nobody is holding.
+    2. **Greet.** Otherwise the caller connects successfully and hears silence
+       until they speak first, which is not how a bank answers the telephone.
+
+    If the media never arrives the call is given up rather than left holding a
+    capacity slot — one gateway failure must not cost a five-slot bank a slot
+    for the length of the idle timeout.
     """
-    transport = bridge.transport
-    if not hasattr(transport, "wait_for_attach"):
-        return
-    if await transport.wait_for_attach(settings.telephony_media_connect_timeout):
-        return
-    logger.warning("telephony media never attached: %s", bridge.provider_call_id)
-    await tear_down(bridge.provider_call_id, bridge.banking_session_id)
-    recorder.mark_phone_call_rejected(
-        bridge.provider_call_id, reason="MEDIA_ATTACH_TIMEOUT"
+    ready = await bridge.transport.wait_until_ready(
+        settings.telephony_media_connect_timeout
     )
+
+    if not ready:
+        if bridge.closed:
+            # The call ended by itself while we waited. Nothing to give up on.
+            return
+        logger.warning("telephony media never attached: %s", bridge.provider_call_id)
+        await tear_down(bridge.provider_call_id, bridge.banking_session_id)
+        recorder.mark_phone_call_rejected(
+            bridge.provider_call_id, reason="MEDIA_ATTACH_TIMEOUT"
+        )
+        return
+
+    await bridge.greet()
 
 
 async def sweep_idle_calls() -> int:
@@ -249,7 +265,6 @@ async def _register_incoming(payload: InboundCallEvent) -> EventResult:
         # so what is left here is the bridge, the session and the claim row.
         await bridge.close()
         await voice_call_manager.release(session.session_id)
-        recorder.mark_phone_call_rejected(payload.provider_call_id)
         session_manager.destroy_session(session.session_id)
 
         at_capacity = (
@@ -265,6 +280,11 @@ async def _register_incoming(payload: InboundCallEvent) -> EventResult:
         if not at_capacity:
             # Type only. A provider or SDK message may carry request detail.
             logger.error("telephony call could not start: %s", type(error).__name__)
+        # Recorded with the reason that actually applied. Defaulting this to
+        # CAPACITY_REJECTED told an operator the bank was full when the real
+        # cause was a model session that would not open — which is the opposite
+        # of the diagnosis, and would send them to look at the wrong thing.
+        recorder.mark_phone_call_rejected(payload.provider_call_id, reason=reason)
         _audit(AuditEvent.CALL_REJECTED, payload, reason=reason)
         return EventResult(
             Outcome.REJECTED_CAPACITY, payload.provider_event_id, agent_session_id
@@ -287,16 +307,18 @@ async def _register_incoming(payload: InboundCallEvent) -> EventResult:
         await bridge.start()
     except Exception as error:
         await tear_down(payload.provider_call_id, session.session_id)
-        recorder.mark_phone_call_rejected(payload.provider_call_id)
+        recorder.mark_phone_call_rejected(
+            payload.provider_call_id, reason="MEDIA_UNAVAILABLE"
+        )
         logger.error("telephony media failed to start: %s", type(error).__name__)
         _audit(AuditEvent.CALL_REJECTED, payload, reason="MEDIA_UNAVAILABLE")
         return EventResult(
             Outcome.REJECTED_CAPACITY, payload.provider_event_id, agent_session_id
         )
 
-    # Watches for a gateway that never turns up. Exits by itself when the call
-    # ends, because ending the transport marks it attached.
-    asyncio.ensure_future(_watch_for_media(bridge))
+    # Waits for the caller's audio path, then greets them. Exits by itself when
+    # the call ends, because ending the transport marks it ready.
+    asyncio.ensure_future(_open_conversation(bridge))
 
     _audit(AuditEvent.CALL_ACCEPTED, payload, agent_session_id=agent_session_id)
     return EventResult(Outcome.ACCEPTED, payload.provider_event_id, agent_session_id)

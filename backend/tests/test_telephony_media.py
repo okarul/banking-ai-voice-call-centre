@@ -37,7 +37,11 @@ from app.realtime.browser_calls import voice_call_manager
 from app.sessions import session_manager
 from app.telephony import audio as codec
 from app.telephony import service
-from app.telephony.bridge import PhoneCallBridge, phone_call_registry
+from app.telephony.bridge import (
+    GREETING_CUE,
+    PhoneCallBridge,
+    phone_call_registry,
+)
 from app.telephony.media import LoopbackMediaTransport
 from app.telephony.schemas import InboundCallEvent
 
@@ -63,6 +67,7 @@ class FakePhoneSession:
 
     def __init__(self, *, send_delay: float = 0.0) -> None:
         self.audio_chunks: list[bytes] = []
+        self.messages: list[str] = []
         self.closed = False
         self.send_delay = send_delay
         self._events: asyncio.Queue = asyncio.Queue()
@@ -73,7 +78,7 @@ class FakePhoneSession:
         self.audio_chunks.append(audio)
 
     async def send_message(self, text: str) -> None:
-        return None
+        self.messages.append(text)
 
     async def interrupt(self) -> None:
         return None
@@ -1339,3 +1344,274 @@ def test_the_watchdog_leaves_an_attached_call_alone(phone, monkeypatch):
 
     assert phone_call_registry.get("call-attached") is not None
     assert voice_call_manager.used_capacity() == 1
+
+
+# === the greeting (Phase 3.5) ===============================================
+#
+# A telephone caller hears nothing until somebody speaks, and the model does
+# not speak until a turn is prompted. The browser page prompts its own; nothing
+# was prompting the telephone's, so a live caller would have connected
+# successfully and waited in silence. These tests are the fix, and the two ways
+# it could go wrong: greeting the wrong caller, or greeting the same one twice.
+
+
+def test_a_call_is_greeted_once_the_media_is_ready(phone):
+    async def scenario():
+        await place("call-hello")
+        await wait_until(lambda: bridge_for("call-hello").greeted)
+        return phone.sessions[0]
+
+    session = run(scenario())
+
+    assert bridge_for("call-hello").greeted is True
+    assert session.messages == [GREETING_CUE]
+
+
+def test_the_greeting_uses_the_realtime_session_not_a_separate_audio_path(phone):
+    """The agent speaks it, through the same session as the rest of the call."""
+    import inspect
+
+    from app.telephony import bridge as bridge_module
+
+    source = inspect.getsource(bridge_module.PhoneCallBridge.greet)
+    assert "self._realtime.send_message" in source
+    # No recorded file, no synthesiser, no second way to make sound.
+    for separate_path in ("open(", ".wav", "tts", "synthes", "playback", "ffmpeg"):
+        assert separate_path not in source.lower(), separate_path
+
+
+def test_the_greeting_wording_is_not_hard_coded_in_the_bridge(phone):
+    """How this bank speaks is decided in one place: the agent's instructions."""
+    from app.agents import speech
+    from app.telephony.bridge import GREETING_CUE as cue
+
+    assert speech.WELCOME_SPEECH not in cue
+    assert "ABC Demo Bank" not in cue
+
+
+def test_each_of_five_callers_is_greeted_exactly_once_and_only_their_own(phone):
+    """The isolation test for the greeting: five hellos, one each."""
+
+    async def scenario():
+        await asyncio.gather(*(place(f"call-{n}") for n in range(APPLICATION_TARGET)))
+        await wait_until(
+            lambda: all(
+                bridge_for(f"call-{n}").greeted for n in range(APPLICATION_TARGET)
+            )
+        )
+
+    run(scenario())
+
+    for n in range(APPLICATION_TARGET):
+        session = phone.by_banking_session[bridge_for(f"call-{n}").banking_session_id]
+        assert session.messages == [GREETING_CUE], f"call-{n} got {session.messages}"
+
+    # Five sessions, five greetings, no session greeted on another's behalf.
+    assert sum(len(s.messages) for s in phone.sessions) == APPLICATION_TARGET
+
+
+def test_a_duplicate_start_event_does_not_greet_twice(phone):
+    """A provider retry must not make the bank say hello down the same line."""
+
+    async def scenario():
+        await place("call-retry")
+        await wait_until(lambda: bridge_for("call-retry").greeted)
+        for n in range(3):
+            await place("call-retry", event_id=f"evt-retry-{n}")
+        await asyncio.sleep(0.05)
+        return phone.sessions[0]
+
+    session = run(scenario())
+
+    assert session.messages == [GREETING_CUE]
+    assert len(phone.sessions) == 1
+
+
+def test_greeting_twice_directly_is_refused(phone):
+    """Idempotent at the bridge, not merely unreached by the caller."""
+
+    async def scenario():
+        await place("call-once")
+        bridge = bridge_for("call-once")
+        await wait_until(lambda: bridge.greeted)
+        return await bridge.greet(), phone.sessions[0].messages
+
+    second, messages = run(scenario())
+
+    assert second is False
+    assert messages == [GREETING_CUE]
+
+
+def test_a_closed_call_is_not_greeted(phone):
+    async def scenario():
+        await place("call-closing")
+        bridge = bridge_for("call-closing")
+        await bridge.close()
+        return await bridge.greet()
+
+    assert run(scenario()) is False
+
+
+def test_a_failed_greeting_does_not_end_the_call(phone):
+    """A caller who is not greeted can still speak first and be answered."""
+
+    async def scenario():
+        await place("call-mute")
+        bridge = bridge_for("call-mute")
+        session = phone.sessions[0]
+
+        async def refuse(_text):
+            raise RuntimeError("session busy")
+
+        session.send_message = refuse
+        greeted = await bridge.greet()
+        # And the call still carries audio afterwards.
+        transport_for("call-mute").feed(speech(1))
+        await wait_until(lambda: session.audio_chunks)
+        return greeted, len(session.audio_chunks)
+
+    greeted, frames = run(scenario())
+
+    assert greeted is False
+    assert frames == 1
+    assert phone_call_registry.get("call-mute") is not None
+    assert voice_call_manager.used_capacity() == 1
+
+
+def test_the_greeting_does_not_authorise_any_banking_tool(phone):
+    """The cue is not a caller turn, and must not open the gate for one."""
+    from app.tools import accounts
+
+    async def scenario():
+        await place("call-gate")
+        await wait_until(lambda: bridge_for("call-gate").greeted)
+
+    run(scenario())
+
+    banking_session_id = bridge_for("call-gate").banking_session_id
+    # Still nobody, and still nothing readable.
+    assert session_manager.get_session(banking_session_id).customer_id is None
+    refusal = accounts.get_account_balance(banking_session_id, "Savings")
+    assert refusal == {"success": False, "reason": "NOT_AUTHENTICATED"}
+
+
+class _FakeSocket:
+    def __init__(self):
+        self.sent = []
+
+    async def send_bytes(self, data):
+        self.sent.append(data)
+
+
+def test_a_websocket_call_is_not_greeted_before_the_gateway_attaches(
+    phone, monkeypatch
+):
+    """Greeting into a socket nobody holds is a greeting the caller never hears."""
+    monkeypatch.setattr(settings, "telephony_media_transport", "websocket")
+    monkeypatch.setattr(settings, "telephony_media_connect_timeout", 3)
+
+    async def scenario():
+        await place("call-wait")
+        bridge = bridge_for("call-wait")
+        await asyncio.sleep(0.2)
+        before = bridge.greeted
+
+        bridge.transport.attach(_FakeSocket())
+        await wait_until(lambda: bridge.greeted, timeout=2.0)
+        return before, bridge.greeted
+
+    before, after = run(scenario())
+
+    assert before is False, "greeted before the gateway attached"
+    assert after is True, "never greeted after the gateway attached"
+
+
+def test_a_call_whose_gateway_never_attaches_is_never_greeted(phone, monkeypatch):
+    monkeypatch.setattr(settings, "telephony_media_transport", "websocket")
+    monkeypatch.setattr(settings, "telephony_media_connect_timeout", 1)
+
+    async def scenario():
+        await place("call-abandoned")
+        await wait_until(
+            lambda: phone_call_registry.get("call-abandoned") is None, timeout=4.0
+        )
+        return phone.sessions[0].messages
+
+    messages = run(scenario())
+
+    assert messages == []
+    assert voice_call_manager.used_capacity() == 0
+
+
+def test_a_call_refused_for_a_non_capacity_reason_says_so(phone, monkeypatch):
+    """An operator must not be told the bank was full when it was not.
+
+    The rejection reason defaulted to CAPACITY_REJECTED on every failure path,
+    so a model session that would not open was recorded as a bank at capacity —
+    the opposite of the diagnosis, sending an operator to look at the wrong
+    thing entirely.
+    """
+
+    async def explode(_context):
+        raise RuntimeError("provider refused")
+
+    monkeypatch.setattr(service, "open_phone_realtime_session", explode)
+
+    async def scenario():
+        return await place("call-not-full")
+
+    result = run(scenario())
+
+    assert result.outcome.value == "rejected_capacity"
+    with session_scope() as db:
+        row = db.scalars(
+            select(AgentSession).where(AgentSession.provider_call_id == "call-not-full")
+        ).one()
+    assert row.status == "REJECTED"
+    assert row.disconnect_reason == "UNAVAILABLE"
+
+
+def test_a_call_refused_because_the_bank_is_full_says_that(phone):
+    """And the genuine capacity refusal still reads as one."""
+
+    async def scenario():
+        await asyncio.gather(*(place(f"call-{n}") for n in range(APPLICATION_TARGET)))
+        return await place("call-genuinely-full")
+
+    run(scenario())
+
+    with session_scope() as db:
+        row = db.scalars(
+            select(AgentSession).where(
+                AgentSession.provider_call_id == "call-genuinely-full"
+            )
+        ).one()
+    assert row.disconnect_reason == "CAPACITY_REJECTED"
+
+
+def test_a_media_failure_is_recorded_as_a_media_failure(phone, monkeypatch):
+    original = service.build_transport
+
+    def broken_transport():
+        transport = original()
+
+        async def refuse():
+            raise RuntimeError("no media path")
+
+        transport.on_call_started = refuse
+        return transport
+
+    monkeypatch.setattr(service, "build_transport", broken_transport)
+
+    async def scenario():
+        return await place("call-media-broken")
+
+    run(scenario())
+
+    with session_scope() as db:
+        row = db.scalars(
+            select(AgentSession).where(
+                AgentSession.provider_call_id == "call-media-broken"
+            )
+        ).one()
+    assert row.disconnect_reason == "MEDIA_UNAVAILABLE"

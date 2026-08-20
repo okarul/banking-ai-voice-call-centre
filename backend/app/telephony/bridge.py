@@ -43,6 +43,25 @@ from app.telephony.media import BoundedAudioQueue, MediaTransport
 
 logger = logging.getLogger("app.telephony.bridge")
 
+# What is sent into the session to make the agent open the call.
+#
+# The wording of the greeting itself is **not** here — it lives in the agent's
+# instructions (`app.agents.banking_realtime`), which is the one place that
+# decides how this bank speaks. This is only the cue that a caller is now on
+# the line, playing the part the browser plays when it sends `response.create`.
+#
+# The Agents SDK has no public way to request a bare response, so the cue is
+# delivered as a short user turn, which is the supported path. Two consequences
+# are worth being explicit about:
+#
+#   * The scope gate classifies it, as it classifies any user turn, and will
+#     rule it out of scope. That is harmless and asserted by test: no tool can
+#     run between the greeting and the caller's first words, and that first
+#     real utterance re-rules the gate.
+#   * It is not a transcript of anything the caller said. The phone channel
+#     persists no transcript today; when it does, this cue must be excluded.
+GREETING_CUE = "Hello?"
+
 
 class PhoneCallBridge:
     """The live audio path for exactly one telephone call."""
@@ -80,6 +99,11 @@ class PhoneCallBridge:
         self._on_call_lost = on_call_lost
         self._lost_signalled = False
         self._lost_task: asyncio.Task | None = None
+
+        # Whether this caller has been greeted. One call, one greeting: a
+        # provider that retries its "incoming" event must not make the bank say
+        # hello twice down the same line.
+        self._greeted = False
 
         # Monotonic, because a clock that can go backwards would make a live
         # call look idle. Read by the idle sweep.
@@ -175,6 +199,51 @@ class PhoneCallBridge:
                 type(error).__name__,
             )
             self._signal_lost()
+
+    @property
+    def greeted(self) -> bool:
+        return self._greeted
+
+    async def greet(self) -> bool:
+        """Open the conversation, so the caller is not met with silence.
+
+        A telephone caller hears nothing until somebody speaks, and the model
+        will not speak until something prompts a turn — the browser page does
+        this itself by sending `response.create` over its data channel. Nothing
+        was doing it for the telephone, so a live caller would have connected
+        successfully and waited in silence.
+
+        The greeting is produced by the **agent**, through the same realtime
+        session that carries the rest of the call, using the wording already in
+        its instructions. It is deliberately not a recorded file or a separate
+        audio path: a second way to make sound reach a caller would be a second
+        thing to keep in step with the agent's actual behaviour, and the first
+        to drift.
+
+        Returns True if this call is the one that greeted, False if it had been
+        greeted already or is closing. Guarded rather than trusted, because a
+        duplicate provider event and a media socket attaching can both arrive
+        at a moment that looks like the start of the call.
+        """
+        if self._greeted or self._closed:
+            return False
+        self._greeted = True
+
+        try:
+            await self._realtime.send_message(self.banking_session_id, GREETING_CUE)
+        except Exception as error:
+            # A caller who is not greeted still has a working call — they can
+            # speak first, and the agent answers. Not worth ending a call over.
+            self._greeted = False
+            logger.warning(
+                "bridge[%s] greeting could not be delivered: %s",
+                self.provider_call_id,
+                type(error).__name__,
+            )
+            return False
+
+        self.last_activity = time.monotonic()
+        return True
 
     def _signal_lost(self) -> None:
         """Tell the owner this call has failed, exactly once.
