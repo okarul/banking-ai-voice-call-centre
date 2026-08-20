@@ -124,6 +124,41 @@ class Settings:
         self.sip_public_uri: str | None = os.getenv("SIP_PUBLIC_URI") or None
         self.sip_provider_domain: str | None = os.getenv("SIP_PROVIDER_DOMAIN") or None
 
+        # The shared secret an inbound provider event is signed with. Backend
+        # only: it is never returned by a route, never logged, and deliberately
+        # absent from `public_settings()`. Without it the webhook cannot verify
+        # anything, so it refuses every request rather than accepting unsigned
+        # ones — see `telephony_webhook_ready`.
+        self.telephony_webhook_secret: str | None = (
+            os.getenv("TELEPHONY_WEBHOOK_SECRET") or None
+        )
+        # How far a signed timestamp may be from now, in seconds, in either
+        # direction. Five minutes is the usual provider convention: long enough
+        # to survive ordinary clock drift and a retry, short enough that a
+        # captured request stops being useful quickly.
+        self.telephony_signature_tolerance_seconds: int = _positive_int(
+            os.getenv("TELEPHONY_SIGNATURE_TOLERANCE_SECONDS"), default=300
+        )
+
+        # --- persistent PIN lockout --------------------------------------
+        # The per-call lockout stops three wrong guesses inside one call. These
+        # two settings are what stop the caller who simply redials: failures are
+        # counted against the claimed customer id across calls.
+        #
+        # Higher than the per-call limit on purpose. Three failures in one call
+        # is a caller who has forgotten their PIN; this threshold is meant to
+        # catch the pattern that only an attacker produces.
+        self.pin_lockout_max_attempts: int = _positive_int(
+            os.getenv("PIN_LOCKOUT_MAX_ATTEMPTS"), default=5
+        )
+        # Both how long a lock lasts and how far back failures are counted. A
+        # lock that never expired would let one mistyped PIN deny a shared
+        # demonstration customer to a whole classroom, which is a denial of
+        # service wearing the costume of a security control.
+        self.pin_lockout_minutes: int = _positive_int(
+            os.getenv("PIN_LOCKOUT_MINUTES"), default=15
+        )
+
         # Synthetic data only. This is a demonstration bank; turning it off
         # would imply a real banking connector, and there is none.
         self.demo_mode: bool = _flag(os.getenv("DEMO_MODE"), True)
@@ -166,6 +201,17 @@ class Settings:
         as "not available" rather than as an attempt that fails later.
         """
         return bool(self.telephony_enabled and self.sip_public_uri)
+
+    @property
+    def telephony_webhook_ready(self) -> bool:
+        """Whether the inbound event endpoint may be served at all.
+
+        The signing secret is required, not optional. A webhook with no secret
+        could only either reject everything or accept anything, and the second
+        is how a public endpoint becomes a way to open banking sessions from the
+        internet. So an unconfigured secret means the route is not registered.
+        """
+        return bool(self.telephony_enabled and self.telephony_webhook_secret)
 
     def public_settings(self) -> dict:
         """Non-sensitive settings, safe to log or show an operator.

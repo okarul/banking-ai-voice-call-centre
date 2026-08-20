@@ -123,8 +123,18 @@ def test_the_application_starts_and_serves_with_telephony_disabled(client):
 
 
 def test_no_telephony_route_is_registered(client):
-    """Phase 1 adds no endpoint a provider could reach."""
-    paths = {getattr(route, "path", "") for route in app.routes}
+    """With telephony off, no endpoint a provider could reach exists.
+
+    Read from the OpenAPI schema rather than by walking `app.routes`. This
+    version of FastAPI defers `include_router` into lazy `_IncludedRouter`
+    objects that carry no `.path`, so scanning `app.routes` for path prefixes
+    inspected nothing at all and would have passed just as happily with the
+    telephony router registered. The schema is the resolved surface.
+    """
+    paths = set(app.openapi()["paths"])
+
+    # The scan is only meaningful if it can see the routes that do exist.
+    assert "/api/call/start" in paths
 
     for reserved in ("/api/telephony", "/api/sip", "/api/didww", "/sip", "/webhook"):
         assert not any(path.startswith(reserved) for path in paths), reserved

@@ -1,10 +1,14 @@
 # Telephony — security and privacy by design
 
-**Status: Phase 1 (foundation only).** `TELEPHONY_ENABLED` is `false`, no SIP
-code initialises, no provider is contacted, and no telephone call can be
-placed or received. This document records the decisions the telephone channel
-will be built to, so they are constraints on the work rather than a review of
-it afterwards.
+**Status: Phase 2 (inbound event boundary).** `TELEPHONY_ENABLED` still
+defaults to `false`. No SIP media code exists, no audio is carried, and no
+telephone call can yet be *answered* — Phase 2 implements the control plane
+only: a signed provider event can register that a call exists, take a capacity
+slot, and open an unauthenticated banking session.
+
+This document was written in Phase 1, before the code, so its decisions are
+constraints on the work rather than a review of it afterwards. Sections now
+record both the requirement and how it is met.
 
 The browser (WebRTC) channel is the working, classroom-ready baseline and is
 unchanged.
@@ -67,7 +71,19 @@ Unchanged and non-negotiable:
 - Customer ID **and** PIN required. Neither alone is sufficient.
 - Anti-enumeration: an unknown customer id and a wrong PIN are answered
   identically, in wording and in timing.
-- Attempts are counted and the session locks; the lock is per session.
+- Attempts are counted at **two** levels. Three wrong PINs lock the session,
+  as before. Failures are *also* counted in the database against the claimed
+  customer id, across calls, and enough of them lock that id for
+  `PIN_LOCKOUT_MINUTES` — because a per-session lock alone is not a
+  brute-force control when hanging up and redialling costs nothing, which on a
+  telephone line is a script rather than a chore.
+- The persistent count is kept for ids that match **no** customer too.
+  Otherwise only real customers would ever lock, and watching which claims lock
+  would separate real ids from invented ones — the enumeration channel the
+  generic failure message exists to close.
+- Locks expire. An unbounded lock on a shared demonstration customer would let
+  one mistyped PIN deny DEMO001 to a whole classroom: a denial of service
+  dressed as a security control.
 - Voice is **not** a biometric. No speaker recognition, no voiceprint, no
   emotion, age, gender or accent inference — see `RESPONSIBLE_AI_TELEPHONY.md`.
 
@@ -110,9 +126,15 @@ telemetry, exceptions, or any provider audit payload.
 - `settings.public_settings()` is an **allow-list**. A denylist would start
   leaking the day somebody added a setting and forgot to update it.
 - `.env` is git-ignored; `.env.example` carries placeholders only.
+- `TELEPHONY_WEBHOOK_SECRET` is read from the environment, is absent from
+  `public_settings()`, is never returned by any route, and is never written to
+  a log. `.env.example` carries an empty placeholder and instructions for
+  generating one.
 - `app.redaction` scrubs keys, bearer tokens, `api_key` fields and database
   passwords from every log record, and is installed on the root logger at
-  startup.
+  startup. The webhook secret is added to its **literal** rules: it is whatever
+  the operator generated, so it has no recognisable shape and no pattern rule
+  could catch it.
 
 ## 8. Logging and audit events
 
@@ -143,9 +165,24 @@ message is where an exception string hides.
 
 One ceiling for the whole bank. `REALTIME_MAX_ACTIVE_SESSIONS` counts
 established connections plus in-flight reservations, keyed by banking session
-id with no notion of channel, so a telephone call will consume the same slot a
+id with no notion of channel, so a telephone call consumes the same slot a
 browser call would. There is deliberately no separate phone capacity setting,
 and a test asserts none exists.
+
+A registered telephone call is a *registered call*, not a held reservation.
+That distinction is cleanup: a reservation is invisible to `close_all()` and to
+the idle sweep, so a call whose end event never arrived would hold a slot until
+the process restarted.
+
+The claim is taken **before** the slot, never after. Reserving first would mean
+every duplicate retry briefly consumed capacity before discovering it was a
+duplicate, so a provider retrying under load could turn away real callers with
+capacity it was never entitled to.
+
+**Application capacity and provider capacity are separate things.** The
+configured ceiling is what this application will admit. The external provider
+has its own limit — measured at roughly three concurrent sessions — which may
+be lower, and which this setting neither knows nor controls.
 
 ## 10. Retention
 
@@ -165,14 +202,23 @@ existing customer-safe messages are the model:
 > "Voice banking is temporarily busy. Please try again shortly."
 > "I'm unable to retrieve that information right now."
 
-## 12. The provider boundary and the future webhook
+## 12. The provider boundary and the inbound webhook
 
-**Nothing described in this section exists yet.** Phase 1 registers no
-telephony route and exposes no public endpoint; a test asserts that no path
-beginning `/api/telephony`, `/api/sip`, `/api/didww`, `/sip` or `/webhook` is
-registered. These are the requirements the endpoint must satisfy before it is
-written, recorded now so they constrain the implementation rather than being
-retrofitted to it.
+**Status: implemented in Phase 2** as `POST /api/telephony/incoming`. The
+requirements below were written in Phase 1, before the endpoint existed, so
+they constrained the implementation rather than describing it afterwards. What
+follows now records both the requirement and how it is met.
+
+The route is registered **only** when `TELEPHONY_ENABLED` is true *and*
+`TELEPHONY_WEBHOOK_SECRET` is set — see `app.main.create_app`. With either
+missing, the path does not exist, and a test asserts so. Not registering is a
+stronger guarantee than registering something that refuses: a route that exists
+can be mis-deployed or accidentally exempted by a later change, and the default
+configuration is the one where it was never added.
+
+Phase 2 is the control plane only. No audio is carried, no SIP media session is
+opened, and no call is answered — a registered call holds a session and a
+capacity slot, and waits for Phase 3.
 
 The boundary itself is the important idea. A provider event is a *claim by an
 outside party over the public internet*, not an instruction. Everything on the
@@ -215,10 +261,16 @@ to act on it.
   are ordinarily benign — a provider retrying after a slow response is normal
   behaviour, not an attack.
 - Idempotency is keyed on `provider_event_id` (this exact notification) and
-  `provider_call_id` (this call). Both fields exist on `agent_sessions` from
-  Phase 1; the dedupe check itself is Phase 2. A repeated event is
-  acknowledged and ignored, and one `provider_call_id` maps to at most one
-  `agent_session_id`.
+  `provider_call_id` (this call). Both are enforced by **partial unique
+  indexes** (`WHERE ... IS NOT NULL`, so browser calls may all sit at NULL),
+  created by the schema helper in `app.database.seed`. The claim *is* the
+  insert: `if not exists: create()` would let two workers both find nothing and
+  both proceed, so the database settles it and the loser takes an
+  `IntegrityError` that becomes a deterministic duplicate response.
+- Only a provider-id conflict counts as a duplicate. `agent_session_id` is
+  derived from `max(id)` and can collide between simultaneous inserts; that is
+  retried, because reporting it as a duplicate would strand a real second
+  caller whose call was never registered.
 - The rule that makes this matter: a retry must never produce a second capacity
   reservation, a second banking session, a second agent session, or a second
   acceptance. Acknowledging a duplicate is cheap; double-booking a slot that a
@@ -228,7 +280,10 @@ to act on it.
 
 - **No banking tool is invoked from a raw webhook.** The handler does not read
   an account, look up a customer, check a PIN, or call anything in `app.tools`.
-  It validates an event and hands off. A webhook that could reach a banking
+  It validates an event and hands off. `app.telephony.service` imports no
+  banking module, and the strict schema has no field that could name a
+  customer — `extra="forbid"` means a payload carrying `customer_id` or
+  `authenticated: true` is rejected outright rather than accepted and ignored. A webhook that could reach a banking
   tool would be a second route around the authorization guards, which is the
   one thing this architecture exists to prevent.
 - No event authenticates anybody. The most a perfectly valid, correctly signed
@@ -266,6 +321,20 @@ to act on it.
 - No fund transfer, payment, beneficiary, card or lending capability. The
   channel is read-only: authentication, accounts, loans.
 - No financial advice. Factual synthetic account and loan information only.
-- The telephone channel does not exist yet. Nothing in this document describes
-  running code beyond the channel model, configuration and the documented
-  boundary.
+- **No audio.** Phase 2 is the control plane only: a call can be registered,
+  counted and closed, but not answered. There is no SIP media path, so a caller
+  would hear nothing. Phase 3.
+- **The signing scheme is an abstraction, not DIDWW compatibility.** No
+  provider here has published a scheme this implements. `verify_provider_request`
+  is the seam where a real one is added; until then the scheme is ours, and the
+  deterministic credentials are for tests and local development.
+- **No per-source rate limiting.** The persistent lockout closes the redial
+  loop for a single claimed id. An attacker spreading guesses across many ids
+  is slowed only by capacity.
+- **Replay protection has no nonce store.** A signed request is refused once it
+  is older than the tolerance, and a repeat inside that window is caught by
+  idempotency — but an event whose row has aged out of retention could in
+  principle be replayed later.
+- **Single-process capacity.** Admission control is in-memory in one process.
+  Idempotency is database-backed and survives multiple workers; the capacity
+  ceiling would need shared state to do the same.

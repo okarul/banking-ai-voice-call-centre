@@ -20,7 +20,8 @@ short-lived database session, writes, and closes.
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.database.connection import session_scope
 from app.database.models import AgentSession, AgentToolEvent, ConversationMessage
@@ -399,3 +400,194 @@ def record_rejection(
             )
         )
     return agent_session_id
+
+
+# --- telephone call registration ---------------------------------------------
+#
+# Everything above this line is observability, and every function is wrapped in
+# `@_safe` so that a failed write can never fail a customer's call.
+#
+# The two functions below deliberately break that rule, and the reason is worth
+# stating plainly: these writes are not a record of a decision, they *are* the
+# decision. The unique index on `provider_call_id` is what stops one telephone
+# call being answered twice, and the conditional status update is what stops one
+# hang-up releasing a capacity slot twice. A swallowed exception here would
+# report success to the caller while the guarantee silently did not hold — which
+# is precisely the failure mode idempotency exists to prevent.
+#
+# So they raise, and `app.telephony.service` decides what a failure means.
+
+
+# How many times a claim will retry a lost race for an operator-facing name.
+# Small on purpose: each retry is one contended insert, and a provider that
+# genuinely sent this many simultaneous calls is better served by a retry of
+# its own than by us looping.
+_CLAIM_ATTEMPTS = 5
+
+
+class DuplicateProviderCall(Exception):
+    """This provider call or event has already been registered."""
+
+    def __init__(self, provider_call_id: str) -> None:
+        super().__init__(provider_call_id)
+        self.provider_call_id = provider_call_id
+
+
+# The indexes that mean "we have seen this call before". Any *other* integrity
+# violation means something else went wrong, and must not be reported as a
+# duplicate — see `claim_phone_call`.
+_PROVIDER_INDEXES = (
+    "uq_agent_sessions_provider_call_id",
+    "uq_agent_sessions_provider_event_id",
+)
+
+
+def _is_duplicate_provider_conflict(error: IntegrityError) -> bool:
+    """Whether this integrity error is a provider id already in use."""
+    text = str(getattr(error, "orig", error))
+    return any(name in text for name in _PROVIDER_INDEXES)
+
+
+def claim_phone_call(
+    banking_session_id: str,
+    *,
+    provider_call_id: str,
+    provider_event_id: str,
+) -> str:
+    """Register one telephone call, or refuse because it is already registered.
+
+    The claim is the insert itself. Checking for an existing row first and
+    inserting if absent would read correctly and behave wrongly: two workers
+    handling the same retry would both find nothing, both insert, and both
+    proceed to take a capacity slot for one telephone call. Here the database
+    decides — the partial unique indexes admit exactly one of them, and the
+    loser gets an `IntegrityError` that becomes `DuplicateProviderCall`.
+
+    Note what is *not* set: `customer_id` stays null and `authenticated` stays
+    false. A provider telling us a call exists has not told us who is on it.
+    """
+    now = _now()
+
+    # `_next_agent_session_id` derives AGT-000123 from `max(id)`, which two
+    # transactions running at the same instant will read identically. That
+    # collides on the `agent_session_id` unique constraint — an integrity error
+    # that has nothing to do with duplication.
+    #
+    # Treating every integrity error as a duplicate would be worse than the
+    # collision it papered over: two genuinely different telephone calls
+    # arriving together would see one of them acknowledged as a repeat and
+    # silently never registered, leaving a real caller connected to nothing. So
+    # the constraint is identified, and only a provider-id conflict counts as a
+    # duplicate. A name collision is retried, because the next read of `max(id)`
+    # sees the row the winner just committed.
+    for _ in range(_CLAIM_ATTEMPTS):
+        try:
+            with session_scope() as db:
+                agent_session_id = _next_agent_session_id(db)
+                db.add(
+                    AgentSession(
+                        agent_session_id=agent_session_id,
+                        banking_session_id=banking_session_id,
+                        channel=Channel.PHONE.value,
+                        provider_call_id=provider_call_id,
+                        provider_event_id=provider_event_id,
+                        customer_id=None,
+                        authenticated=False,
+                        auth_status=PENDING,
+                        status=ACTIVE,
+                        started_at=now,
+                        capability=DEFAULT_CAPABILITY,
+                        tool_call_count=0,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            return agent_session_id
+        except IntegrityError as error:
+            if _is_duplicate_provider_conflict(error):
+                raise DuplicateProviderCall(provider_call_id) from error
+            last_error = error
+
+    # Every attempt lost the race for a name. Raising is correct: the caller
+    # turns this into a generic failure, and the provider retries. Reporting a
+    # duplicate here would strand the call instead.
+    raise last_error
+
+
+def close_phone_call(provider_call_id: str, *, reason: str = "CUSTOMER_ENDED"):
+    """End the call with this provider id, exactly once.
+
+    Returns the banking session id if this call was open and this is the call
+    that closed it, or None if there was nothing to close — either because no
+    such call exists, or because it has already ended.
+
+    The distinction matters because the caller uses the return value to decide
+    whether to hand a capacity slot back. Two `ended` events for one call must
+    release one slot, so the transition to a closed status has to be the thing
+    that is atomic, not a status check followed by an update. `UPDATE ... WHERE
+    ended_at IS NULL` does that in one statement: the row moves once, and only
+    the statement that moved it gets a row back.
+
+    Scoped to `provider_call_id`, so an event naming a call that is not this
+    one cannot reach into anybody else's.
+    """
+    now = _now()
+    with session_scope() as db:
+        result = db.execute(
+            update(AgentSession)
+            .where(
+                AgentSession.provider_call_id == provider_call_id,
+                AgentSession.channel == Channel.PHONE.value,
+                AgentSession.ended_at.is_(None),
+            )
+            .values(
+                ended_at=now,
+                status=COMPLETED,
+                disconnect_reason=reason,
+                updated_at=now,
+            )
+            .returning(AgentSession.banking_session_id, AgentSession.started_at)
+        ).first()
+
+        if result is None:
+            return None
+
+        banking_session_id, started = result
+        if started is not None:
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            db.execute(
+                update(AgentSession)
+                .where(AgentSession.provider_call_id == provider_call_id)
+                .values(duration_seconds=max(0, int((now - started).total_seconds())))
+            )
+        return banking_session_id
+
+
+@_safe("mark_phone_call_rejected")
+def mark_phone_call_rejected(
+    provider_call_id: str, *, reason: str = "CAPACITY_REJECTED"
+) -> None:
+    """Turn an already-claimed call into a refusal.
+
+    Safe to swallow, unlike the two above: the claim has already happened, the
+    capacity slot has already been handed back, and this only corrects what an
+    operator sees on the board.
+    """
+    now = _now()
+    with session_scope() as db:
+        db.execute(
+            update(AgentSession)
+            .where(
+                AgentSession.provider_call_id == provider_call_id,
+                AgentSession.ended_at.is_(None),
+            )
+            .values(
+                status=REJECTED,
+                ended_at=now,
+                duration_seconds=0,
+                disconnect_reason=reason,
+                banking_session_id=None,
+                updated_at=now,
+            )
+        )

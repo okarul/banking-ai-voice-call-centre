@@ -9,6 +9,7 @@ Layering: route -> normalization -> this service -> SessionManager + repository.
 
 import secrets
 
+from app.auth import lockout
 from app.auth.normalization import normalize_customer_id, normalize_pin
 from app.database.connection import session_scope
 from app.database.repositories import get_customer_by_customer_id
@@ -136,6 +137,13 @@ def verify_pin(
     if not pin:
         return _failure("INVALID_PIN_FORMAT", authenticated=False)
 
+    # The count that survives hanging up. Checked before the PIN is compared,
+    # so a locked id costs an attacker a refusal rather than a guess — and
+    # checked against the *claimed* id, which is the only thing known at this
+    # point and the only thing an attacker can iterate.
+    if lockout.is_locked(candidate) is not None:
+        return _failure("AUTHENTICATION_LOCKED", authenticated=False)
+
     with session_scope() as db:
         customer = get_customer_by_customer_id(db, candidate)
         # Read the hash into a local only long enough to compare it. It is
@@ -150,6 +158,8 @@ def verify_pin(
             known = False
 
     if verify_pin_hash(pin, stored_hash) and known:
+        # Proving identity answers the question the counter was asking.
+        lockout.clear(candidate)
         manager.update_session(
             session_id,
             customer_id=candidate,
@@ -162,8 +172,17 @@ def verify_pin(
             "customer_id": candidate,
         }
 
+    # Recorded against the claimed id before anything else, so a caller who
+    # hangs up mid-guess still pays for the attempt they just made.
+    persistent = lockout.record_failure(candidate)
+
     attempts = session.authentication_attempts + 1
-    locked = attempts >= MAX_AUTHENTICATION_ATTEMPTS
+    # Either limit can end this call's attempts: three wrong PINs inside one
+    # call, or enough failures across calls to trip the persistent lock. The
+    # caller is told the same thing by both, because the difference between
+    # "you have used this call's attempts" and "this id is locked everywhere"
+    # is precisely the information an attacker is probing for.
+    locked = attempts >= MAX_AUTHENTICATION_ATTEMPTS or persistent.locked
 
     manager.update_session(
         session_id,

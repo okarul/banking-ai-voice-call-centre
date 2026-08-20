@@ -238,6 +238,7 @@ def create_tables() -> None:
     engine = get_engine()
     Base.metadata.create_all(engine)
     _add_missing_columns(engine)
+    _add_missing_indexes(engine)
 
 
 # Columns added after the operational tables first shipped, with the SQL to add
@@ -268,6 +269,57 @@ def _add_missing_columns(engine) -> list[str]:
                 text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
             )
         added.append(f"{table}.{column}")
+
+    return added
+
+
+# Indexes added after the operational tables first shipped. Written as
+# `CREATE UNIQUE INDEX IF NOT EXISTS`, so applying them twice is a no-op and a
+# database that already has them is left alone.
+#
+# Both are **partial** — `WHERE ... IS NOT NULL`. PostgreSQL already treats
+# NULLs as distinct in a unique index, so a plain unique index would also allow
+# many browser calls to sit at NULL; the explicit predicate says so out loud
+# rather than resting on a subtlety that differs between databases, and it
+# keeps the index to the telephone rows that actually need it.
+#
+# This is what makes duplicate suppression a database guarantee rather than a
+# hopeful `if not exists: create()`. Two workers racing the same provider event
+# both reach the insert; exactly one commits and the other takes an
+# IntegrityError, which the telephony service turns into the same deterministic
+# duplicate response.
+_ADDED_INDEXES: tuple[tuple[str, str], ...] = (
+    (
+        "uq_agent_sessions_provider_call_id",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_sessions_provider_call_id "
+        "ON agent_sessions (provider_call_id) WHERE provider_call_id IS NOT NULL",
+    ),
+    (
+        "uq_agent_sessions_provider_event_id",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_sessions_provider_event_id "
+        "ON agent_sessions (provider_event_id) WHERE provider_event_id IS NOT NULL",
+    ),
+)
+
+
+def _add_missing_indexes(engine) -> list[str]:
+    """Create the idempotency indexes if the database lacks them."""
+    from sqlalchemy import inspect as sqla_inspect
+    from sqlalchemy import text
+
+    inspector = sqla_inspect(engine)
+    if "agent_sessions" not in inspector.get_table_names():
+        return []
+
+    existing = {index["name"] for index in inspector.get_indexes("agent_sessions")}
+    added = []
+
+    for name, statement in _ADDED_INDEXES:
+        if name in existing:
+            continue
+        with engine.begin() as connection:
+            connection.execute(text(statement))
+        added.append(name)
 
     return added
 

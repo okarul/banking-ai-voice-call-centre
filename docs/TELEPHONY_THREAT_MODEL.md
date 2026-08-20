@@ -1,8 +1,9 @@
 # Telephony threat model
 
-**Status: Phase 1.** The telephone channel is not implemented. This is the
-model the implementation must satisfy, written before the code so it constrains
-the design rather than describing it.
+**Status: Phase 2.** The inbound event boundary is implemented; SIP media is
+not, so no call can yet be answered. This model was written in Phase 1, before
+the code, so it constrains the design rather than describing it. Controls now
+in place say so; the ones still ahead are marked.
 
 Scope: a SIP/DIDWW inbound voice channel reaching the existing synthetic
 banking demo. The browser (WebRTC) channel is the working baseline; threats
@@ -20,9 +21,10 @@ residual risk is stated for today.
 **Threat.** An attacker sends the backend a fabricated "incoming call" event to
 open a banking session or drive the agent.
 **Risk.** High — a public webhook is reachable by anyone who finds it.
-**Control.** No public webhook exists in Phase 1. When one is added: verify the
-provider's signature or mutual TLS, allow-list source addresses, reject
-unauthenticated payloads before any session is created. A forged event still
+**Control.** HMAC-SHA256 over `timestamp.body`, verified on the raw bytes
+before parsing, before logging and before any session exists. An unconfigured
+secret means the route is not registered at all rather than accepting unsigned
+requests. Every failure returns one indistinguishable 401. A forged event still
 authenticates nobody — it can at most open an anonymous session that must pass
 the PIN check like any other.
 **Residual.** Low. Worst case is capacity consumption, covered by D1.
@@ -36,16 +38,20 @@ already processed is acknowledged and ignored. Both columns exist on
 `provider_event_id` names the single notification about it, which is what
 distinguishes a retry from a second call. The dedupe check that reads them is
 Phase 2, when there is an endpoint to receive an event at all.
-**Residual.** Low, once implemented. **Today: not implemented** — no endpoint
-exists to replay against.
+**Residual.** Low. A capture replayed *inside* the tolerance window is caught
+by idempotency instead — the event id is already registered — so both controls
+have to fail for a replay to land. Remaining: no nonce store, so an event whose
+row has aged out of retention could in principle be replayed long after.
 
 ### A3. Duplicate incoming-call event
 **Threat.** The provider legitimately retries, creating two banking sessions
 for one call.
 **Risk.** Medium — retries are normal, not adversarial.
-**Control.** Same idempotency key as A2. One `provider_call_id` maps to at most
-one `agent_session_id`.
-**Residual.** Low. **Today: not implemented.**
+**Control.** Partial unique indexes on `provider_call_id` and
+`provider_event_id`. The insert *is* the claim, so two workers racing the same
+retry are separated by the database rather than by a check-then-insert. Tested
+sequentially and with concurrent requests.
+**Residual.** Low.
 
 ### A4. Caller ID spoofing
 **Threat.** The caller sets the `From` header or ANI to impersonate a customer.
@@ -82,14 +88,21 @@ response. No unbounded reads.
 **Threat.** Repeated PIN guesses over a channel with no CAPTCHA.
 **Risk.** High — a four-digit PIN is 10 000 possibilities, and telephony
 automates cheaply.
-**Control.** Attempts counted per session; the session locks after the
-configured limit. Locking is per session, so it cannot be used to lock another
-customer out. Phase 2 should add per-DID and per-source rate limiting, since a
-new session per attempt resets the counter.
-**Residual.** **Medium today.** Session-level locking does not stop an attacker
-who opens a fresh session per guess; capacity control (D1) limits the rate but
-was not designed as a brute-force control. This is the most significant open
-item for the telephone channel and must be closed before any non-synthetic use.
+**Control.** Two counters, and the second is the one that matters here.
+Attempts are counted per session and the session locks after three, as before.
+Failures are *also* recorded in `customer_auth_locks` against the **claimed**
+customer id, atomically, and survive the call — so hanging up and redialling no
+longer buys a fresh budget. Reaching `PIN_LOCKOUT_MAX_ATTEMPTS` locks that id
+for `PIN_LOCKOUT_MINUTES`, correct PIN included. Unknown ids are counted too,
+so the lock cannot be used to tell a real customer from an invented one.
+**Residual.** **Low-to-medium.** The redial loop is closed and tested,
+including concurrently. What remains: the lock is per claimed id rather than
+per source, so an attacker spreading guesses thinly across many ids is slowed
+only by capacity (D1); there is no per-DID or per-source rate limit; and the
+expiry that stops a shared demo customer being locked out permanently also
+bounds how long an attacker must wait. Per-source rate limiting remains the
+right next control, and production would want a longer window plus an explicit
+unlock path.
 
 ### B2. Customer enumeration
 **Threat.** Probing which customer ids exist.

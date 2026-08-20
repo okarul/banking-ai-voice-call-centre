@@ -94,7 +94,16 @@ def _live_secrets() -> tuple[str, ...]:
 
     return tuple(
         value
-        for value in (settings.openai_api_key, settings.database_url)
+        for value in (
+            settings.openai_api_key,
+            settings.database_url,
+            # The webhook signing secret has no recognisable shape — it is
+            # whatever the operator generated — so no pattern above can catch
+            # it. Only the literal rule can, which is why it has to be named
+            # here: a traceback rendering a verification call's locals would
+            # otherwise print it in full.
+            settings.telephony_webhook_secret,
+        )
         if isinstance(value, str) and len(value) >= 8
     )
 

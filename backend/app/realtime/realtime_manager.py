@@ -247,6 +247,19 @@ class RealtimeManager:
         async with self._lock:
             self._reserved.discard(banking_session_id)
 
+    async def release_all(self) -> int:
+        """Drop every outstanding reservation. Returns how many were held.
+
+        A reservation is a slot claimed by a caller that has not finished
+        connecting, so it is deliberately invisible to `close_all()`, which
+        deals in live calls. That leaves reservations as the one piece of
+        capacity state a shutdown or a test teardown would otherwise miss.
+        """
+        async with self._lock:
+            count = len(self._reserved)
+            self._reserved.clear()
+            return count
+
     # --- queries ----------------------------------------------------------
 
     def get(self, banking_session_id: str) -> RealtimeConnection | None:

@@ -252,3 +252,60 @@ class AgentToolEvent(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<AgentToolEvent {self.agent_session_id} {self.tool_name}>"
+
+
+class CustomerAuthLock(Base):
+    """Failed PIN attempts for one claimed customer id, across every call.
+
+    The per-session lockout in `app.auth.authentication` stops three wrong
+    guesses inside one call. On its own that is not a brute-force control: a
+    caller who hangs up and redials gets a fresh session and three more
+    guesses, so a four-digit PIN stays reachable by anyone willing to dial
+    repeatedly. Telephony makes exactly that cheap and automatable.
+
+    So the count also lives here, keyed by the *claimed* id rather than by
+    session, and it survives the call that produced it.
+
+    Two details matter more than they look:
+
+    **Claimed, not verified.** A row is written for an id that matches no
+    customer just as readily as for one that does. If unknown ids were skipped,
+    an attacker could tell a real customer from an invented one by watching
+    which claims eventually lock — the enumeration channel the generic failure
+    message exists to close.
+
+    **Locks expire.** `locked_until` is a timestamp, not a flag. An unbounded
+    lock on shared demonstration customers would mean one mistyped PIN denies
+    the rest of a classroom, which is a denial of service wearing the costume
+    of a security control.
+
+    Operational state, not customer master data — hence its own table rather
+    than columns on `customers`, which holds the seeded demo bank.
+    """
+
+    __tablename__ = "customer_auth_locks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # The id the caller claimed. Not a foreign key: it may match no customer,
+    # and it must still be counted when it does not.
+    customer_id: Mapped[str] = mapped_column(String(20), unique=True, index=True)
+
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    # When the current run of failures began. Failures older than the
+    # configured window are not held against a caller for ever.
+    first_failed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_failed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Null means not locked. A past timestamp means a lock that has expired,
+    # which is treated as not locked rather than cleaned up eagerly.
+    locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<CustomerAuthLock {self.customer_id} {self.failed_attempts}>"
