@@ -146,6 +146,16 @@ class AgentSession(Base):
     provider_call_id: Mapped[str | None] = mapped_column(
         String(64), index=True, nullable=True
     )
+    # The identifier of the single provider notification that opened this call,
+    # as distinct from the call itself: one `provider_call_id` may be announced
+    # by several events if the provider retries. Kept so a retry can be
+    # recognised as a repeat rather than answered twice — see §12 of
+    # docs/TELEPHONY_SECURITY_PRIVACY_DESIGN.md. The field exists from Phase 1;
+    # the dedupe check that reads it belongs to Phase 2, when there is an
+    # endpoint to receive an event at all. Null for browser calls.
+    provider_event_id: Mapped[str | None] = mapped_column(
+        String(64), index=True, nullable=True
+    )
 
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE", index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

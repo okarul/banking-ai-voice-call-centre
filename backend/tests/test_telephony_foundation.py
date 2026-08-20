@@ -447,6 +447,81 @@ def test_no_separate_phone_capacity_setting_exists():
         assert forbidden not in names, forbidden
 
 
+# === idempotency foundation =================================================
+
+
+def test_a_call_carries_both_provider_identifiers():
+    """Two different things: which call, and which notification about it.
+
+    A provider that retries announces one call twice. Keeping both ids is what
+    lets Phase 2 recognise the second announcement as a repeat rather than
+    answering it as a second call.
+    """
+    session = session_manager.create_session()
+    recorder.start_session(
+        session.session_id,
+        channel=Channel.PHONE,
+        provider_call_id="call-1",
+        provider_event_id="evt-1",
+    )
+
+    record = only_row()
+    assert record["provider_call_id"] == "call-1"
+    assert record["provider_event_id"] == "evt-1"
+    # Still nobody, on either identifier.
+    assert record["customer_id"] is None
+
+
+def test_a_rejected_call_also_records_its_provider_identifiers():
+    """A refusal must be as traceable as an acceptance, or a retry storm is
+    invisible."""
+    recorder.record_rejection(
+        "CAPACITY_REJECTED",
+        channel=Channel.PHONE,
+        provider_call_id="call-2",
+        provider_event_id="evt-2",
+    )
+
+    record = only_row()
+    assert record["status"] == "REJECTED"
+    assert record["provider_call_id"] == "call-2"
+    assert record["provider_event_id"] == "evt-2"
+    assert record["banking_session_id"] is None
+    assert record["customer_id"] is None
+
+
+def test_browser_calls_leave_the_provider_identifiers_empty(call):
+    """Nothing about the WebRTC path acquired a provider field."""
+    record = only_row()
+
+    assert record["channel"] == "WEBRTC"
+    assert record["provider_call_id"] is None
+    assert record["provider_event_id"] is None
+
+
+def test_a_provider_event_id_is_not_a_customer_id():
+    """Same rule as the call id: a provider names events, not people."""
+    session = session_manager.create_session()
+    recorder.start_session(
+        session.session_id, channel=Channel.PHONE, provider_event_id="DEMO002"
+    )
+
+    record = only_row()
+    assert record["provider_event_id"] == "DEMO002"
+    assert record["customer_id"] is None
+    assert record["authenticated"] is False
+
+
+def test_the_schema_helper_knows_how_to_add_the_idempotency_column():
+    """An existing database must gain the column, not merely a model that
+    expects one."""
+    from app.database.seed import _ADDED_COLUMNS
+
+    additions = {(table, column) for table, column, _ in _ADDED_COLUMNS}
+    assert ("agent_sessions", "provider_event_id") in additions
+    assert ("agent_sessions", "provider_call_id") in additions
+
+
 # === audit event taxonomy ===================================================
 
 
@@ -454,11 +529,44 @@ def test_the_event_taxonomy_covers_the_call_lifecycle():
     names = {event.value for event in AuditEvent}
 
     for required in (
-        "CALL_RECEIVED", "CALL_STARTED", "AUTH_STARTED", "AUTH_SUCCEEDED",
+        "CALL_RECEIVED", "CALL_VALIDATED", "CALL_ACCEPTED", "CALL_REJECTED",
+        "CALL_STARTED", "AUTH_STARTED", "AUTH_SUCCEEDED",
         "AUTH_FAILED", "INTENT_RECEIVED", "TOOL_EXECUTED",
         "CALL_END_REQUESTED", "CALL_ENDED", "CALL_FAILED",
     ):
         assert required in names, required
+
+
+def test_the_vocabulary_is_one_vocabulary_not_two():
+    """A telephone moment is the same moment with `channel="PHONE"` on it.
+
+    Channel-prefixed names would let the two channels drift apart, so that a
+    control could be enforced on one and quietly not the other without any name
+    looking wrong.
+    """
+    names = {event.value for event in AuditEvent}
+
+    assert not any(name.startswith(("PHONE_", "WEBRTC_", "SIP_")) for name in names)
+    assert "channel" in ALLOWED_EVENT_FIELDS
+
+
+def test_a_boundary_rejection_records_a_category_and_nothing_else():
+    """The moment a forged or oversized event is turned away."""
+    payload = safe_event(
+        AuditEvent.CALL_REJECTED,
+        channel="PHONE",
+        provider_event_id="evt-9",
+        reason="SIGNATURE_INVALID",
+        raw_body="<the entire forged payload>",
+        signature="sha256=deadbeef",
+    )
+
+    assert payload == {
+        "event": "CALL_REJECTED",
+        "channel": "PHONE",
+        "provider_event_id": "evt-9",
+        "reason": "SIGNATURE_INVALID",
+    }
 
 
 def test_an_event_drops_anything_not_on_the_allow_list():

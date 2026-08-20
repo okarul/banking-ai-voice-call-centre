@@ -117,9 +117,22 @@ telemetry, exceptions, or any provider audit payload.
 ## 8. Logging and audit events
 
 `app.observability.events` defines the vocabulary: `CALL_RECEIVED`,
-`CALL_STARTED`, `AUTH_STARTED`, `AUTH_SUCCEEDED`, `AUTH_FAILED`,
-`INTENT_RECEIVED`, `TOOL_EXECUTED`, `CALL_END_REQUESTED`, `CALL_ENDED`,
-`CALL_FAILED`.
+`CALL_VALIDATED`, `CALL_ACCEPTED`, `CALL_REJECTED`, `CALL_STARTED`,
+`AUTH_STARTED`, `AUTH_SUCCEEDED`, `AUTH_FAILED`, `INTENT_RECEIVED`,
+`TOOL_EXECUTED`, `CALL_END_REQUESTED`, `CALL_ENDED`, `CALL_FAILED`.
+
+The first four are the boundary of §12, kept as separate moments because on the
+telephone they are genuinely different: an event arrived, it proved genuine and
+well-formed, and only then was a call admitted or refused. Collapsing them
+would make "we received a forged event and threw it away" indistinguishable
+from "we answered the telephone".
+
+The names carry no channel prefix. A telephone call being received is
+`CALL_RECEIVED` with `channel="PHONE"` — the moment is the same moment, and the
+channel is a field on it. Two parallel vocabularies would let the channels
+drift, so that a control could be enforced on one and quietly not the other
+without any name looking wrong. Filtering on `channel` gives the per-channel
+view.
 
 An event says *what happened*, never *what was said*. Fields are an allow-list;
 anything else is dropped silently rather than raising, because an observability
@@ -152,7 +165,89 @@ existing customer-safe messages are the model:
 > "Voice banking is temporarily busy. Please try again shortly."
 > "I'm unable to retrieve that information right now."
 
-## 12. Failure and incident handling
+## 12. The provider boundary and the future webhook
+
+**Nothing described in this section exists yet.** Phase 1 registers no
+telephony route and exposes no public endpoint; a test asserts that no path
+beginning `/api/telephony`, `/api/sip`, `/api/didww`, `/sip` or `/webhook` is
+registered. These are the requirements the endpoint must satisfy before it is
+written, recorded now so they constrain the implementation rather than being
+retrofitted to it.
+
+The boundary itself is the important idea. A provider event is a *claim by an
+outside party over the public internet*, not an instruction. Everything on the
+far side of that line is untrusted: the payload, its headers, the caller
+number, the display name, the provider's own identifiers. The handler's job is
+to decide whether the claim is well-formed and genuine, and — if it is — to
+hand a small, validated, internally-typed object to the application. It is not
+to act on it.
+
+**Transport and origin**
+
+- HTTPS only. No plaintext listener, no downgrade, no "just for testing" HTTP
+  variant — a webhook that has ever answered on HTTP is a webhook whose
+  payloads have travelled in clear text.
+- Verify the provider's signature where DIDWW supports one, or mutual TLS
+  where it does not. Failing that, an allow-list of provider source addresses
+  is a weaker fallback, not an equivalent: addresses are easier to spoof than
+  signatures are to forge.
+- Verification happens **before** parsing, before logging, and before any
+  session, capacity reservation or database row is created. An unverified
+  event has earned none of those.
+
+**Shape of the request**
+
+- Validate `Content-Type` explicitly. Reject anything unexpected rather than
+  sniffing the body.
+- Enforce a maximum body size at the boundary and reject oversized payloads
+  early, with a small response and no unbounded read.
+- Validate against a strict schema (Pydantic, as the existing routes use).
+  **Reject rather than coerce** — a missing field is a malformed event, not a
+  field to default. Unknown fields are dropped, never passed through.
+- Treat every provider string as untrusted text. It is never interpolated into
+  SQL, a shell command, a file path, or a model instruction.
+
+**Replay and duplication**
+
+- Replay protection where the provider supports it: a signed timestamp outside
+  a short tolerance window is rejected.
+- Duplicate-event protection regardless of provider support, because duplicates
+  are ordinarily benign — a provider retrying after a slow response is normal
+  behaviour, not an attack.
+- Idempotency is keyed on `provider_event_id` (this exact notification) and
+  `provider_call_id` (this call). Both fields exist on `agent_sessions` from
+  Phase 1; the dedupe check itself is Phase 2. A repeated event is
+  acknowledged and ignored, and one `provider_call_id` maps to at most one
+  `agent_session_id`.
+- The rule that makes this matter: a retry must never produce a second capacity
+  reservation, a second banking session, a second agent session, or a second
+  acceptance. Acknowledging a duplicate is cheap; double-booking a slot that a
+  student is waiting for is not.
+
+**What the handler may not do**
+
+- **No banking tool is invoked from a raw webhook.** The handler does not read
+  an account, look up a customer, check a PIN, or call anything in `app.tools`.
+  It validates an event and hands off. A webhook that could reach a banking
+  tool would be a second route around the authorization guards, which is the
+  one thing this architecture exists to prevent.
+- No event authenticates anybody. The most a perfectly valid, correctly signed
+  provider event can do is open an **anonymous** session, which must then pass
+  the same deterministic PIN check as any browser call. Signature verification
+  proves the event came from DIDWW; it says nothing whatever about who is
+  holding the telephone.
+
+**Logging at the boundary**
+
+- Log by category, never by content: an event name, a decision, an
+  `error_category`. Never the raw body, never headers, never the signature,
+  never the caller's number.
+- A rejected event is logged as a rejection with a reason category. The reason
+  is not returned to the sender in detail — an error that explains precisely
+  why a signature failed is a tool for the next attempt.
+- Boundary failures must never surface to a caller. See §11.
+
+## 13. Failure and incident handling
 
 - **Provider outage** — no call arrives; the browser channel is unaffected.
 - **Realtime outage** — the call cannot be answered; the caller is told the
@@ -165,7 +260,7 @@ existing customer-safe messages are the model:
   then investigate. Assume anything written to a log or a repository is
   disclosed.
 
-## 13. Known limitations
+## 14. Known limitations
 
 - No human-agent handoff exists. The AI must never claim to transfer a caller.
 - No fund transfer, payment, beneficiary, card or lending capability. The

@@ -25,14 +25,17 @@ provider's signature or mutual TLS, allow-list source addresses, reject
 unauthenticated payloads before any session is created. A forged event still
 authenticates nobody — it can at most open an anonymous session that must pass
 the PIN check like any other.
-**Residual.** Low. Worst case is capacity consumption, covered by A11.
+**Residual.** Low. Worst case is capacity consumption, covered by D1.
 
 ### A2. Replayed event
 **Threat.** A valid event is captured and resent to duplicate a call.
 **Risk.** Medium.
 **Control.** Idempotency on `provider_event_id` / `provider_call_id`: an event
-already processed is acknowledged and ignored. Fields exist on the model from
-Phase 1; the dedupe check is Phase 2.
+already processed is acknowledged and ignored. Both columns exist on
+`agent_sessions` from Phase 1 — `provider_call_id` names the call,
+`provider_event_id` names the single notification about it, which is what
+distinguishes a retry from a second call. The dedupe check that reads them is
+Phase 2, when there is an endpoint to receive an event at all.
 **Residual.** Low, once implemented. **Today: not implemented** — no endpoint
 exists to replay against.
 
@@ -52,7 +55,7 @@ no customer field, `identifies_customer()` returns `False`, and the caller
 number is discarded by default. Only the deterministic PIN check writes
 `session.customer_id`. Enforced by test.
 **Residual.** **None for identity.** A spoofed number can still place a call,
-which is what A11 addresses.
+which is what D1 addresses.
 
 ### A15. Malformed provider payload
 **Threat.** A payload with missing fields, wrong types or injected content
@@ -84,7 +87,7 @@ configured limit. Locking is per session, so it cannot be used to lock another
 customer out. Phase 2 should add per-DID and per-source rate limiting, since a
 new session per attempt resets the counter.
 **Residual.** **Medium today.** Session-level locking does not stop an attacker
-who opens a fresh session per guess; capacity control (A11) limits the rate but
+who opens a fresh session per guess; capacity control (D1) limits the rate but
 was not designed as a brute-force control. This is the most significant open
 item for the telephone channel and must be closed before any non-synthetic use.
 
@@ -183,7 +186,7 @@ it.
 
 ## D. Availability
 
-### A11. Capacity exhaustion
+### D1. Capacity exhaustion
 **Threat.** Calls consume every available slot, denying service to students.
 **Risk.** Medium.
 **Control.** One ceiling across both channels: `REALTIME_MAX_ACTIVE_SESSIONS`

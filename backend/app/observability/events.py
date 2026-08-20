@@ -10,6 +10,14 @@ credential and the model's reasoning are all absent by construction — the
 payload carries identifiers, a category and a timestamp, and nothing that would
 matter if it were read aloud.
 
+The names are deliberately channel-neutral. A telephone call being received is
+`CALL_RECEIVED` with `channel="PHONE"`, not `PHONE_CALL_RECEIVED`: the moment
+is the same moment, and the channel is a field on it. Prefixing the channel
+into the name would double the vocabulary, and — worse — it would let the two
+channels drift apart, so that a control could quietly be enforced on one and
+not the other without any name looking wrong. Filtering by `channel` gives an
+operator the per-channel view; nothing is lost.
+
 Nothing here writes anything. `app.observability.recorder` does the writing;
 this is the vocabulary it uses.
 """
@@ -20,9 +28,23 @@ from enum import Enum
 class AuditEvent(str, Enum):
     """Moments in a call's life that an operator may need to account for."""
 
-    # A provider told us about an inbound call. Telephone channel only, and it
-    # happens before any banking session exists.
+    # The first three happen before any banking session exists, and on the
+    # telephone they are three genuinely different moments an operator may need
+    # to tell apart: an event arrived, it proved to be genuine and well-formed,
+    # and only then was a call admitted.
+    #
+    # A provider told us about an inbound call. Nothing has been checked yet.
     CALL_RECEIVED = "CALL_RECEIVED"
+    # The event passed signature, schema and size checks at the boundary. It is
+    # a real notification from the provider; it still says nothing about who is
+    # holding the telephone.
+    CALL_VALIDATED = "CALL_VALIDATED"
+    # Admission control had a slot and the call was taken.
+    CALL_ACCEPTED = "CALL_ACCEPTED"
+    # Admission control refused it. Carries a `reason` category, never a
+    # message, and never reaches the caller in that form.
+    CALL_REJECTED = "CALL_REJECTED"
+
     CALL_STARTED = "CALL_STARTED"
 
     AUTH_STARTED = "AUTH_STARTED"
@@ -45,6 +67,7 @@ ALLOWED_EVENT_FIELDS = frozenset(
         "event",
         "agent_session_id",
         "provider_call_id",
+        "provider_event_id",  # which notification, for spotting a retry
         "channel",
         "customer_id",     # only after a real PIN check, never a claim
         "tool_name",

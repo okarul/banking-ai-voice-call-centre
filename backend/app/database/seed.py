@@ -245,6 +245,7 @@ def create_tables() -> None:
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("agent_sessions", "channel", "VARCHAR(10) DEFAULT 'WEBRTC'"),
     ("agent_sessions", "provider_call_id", "VARCHAR(64)"),
+    ("agent_sessions", "provider_event_id", "VARCHAR(64)"),
 )
 
 

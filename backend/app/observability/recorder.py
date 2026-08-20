@@ -102,12 +102,17 @@ def start_session(
     *,
     channel: Channel | str = Channel.WEBRTC,
     provider_call_id: str | None = None,
+    provider_event_id: str | None = None,
 ) -> str | None:
     """Record that a voice call has begun. Returns its operator-facing id.
 
     `channel` is how the audio arrived and nothing more. It is never read to
     decide who the caller is: `customer_id` stays null here and is only written
     by `record_authentication`, after the deterministic PIN check has passed.
+
+    The two provider identifiers are stored for correlation and, later, for
+    recognising a retry. Neither says anything about identity: a provider is
+    naming a call, not a customer.
     """
     now = _now()
     with session_scope() as db:
@@ -118,6 +123,7 @@ def start_session(
                 banking_session_id=banking_session_id,
                 channel=normalise_channel(channel).value,
                 provider_call_id=provider_call_id,
+                provider_event_id=provider_event_id,
                 status=ACTIVE,
                 auth_status=PENDING,
                 authenticated=False,
@@ -360,6 +366,7 @@ def record_rejection(
     *,
     channel: Channel | str = Channel.WEBRTC,
     provider_call_id: str | None = None,
+    provider_event_id: str | None = None,
 ) -> str | None:
     """Record a call that was refused admission and never became a session.
 
@@ -376,6 +383,7 @@ def record_rejection(
                 banking_session_id=None,
                 channel=normalise_channel(channel).value,
                 provider_call_id=provider_call_id,
+                provider_event_id=provider_event_id,
                 customer_id=None,
                 authenticated=False,
                 auth_status=PENDING,
