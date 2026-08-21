@@ -73,50 +73,71 @@ def test_no_wideband_or_compressed_codec_is_configured():
 # === media fork =============================================================
 
 
-def test_the_dialplan_forks_audio_with_a_core_application():
-    """`unicast` is mod_dptools. No third-party module has to be built in."""
+def test_the_dialplan_bridges_with_a_core_module_only():
+    """mod_sofia ships in every build. The audio-fork modules do not.
+
+    An earlier design used the `unicast` application. It does not exist in
+    FreeSWITCH 1.10.12 — verified against a running build, whose mod_dptools
+    offers 178 applications and none of them is `unicast` — so the dialplan
+    bridges the call over SIP instead, which needs only mod_sofia.
+    """
+    text = directives(DIALPLAN)
+
+    assert 'application="bridge"' in text
+    assert "sofia/channel2/sip:gateway@" in text
+    # Checked against directives, not comments: the comment above the dialplan
+    # legitimately explains why `unicast` is absent.
+    for absent in ("unicast", "mod_audio_stream", "mod_audio_fork", "audio_fork"):
+        assert absent not in text, absent
+
+
+def test_the_bridge_target_is_configuration_not_a_literal_address():
+    """A hard-coded address is a gateway somebody else can point this at."""
     text = DIALPLAN.read_text(encoding="utf-8")
 
-    assert 'application="unicast"' in text
-    assert "transport=udp" in text
-    assert "flags=native" in text
-    for third_party in ("mod_audio_stream", "mod_audio_fork", "audio_fork"):
-        assert third_party not in text, third_party
+    assert "channel2_gateway_uri" in text
+    assert not re.search(r"sip:gateway@\d+\.\d+\.\d+\.\d+", text)
 
 
-def test_the_fork_target_is_inside_the_gateway_media_range():
-    """A fork aimed outside the range would hit a port nothing is listening on."""
-    text = DIALPLAN.read_text(encoding="utf-8")
-    gateway = GatewaySettings()
+def test_no_media_port_is_pinned_in_the_dialplan():
+    """SDP allocates a port per call; a pinned one would mix two callers.
 
-    assert "remote-port=16384" in text
-    assert gateway.media_port_low <= 16384 <= gateway.media_port_high
-
-
-def test_the_media_port_range_is_bounded_and_small():
-    """Every port in an RTP range is a firewall rule."""
-    gateway = GatewaySettings()
-
-    assert gateway.media_ports >= 5, "must exceed the five-call target"
-    assert gateway.media_ports <= 64, "a range far larger than the ceiling"
-
-
-def test_the_fixed_fork_port_is_documented_as_single_call():
-    """Two calls forking to one port would mix two callers into one stream."""
+    Stronger than the check it replaces. The old design forked to a fixed port
+    and could only ever be documented as single-call; bridging removes the
+    fixed port entirely, so concurrent calls are safe by construction — and the
+    three-call loopback proves it.
+    """
     text = DIALPLAN.read_text(encoding="utf-8")
 
-    assert "FIXED PORT" in text
-    assert "single call only" in text.lower()
+    assert "remote-port=" not in text
+    assert "local-port=" not in text
+
+
+def test_the_dialplan_declares_no_context_of_its_own():
+    """Files in dialplan/public/ are included *inside* the public context.
+
+    A nested <context> is silently ignored, and the symptom is a call that
+    reaches FreeSWITCH, matches no extension and comes back 480 with nothing in
+    the log naming this file. Worth a test precisely because it fails silently.
+    """
+    root = ElementTree.parse(DIALPLAN).getroot()
+
+    assert root.tag == "include"
+    assert root.find("context") is None
+    assert root.find("extension") is not None
 
 
 # === the call must answer, and media must not bypass us =====================
 
 
-def test_the_call_is_answered_before_the_fork():
-    """`unicast` needs established media."""
+def test_the_call_is_not_answered_before_bridging():
+    """Answering first would connect the caller to FreeSWITCH and leave them in
+    silence while the gateway leg is set up. Bridging passes the far side's
+    answer straight through, so the caller hears the bank when it is ready."""
     text = DIALPLAN.read_text(encoding="utf-8")
 
-    assert text.index('application="answer"') < text.index('application="unicast"')
+    assert 'application="answer"' not in text
+    assert 'data="hangup_after_bridge=true"' in text
 
 
 def test_media_is_not_allowed_to_bypass_freeswitch():
@@ -166,13 +187,18 @@ def test_the_dialplan_rejects_unknown_destinations():
     text = DIALPLAN.read_text(encoding="utf-8")
 
     assert "404 Not Found" in text
-    assert 'expression="^(6531252836|1000)$"' in text
+    assert 'expression="^(6531252836|90[0-9][0-9])$"' in text
 
 
 def test_inbound_calls_are_restricted_by_acl():
     settings = params(PROFILE)
 
-    assert settings["apply-inbound-acl"] == "loopback.auto"
+    # The ACL is configuration so a deployment can name the carrier's ranges and
+    # the loopback test can name the container network. What must never happen
+    # is an unrestricted profile, so the parameter has to be present and the
+    # file has to state what it defaults to.
+    assert settings["apply-inbound-acl"] == "$${channel2_inbound_acl}"
+    assert "loopback" in PROFILE.read_text(encoding="utf-8").lower()
     assert settings["accept-blind-reg"] == "false"
     assert settings["accept-blind-auth"] == "false"
 

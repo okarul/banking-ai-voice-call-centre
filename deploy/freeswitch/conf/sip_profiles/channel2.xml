@@ -15,8 +15,10 @@
          is published to the Windows host, and nothing beyond it. Before live
          use this becomes the host's real address and the firewall opens to
          DIDWW's signalling ranges only. -->
+    <!-- Port is a variable so the same profile serves the loopback test (5070,
+         beside vanilla's own profiles) and production (5060). -->
     <param name="sip-ip" value="$${local_ip_v4}"/>
-    <param name="sip-port" value="5060"/>
+    <param name="sip-port" value="$${channel2_sip_port}"/>
     <param name="rtp-ip" value="$${local_ip_v4}"/>
 
     <!-- What the SDP advertises. Behind Docker's NAT the container's own
@@ -41,7 +43,11 @@
          restricted to DIDWW — by an ACL on their signalling ranges, or by SIP
          digest credentials. An unauthenticated SIP port on a public address is
          found by scanners within hours. -->
-    <param name="apply-inbound-acl" value="loopback.auto"/>
+    <!-- Which peers may offer this profile a call. Defaults to loopback only;
+         a deployment sets it to the carrier's signalling ranges, and the
+         loopback test sets it to the container network. Never leave it
+         unrestricted on a reachable address. -->
+    <param name="apply-inbound-acl" value="$${channel2_inbound_acl}"/>
 
     <!-- One codec. See the README: a second would add a transcoding step for
          no benefit, and the bank already converts once for the model. -->
