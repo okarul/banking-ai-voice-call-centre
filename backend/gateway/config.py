@@ -95,6 +95,51 @@ class GatewaySettings:
             "GATEWAY_MEDIA_BIND_HOST", "127.0.0.1"
         )
 
+        # --- the SIP leg (Phase 4C) --------------------------------------
+        # Where the gateway answers SIP, for a media server to bridge calls to.
+        self.sip_host: str = os.getenv("GATEWAY_SIP_HOST", "127.0.0.1")
+        self.sip_port: int = _positive_int(
+            os.getenv("GATEWAY_SIP_PORT"), default=5080
+        )
+
+        # What the gateway puts in its SDP `c=` line — where the far side should
+        # send RTP. Separate from `sip_host` on purpose: behind NAT, and behind
+        # Docker on Windows, the address a peer must send to is not the address
+        # this process bound. Conflating them is the classic one-way-audio
+        # failure, where signalling is perfect and no media arrives.
+        #
+        # Empty means "advertise whatever we bound", which is right only when
+        # there is no translation in between.
+        self.sip_advertise_host: str = (
+            os.getenv("GATEWAY_SIP_ADVERTISE_HOST") or self.sip_host
+        )
+
+        # Who may offer this gateway a call, as a comma-separated list of
+        # addresses. Empty means anyone that can reach the port, which is safe
+        # only while it is bound to a private interface — a SIP port reachable
+        # from the internet with no source restriction is found by scanners
+        # within hours.
+        self.sip_allowed_peers: set[str] = {
+            peer.strip()
+            for peer in os.getenv("GATEWAY_SIP_ALLOWED_PEERS", "").split(",")
+            if peer.strip()
+        }
+
+    @property
+    def sip_publicly_bound(self) -> bool:
+        """Whether the SIP listener is on an address others can reach."""
+        return self.sip_host not in ("127.0.0.1", "localhost", "::1")
+
+    @property
+    def sip_source_restricted(self) -> bool:
+        """Whether something limits who may offer this gateway a call.
+
+        A listener on a private loopback interface is restricted by where it is
+        bound. Anything else needs an explicit peer list, and running without
+        one is the misconfiguration this property exists to make visible.
+        """
+        return bool(self.sip_allowed_peers) or not self.sip_publicly_bound
+
     @property
     def media_ports(self) -> int:
         return max(0, self.media_port_high - self.media_port_low + 1)
@@ -122,6 +167,12 @@ class GatewaySettings:
             "attach_timeout": self.attach_timeout,
             "media_bind_host": self.media_bind_host,
             "media_port_range": f"{self.media_port_low}-{self.media_port_high}",
+            "sip_host": self.sip_host,
+            "sip_port": self.sip_port,
+            "sip_advertise_host": self.sip_advertise_host,
+            # The peers themselves are not printed: an allow-list is a map of
+            # what to spoof. Whether one exists is the operationally useful bit.
+            "sip_source_restricted": self.sip_source_restricted,
         }
 
 

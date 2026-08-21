@@ -7,8 +7,7 @@
 `check` reports configuration and reachability without placing a call.
 `selftest` drives synthetic calls against a running backend — no telephone, no
 provider, no cost — and is the command to run before pointing anything real at
-this. `serve` requires SIP termination, which is not implemented, and says so
-rather than starting something that cannot answer.
+this. `serve` answers SIP, for a media server (FreeSWITCH) to bridge calls to.
 
 Nothing here prints the signing secret or a media credential.
 """
@@ -22,7 +21,9 @@ import sys
 
 from gateway.config import gateway_settings
 from gateway.service import CallOutcome, MediaGateway
+from gateway.sipserver import SipUas
 from gateway.sources import FRAME_BYTES, SILENCE, SyntheticSource
+from gateway.udp_source import MediaPortAllocator
 
 
 def _log(verbose: bool) -> None:
@@ -65,6 +66,61 @@ async def _check() -> int:
         return 1
 
     print("\nREADY: the gateway can reach the bank and the route is registered.")
+    return 0
+
+
+async def _serve() -> int:
+    """Answer SIP until interrupted, handing accepted calls to the bank."""
+    if not gateway_settings.configured:
+        print("NOT CONFIGURED: set GATEWAY_WEBHOOK_SECRET")
+        return 1
+
+    if gateway_settings.sip_publicly_bound and not gateway_settings.sip_allowed_peers:
+        # Refusing to start is deliberate. A SIP port on a reachable address
+        # with no source restriction is found by scanners within hours, and
+        # every call they place is one this gateway would offer to a bank.
+        print(
+            f"REFUSING TO START: GATEWAY_SIP_HOST is {gateway_settings.sip_host}, "
+            "which is not loopback, and GATEWAY_SIP_ALLOWED_PEERS is empty.\n"
+            "Set the carrier's signalling addresses before answering SIP on a "
+            "reachable interface."
+        )
+        return 1
+
+    gateway = MediaGateway()
+    allocator = MediaPortAllocator(
+        port_low=gateway_settings.media_port_low,
+        port_high=gateway_settings.media_port_high,
+    )
+    uas = SipUas(
+        gateway=gateway,
+        allocator=allocator,
+        advertise_host=gateway_settings.sip_advertise_host,
+        allowed_peers=gateway_settings.sip_allowed_peers or None,
+    )
+    port = await uas.listen(gateway_settings.sip_host, gateway_settings.sip_port)
+
+    print(f"answering SIP on {gateway_settings.sip_host}:{port}")
+    print(f"advertising media at {gateway_settings.sip_advertise_host}")
+    print(f"media ports {gateway_settings.media_port_low}-{gateway_settings.media_port_high}")
+    print(
+        "source restriction: "
+        + (
+            f"{len(gateway_settings.sip_allowed_peers)} peer(s)"
+            if gateway_settings.sip_allowed_peers
+            else "loopback binding only"
+        )
+    )
+    print("Ctrl-C to stop.")
+
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        await uas.close()
+        await gateway.aclose()
     return 0
 
 
@@ -124,16 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "selftest":
         return asyncio.run(_selftest(args.calls, args.seconds))
 
-    print(
-        "serve: SIP termination is not implemented.\n\n"
-        "This gateway relays audio between a call source and the bank, and it "
-        "is complete.\nWhat it has no source for is a real telephone call: "
-        "that needs a media server\nin front of it (FreeSWITCH, Asterisk) or a "
-        "SIP stack inside it.\n\n"
-        "See docs/PHASE4_LIVE_ACTIVATION.md, and use `selftest` to exercise "
-        "everything else."
-    )
-    return 2
+    return asyncio.run(_serve())
 
 
 if __name__ == "__main__":

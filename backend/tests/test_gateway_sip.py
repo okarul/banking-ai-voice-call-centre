@@ -461,3 +461,180 @@ def test_the_sip_layer_holds_no_media_credential():
     source = inspect.getsource(sipserver)
     for absent in ("media_token", "X-Telephony-Media-Token", "webhook_secret"):
         assert absent not in source, absent
+
+
+# === deployment addressing (Phase 4C) =======================================
+#
+# Phase 4B pinned a container IP to get a loopback call through. That is fine
+# for a test and wrong for a deployment: container addresses change on restart,
+# and a pinned one becomes a call that silently stops connecting.
+
+
+def test_the_sip_leg_is_configured_not_hard_coded():
+    import os
+
+    from gateway.config import GatewaySettings
+
+    previous = {k: os.environ.get(k) for k in
+                ("GATEWAY_SIP_HOST", "GATEWAY_SIP_PORT", "GATEWAY_SIP_ADVERTISE_HOST")}
+    os.environ["GATEWAY_SIP_HOST"] = "10.1.2.3"
+    os.environ["GATEWAY_SIP_PORT"] = "5099"
+    os.environ["GATEWAY_SIP_ADVERTISE_HOST"] = "203.0.113.9"
+    try:
+        settings = GatewaySettings()
+        assert settings.sip_host == "10.1.2.3"
+        assert settings.sip_port == 5099
+        assert settings.sip_advertise_host == "203.0.113.9"
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def test_the_advertised_address_defaults_to_the_bind_address():
+    """Right only when nothing translates in between, which is the default."""
+    from gateway.config import GatewaySettings
+
+    settings = GatewaySettings()
+
+    assert settings.sip_advertise_host == settings.sip_host
+
+
+def test_no_container_or_deployment_address_is_hard_coded_in_the_gateway():
+    """The Phase 4B loopback pinned 192.168.65.254. Nothing may pin it now."""
+    import pkgutil
+    import re
+
+    import gateway
+
+    for module in pkgutil.iter_modules(gateway.__path__):
+        if module.name == "sipclient":
+            continue  # a test tool, and it discovers its own address
+        source = __import__(
+            f"gateway.{module.name}", fromlist=["_"]
+        ).__file__
+        text = open(source, encoding="utf-8").read()
+        # Strip comments and docstrings' prose mentions of example addresses.
+        code = re.sub(r"#.*", "", text)
+        for pinned in ("192.168.65.254", "172.22.0.", "host.docker.internal"):
+            assert pinned not in code, f"{module.name} pins {pinned}"
+
+
+def test_the_defaults_are_loopback_and_therefore_restricted():
+    from gateway.config import GatewaySettings
+
+    settings = GatewaySettings()
+
+    assert settings.sip_host == "127.0.0.1"
+    assert settings.sip_publicly_bound is False
+    assert settings.sip_source_restricted is True
+
+
+def test_a_public_bind_without_a_peer_list_is_not_restricted():
+    """The condition the gateway refuses to start under."""
+    import os
+
+    from gateway.config import GatewaySettings
+
+    previous = os.environ.get("GATEWAY_SIP_HOST")
+    os.environ["GATEWAY_SIP_HOST"] = "0.0.0.0"
+    try:
+        settings = GatewaySettings()
+        assert settings.sip_publicly_bound is True
+        assert settings.sip_source_restricted is False
+    finally:
+        if previous is None:
+            os.environ.pop("GATEWAY_SIP_HOST", None)
+        else:
+            os.environ["GATEWAY_SIP_HOST"] = previous
+
+
+def test_a_peer_list_restricts_a_public_bind():
+    import os
+
+    from gateway.config import GatewaySettings
+
+    previous = {k: os.environ.get(k) for k in
+                ("GATEWAY_SIP_HOST", "GATEWAY_SIP_ALLOWED_PEERS")}
+    os.environ["GATEWAY_SIP_HOST"] = "0.0.0.0"
+    os.environ["GATEWAY_SIP_ALLOWED_PEERS"] = "46.19.209.1, 46.19.210.2"
+    try:
+        settings = GatewaySettings()
+        assert settings.sip_allowed_peers == {"46.19.209.1", "46.19.210.2"}
+        assert settings.sip_source_restricted is True
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def test_the_gateway_refuses_to_answer_sip_unrestricted_on_a_public_bind():
+    """A SIP port with no source restriction is found by scanners within hours,
+    and every call they place is one the gateway would offer to a bank."""
+    import os
+
+    from gateway.__main__ import main
+
+    previous = {k: os.environ.get(k) for k in
+                ("GATEWAY_SIP_HOST", "GATEWAY_SIP_ALLOWED_PEERS",
+                 "GATEWAY_WEBHOOK_SECRET")}
+    os.environ["GATEWAY_SIP_HOST"] = "0.0.0.0"
+    os.environ.pop("GATEWAY_SIP_ALLOWED_PEERS", None)
+    os.environ["GATEWAY_WEBHOOK_SECRET"] = "a-secret-long-enough-to-be-real"
+    try:
+        import importlib
+
+        import gateway.config
+
+        importlib.reload(gateway.config)
+        import gateway.__main__ as entry
+
+        importlib.reload(entry)
+        assert entry.main(["serve"]) == 1
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        import importlib
+
+        import gateway.config
+
+        importlib.reload(gateway.config)
+        import gateway.__main__ as entry
+
+        importlib.reload(entry)
+        assert main is not None
+
+
+def test_the_peer_list_is_never_printed():
+    """An allow-list is a map of what to spoof."""
+    import os
+
+    from gateway.config import GatewaySettings
+
+    previous = os.environ.get("GATEWAY_SIP_ALLOWED_PEERS")
+    os.environ["GATEWAY_SIP_ALLOWED_PEERS"] = "203.0.113.77"
+    try:
+        summary = GatewaySettings().safe_summary()
+        assert "203.0.113.77" not in str(summary)
+        assert summary["sip_source_restricted"] is True
+    finally:
+        if previous is None:
+            os.environ.pop("GATEWAY_SIP_ALLOWED_PEERS", None)
+        else:
+            os.environ["GATEWAY_SIP_ALLOWED_PEERS"] = previous
+
+
+def test_sip_source_is_superseded_and_says_where_to_go():
+    from gateway.sources import SipSource
+
+    with pytest.raises(NotImplementedError) as error:
+        SipSource()
+
+    assert "sipserver" in str(error.value)

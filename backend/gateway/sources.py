@@ -8,18 +8,17 @@ Two implementations, and the difference between them is the honest edge of this
 work:
 
     SyntheticSource   frames a test supplies, in memory — complete
-    SipSource         frames from a real telephone call — NOT IMPLEMENTED
+    UdpMediaSource    frames from a real call, via a media server (gateway.sipserver)
 
-`SipSource` is a named seam, not a stub pretending to be a stack. Terminating
-SIP means answering an INVITE, negotiating SDP, de-jittering RTP and handling
-BYE, and doing that convincingly without a provider to test against would
-produce code that looks finished and fails on the first real call. What it
-would plug into is defined here so the shape is fixed; what fills it is either
-a SIP stack in this process or a media server in front of it.
+Real calls arrive through `gateway.sipserver.SipUas`: FreeSWITCH terminates the
+carrier leg and bridges the call to the gateway over SIP, which negotiates a
+media port per call and produces a `UdpMediaSource`. `SipSource` below is the
+superseded seam, kept only as a signpost.
 
-Everything above this file is complete either way: the gateway, the signing,
-the credential handling, the relay and the teardown are all exercised by
-`SyntheticSource` in the offline suite.
+`SyntheticSource` remains the offline path. It carries the same frames through
+the same gateway and stops where the network begins, which is what lets
+isolation, capacity, credentials and cleanup be tested with no provider, no
+telephone and no cost.
 """
 
 from __future__ import annotations
@@ -109,29 +108,21 @@ class SyntheticSource:
 
 
 class SipSource:
-    """A real telephone call over SIP. **Not implemented.**
+    """Superseded. Use `gateway.sipserver.SipUas` with `UdpMediaSource`.
 
-    This is the seam, stated plainly rather than filled with something that
-    would look convincing and fail on the first live call. To complete it,
-    either:
+    This was the seam for terminating SIP inside the gateway. It is no longer
+    the plan: FreeSWITCH terminates the carrier leg and **bridges the call to
+    the gateway over SIP**, which needs only `mod_sofia` and negotiates a media
+    port per call through SDP. `SipUas` answers that leg and produces a
+    `UdpMediaSource`, which is what the rest of the gateway consumes.
 
-    * put a SIP stack in this process (`pjsua2` or similar) and drive it from
-      here — one new native dependency, and hard to test offline; or
-
-    * run a media server in front (FreeSWITCH `mod_audio_stream`, Asterisk with
-      AudioSocket) and make this class a client of *that*, which is the
-      recommended shape: the protocol detail stays outside the process that
-      talks to a bank, and the media server is separately testable.
-
-    Either way the contract above does not change, and nothing else in this
-    gateway or in the backend needs to.
-
-    See `docs/PHASE4_LIVE_ACTIVATION.md`.
+    Kept as a signpost rather than deleted, so anyone following the older
+    documentation lands here instead of concluding the feature is missing.
     """
 
     def __init__(self, *_args, **_kwargs) -> None:
         raise NotImplementedError(
-            "SIP termination is not implemented. Run a media server in front of "
-            "this gateway, or add a SIP stack to it. See "
-            "docs/PHASE4_LIVE_ACTIVATION.md."
+            "SipSource is superseded. FreeSWITCH bridges the call over SIP to "
+            "gateway.sipserver.SipUas, which produces a UdpMediaSource. See "
+            "deploy/freeswitch/README.md."
         )
