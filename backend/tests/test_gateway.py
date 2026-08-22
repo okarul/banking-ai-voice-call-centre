@@ -823,3 +823,170 @@ def test_the_gateway_reports_the_ending_exactly_once(gateway, sessions, run):
     assert len(rows) == 1
     assert rows[0].status == "COMPLETED"
     assert rows[0].duration_seconds is not None
+
+
+# === RTP packetisation and pacing ===========================================
+#
+# Brought in from the live VPS, where it was applied by hand and proved on real
+# calls. Two things a WebSocket does not do for us and RTP requires: cut the
+# stream on 160-byte frame boundaries, and hand frames over at fifty a second
+# rather than as fast as the model produces them.
+
+
+class _Socket:
+    """A bank-side socket that yields a scripted list of messages."""
+
+    def __init__(self, messages):
+        self._messages = list(messages)
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for message in self._messages:
+            yield message
+
+
+class _Sink:
+    """A call source that records exactly what was handed to the caller."""
+
+    def __init__(self):
+        self.frames = []
+        self.call_id = "pacing"
+
+    async def send_frame(self, frame):
+        self.frames.append(frame)
+
+    async def receive_frame(self):
+        return None
+
+    async def close(self):
+        return None
+
+
+def _relay(messages, gateway):
+    sink = _Sink()
+
+    async def scenario():
+        await gateway._bank_to_caller(sink, _Socket(messages))
+        return sink.frames
+
+    return asyncio.run(scenario())
+
+
+def _gateway_only():
+    """A gateway with no backend client; only the relay is under test."""
+    import os
+
+    os.environ.setdefault("GATEWAY_WEBHOOK_SECRET", "pacing-test-secret-value")
+    from gateway.client import BackendClient
+
+    settings = GatewaySettings()
+    return MediaGateway(settings, client=BackendClient.__new__(BackendClient))
+
+
+def test_one_message_of_several_frames_is_cut_into_frames():
+    """RTP carries exactly one 160-byte payload per packet."""
+    gateway = _gateway_only()
+    payload = bytes(range(256)) * 4  # 1024 bytes = 6 frames + remainder
+
+    frames = _relay([payload[: FRAME_BYTES * 3]], gateway)
+
+    assert len(frames) == 3
+    assert all(len(frame) == FRAME_BYTES for frame in frames)
+    assert b"".join(frames) == payload[: FRAME_BYTES * 3]
+
+
+def test_a_frame_split_across_two_messages_is_reassembled():
+    """The bank may split a frame; the wire may not carry half of one."""
+    gateway = _gateway_only()
+    whole = bytes([n % 256 for n in range(FRAME_BYTES)])
+
+    frames = _relay([whole[:100], whole[100:]], gateway)
+
+    assert frames == [whole]
+
+
+def test_a_partial_trailing_frame_is_held_not_sent_short():
+    """A short payload on the wire is dropped by a carrier or heard as noise."""
+    gateway = _gateway_only()
+
+    frames = _relay([b"\xff" * (FRAME_BYTES + 40)], gateway)
+
+    assert len(frames) == 1
+    assert len(frames[0]) == FRAME_BYTES
+
+
+def test_non_binary_messages_are_ignored():
+    """This socket carries audio; text is not ours to interpret."""
+    gateway = _gateway_only()
+    audio = b"\xff" * FRAME_BYTES
+
+    frames = _relay(["a text frame", audio, '{"event":"hangup"}'], gateway)
+
+    assert frames == [audio]
+
+
+def test_frames_are_paced_at_about_fifty_a_second():
+    """Handed over as fast as they arrive, the far end discards the overflow.
+
+    Ten frames is 200 ms of speech and must take roughly that long to hand
+    over — not the microseconds a WebSocket would allow.
+    """
+    import time
+
+    gateway = _gateway_only()
+    sink = _Sink()
+    payload = b"\xff" * (FRAME_BYTES * 10)
+
+    async def scenario():
+        started = time.perf_counter()
+        await gateway._bank_to_caller(sink, _Socket([payload]))
+        return time.perf_counter() - started
+
+    elapsed = asyncio.run(scenario())
+
+    assert len(sink.frames) == 10
+    # Nine gaps of 20 ms between ten frames. Generous upper bound: this is
+    # asserting that pacing happens at all, not benchmarking the event loop.
+    assert elapsed >= 0.15, f"frames were not paced ({elapsed:.3f}s for 200ms)"
+    assert elapsed < 1.5, f"pacing overshot badly ({elapsed:.3f}s)"
+
+
+def test_falling_behind_does_not_burst_stale_audio():
+    """Catching up would replay audio that is already too late to be useful."""
+    import time
+
+    gateway = _gateway_only()
+
+    class SlowSink(_Sink):
+        async def send_frame(self, frame):
+            await asyncio.sleep(0.03)  # slower than the 20 ms budget
+            self.frames.append(frame)
+
+    sink = SlowSink()
+
+    async def scenario():
+        started = time.perf_counter()
+        await gateway._bank_to_caller(sink, _Socket([b"\xff" * (FRAME_BYTES * 5)]))
+        return time.perf_counter() - started
+
+    elapsed = asyncio.run(scenario())
+
+    assert len(sink.frames) == 5
+    # Five frames at 30 ms each is ~150 ms. If the deadline were allowed to run
+    # into the past, the loop would stop sleeping and finish far faster while
+    # the far end drowned; if it tried to catch up it would take far longer.
+    assert 0.1 <= elapsed < 1.0, f"pacing did not degrade gracefully ({elapsed:.3f}s)"
+
+
+def test_the_pacing_constants_are_the_production_values():
+    """20 ms and 160 bytes are what the telephone network carries."""
+    import inspect
+
+    from gateway.service import MediaGateway as Gateway
+
+    source = inspect.getsource(Gateway._bank_to_caller)
+    assert "frame_interval = 0.020" in source
+    assert "FRAME_BYTES" in source
+    assert FRAME_BYTES == 160

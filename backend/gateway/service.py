@@ -27,7 +27,7 @@ import websockets
 
 from gateway.client import AcceptedCall, BackendClient, BackendUnavailable, CallRefused
 from gateway.config import GatewaySettings, gateway_settings
-from gateway.sources import CallSource
+from gateway.sources import FRAME_BYTES, CallSource
 
 logger = logging.getLogger("gateway")
 
@@ -144,12 +144,54 @@ class MediaGateway:
             await socket.send(frame)
 
     async def _bank_to_caller(self, source: CallSource, socket) -> None:
+        """Assistant audio, repacketised to 20 ms frames and paced in real time.
+
+        Two things a WebSocket does not do for us, and RTP requires both.
+
+        **Packetisation.** The bank may deliver several 20 ms telephone frames
+        in one WebSocket message, or split one across two. RTP carries exactly
+        one 160-byte PCMU payload per packet, so the stream is buffered and cut
+        on frame boundaries rather than forwarded message-for-message. Sending
+        a whole message as one frame puts a payload of the wrong length on the
+        wire, which a carrier either drops or plays as a burst of noise.
+
+        **Pacing.** A telephone plays 50 frames a second and no faster. The
+        model generates far quicker than that, so frames handed over as fast as
+        they arrive arrive faster than they can be played — and the far end,
+        having no jitter buffer for a flood, discards the overflow. The caller
+        hears the beginning of a sentence and then silence.
+
+        When the loop falls behind, `next_send` is reset to now rather than
+        allowed to run in the past. Catching up would mean bursting audio that
+        is already stale, which is the same failure again with worse timing.
+        """
+        buffer = bytearray()
+        frame_interval = 0.020
+        loop = asyncio.get_running_loop()
+        next_send = loop.time()
+
         try:
             async for message in socket:
                 # Binary only. The bank sends audio down this socket and
                 # nothing else, so anything textual is not ours to interpret.
-                if isinstance(message, bytes):
-                    await source.send_frame(message)
+                if not isinstance(message, bytes):
+                    continue
+
+                buffer.extend(message)
+
+                while len(buffer) >= FRAME_BYTES:
+                    frame = bytes(buffer[:FRAME_BYTES])
+                    del buffer[:FRAME_BYTES]
+
+                    await source.send_frame(frame)
+
+                    next_send += frame_interval
+                    delay = next_send - loop.time()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    else:
+                        # Do not try to catch up by bursting old audio.
+                        next_send = loop.time()
         except websockets.exceptions.ConnectionClosed:
             # A socket that closes, tidily or not, is a call that has ended.
             # Callers hang up mid-sentence and networks drop; neither is a
