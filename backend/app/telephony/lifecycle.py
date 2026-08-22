@@ -152,19 +152,24 @@ class CallLifecycle:
             if self._closed or not self._generation_ended:
                 return
 
-            if self._closing_for is not None:
-                # The closing line has finished playing. Now, and not before,
-                # the call may be taken down.
-                reason = self._closing_for
-                self.state = CallState.CLOSED
-                self._closed = True
-                self._cancel_silence()
-                await self._finish(reason)
+            if self._closing_for is None:
+                self.turns_completed += 1
+                self.state = CallState.WAITING_FOR_CALLER
+                self._arm_silence()
                 return
 
-            self.turns_completed += 1
-            self.state = CallState.WAITING_FOR_CALLER
-            self._arm_silence()
+            # The closing line has finished playing. Now, and not before, the
+            # call may be taken down.
+            reason = self._closing_for
+            self.state = CallState.CLOSED
+            self._closed = True
+            self._cancel_silence()
+
+        # Outside the lock, deliberately. Hanging up runs the owner teardown,
+        # which closes the bridge, which closes this lifecycle — and that needs
+        # this same lock. Holding it across the call is a deadlock that stops
+        # the call ever ending.
+        await self._finish(reason)
 
     async def on_caller_speech_started(self) -> None:
         """The model reports the caller's voice. Cancel the wait immediately."""
@@ -208,7 +213,9 @@ class CallLifecycle:
             self._closed = True
             self.state = CallState.CLOSED
             self._cancel_silence()
-            await self._finish(EndReason.CALLER_DISCONNECTED)
+
+        # Outside the lock, for the same reason as `on_playback_drained`.
+        await self._finish(EndReason.CALLER_DISCONNECTED)
 
     # --- the silence timer ---------------------------------------------------
 

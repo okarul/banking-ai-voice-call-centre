@@ -41,6 +41,7 @@ import time
 
 from app.agents import speech
 from app.telephony import audio as codec
+from app.telephony.conversation import ConversationState
 from app.telephony.lifecycle import CallLifecycle, EndReason
 from app.telephony.media import BoundedAudioQueue, MediaTransport
 
@@ -160,11 +161,14 @@ class PhoneCallBridge:
             hang_up=self._end_call,
         )
 
-        # One logical caller turn produces one assistant response. The model can
-        # be prompted more than once for the same turn — a retried cue, a racing
-        # trigger — and each prompt is a second voice talking over the first.
-        self._response_open = False
-        self._turn_id = 0
+        # Everything this call knows about itself, in one typed place.
+        from app.sessions import session_manager as _sessions
+
+        self.conversation = ConversationState(
+            provider_call_id=provider_call_id,
+            banking_session_id=banking_session_id,
+            session_manager=_sessions,
+        )
 
         # Tools already executed in this turn, so a repeated call with the same
         # arguments reads the customer balance once rather than twice. A banking
@@ -196,17 +200,18 @@ class PhoneCallBridge:
         kind = getattr(event, "type", "")
 
         if kind == "audio":
-            data = getattr(getattr(event, "audio", None), "data", None)
-            if data:
+            payload = getattr(event, "audio", None)
+            data = getattr(payload, "data", None)
+            if data and self._admit_response(getattr(payload, "response_id", None)):
                 self.outbound.put(data)
-                self._response_open = True
+                self.conversation.assistant_speaking = True
                 self._schedule(self.lifecycle.on_assistant_audio())
 
         elif kind == "audio_end":
             # The model has finished *generating* this turn. The caller has not
             # finished *hearing* it — several seconds may still be queued for a
             # telephone that plays fifty frames a second.
-            self._response_open = False
+            self.conversation.complete_turn()
             self._schedule(self.lifecycle.on_generation_ended())
             if not len(self.outbound):
                 # Nothing left to play: the last frame already went out, so no
@@ -218,7 +223,12 @@ class PhoneCallBridge:
             # sentence they have stopped listening to. Playing it out would
             # talk over them, and the model has already stopped generating it.
             self.outbound.clear()
-            self._response_open = False
+            # Release the response id as well. The interrupted response is over,
+            # so the next one the model starts is a legitimate new answer rather
+            # than a second voice — without this, barge-in would leave a response
+            # active for ever and every later answer would be suppressed.
+            self.conversation.active_response_id = None
+            self.conversation.assistant_speaking = False
             self._schedule(self.lifecycle.on_assistant_interrupted())
 
         elif kind == "history_added":
@@ -252,9 +262,70 @@ class PhoneCallBridge:
             self._begin_caller_turn()
 
     def _begin_caller_turn(self) -> None:
-        self._turn_id += 1
+        """A new logical caller turn.
+
+        Duplicate suppression is scoped to a turn, which is what stops it
+        refusing a caller who legitimately asks the same question twice: the
+        second ask is a new turn, so the same tool and the same answer are
+        allowed again.
+        """
+        self.conversation.begin_caller_turn()
         self._tools_this_turn.clear()
         self._schedule(self.lifecycle.on_caller_speech_started())
+
+    # --- one turn, one response ---------------------------------------------
+
+    def _admit_response(self, response_id: str | None) -> bool:
+        """Whether this audio belongs to the response this call is playing.
+
+        The model can be prompted more than once for a single caller turn — a
+        retried cue, a racing trigger, a duplicated SDK callback — and each
+        extra prompt is a second response generating audio at the same time as
+        the first. Played out, that is two assistants talking over each other
+        down one telephone line.
+
+        The first response id seen becomes this turn's answer; audio from any
+        other id is dropped until that one ends. Identity comes from the model
+        rather than from our own counter, so a duplicated callback carrying the
+        same id is admitted (it is the same answer) while a genuinely second
+        response is not.
+        """
+        if response_id is None:
+            # Nothing to distinguish responses by. Admit it: dropping audio on
+            # a stream that cannot be identified would silence real answers.
+            return True
+
+        if response_id in self.conversation.rejected_response_ids:
+            # Already refused on this turn. It stays refused for the rest of
+            # the turn, or its tail would start playing as soon as the admitted
+            # response finished.
+            self.conversation.duplicate_responses_suppressed += 1
+            return False
+
+        active = self.conversation.active_response_id
+        if active is None:
+            self.conversation.active_response_id = response_id
+            return True
+        if active == response_id:
+            return True
+
+        self.conversation.rejected_response_ids.add(response_id)
+        self.conversation.duplicate_responses_suppressed += 1
+        logger.warning(
+            "bridge[%s] suppressed a second concurrent response for one turn",
+            self.provider_call_id,
+        )
+        return False
+
+    def may_request_response(self) -> bool:
+        """Whether this call may prompt the model to speak right now.
+
+        Guards the places *we* create a response — the greeting cue and the
+        closing cue. A cue sent while a response is already generating produces
+        exactly the overlap `_admit_response` then has to throw away, so it is
+        cheaper and clearer to not ask twice.
+        """
+        return self.conversation.active_response_id is None
 
     def _on_history(self, item) -> None:
         """Watch for the assistant's closing line.
@@ -264,10 +335,22 @@ class PhoneCallBridge:
         finished playing — the same division Channel 1 uses, where the page
         watches for the closing line rather than deciding on it.
         """
-        if getattr(item, "role", None) != "assistant":
-            return
+        role = getattr(item, "role", None)
         text = _item_text(item)
-        if text and speech.is_closing_line(text):
+        if not text:
+            return
+
+        if role == "user":
+            self.conversation.last_user_turn = text
+            return
+        if role != "assistant":
+            return
+
+        self.conversation.last_agent_response = text
+        if text.rstrip().endswith("?"):
+            self.conversation.last_agent_question = text
+        if speech.is_closing_line(text):
+            self.conversation.closing = True
             self._schedule(self.lifecycle.on_goodbye_spoken())
 
     def _note_tool(self, event) -> None:
@@ -275,15 +358,18 @@ class PhoneCallBridge:
         tool = getattr(event, "tool", None)
         name = getattr(tool, "name", None) or str(tool)
         signature = f"{name}:{getattr(event, 'arguments', '')}"
-        if signature in self._tools_this_turn:
+        # Scoped to the turn, so the same enquiry on a later turn runs again.
+        key = f"{self.conversation.turn_counter}:{signature}"
+        if key in self._tools_this_turn:
             logger.warning(
                 "bridge[%s] duplicate tool in one turn: %s",
                 self.provider_call_id,
                 name,
             )
             self.duplicate_tool_calls += 1
+            self.conversation.duplicate_tools_suppressed += 1
             return
-        self._tools_this_turn.add(signature)
+        self._tools_this_turn.add(key)
 
     def _schedule(self, coroutine) -> None:
         """Run a lifecycle transition from this synchronous event handler.
@@ -436,6 +522,10 @@ class PhoneCallBridge:
         """
         if self._greeted or self._closed:
             return False
+        if not self.may_request_response():
+            # Something is already speaking. Greeting now would put two voices
+            # on the line at once.
+            return False
         self._greeted = True
 
         try:
@@ -548,6 +638,11 @@ class PhoneCallBridge:
             "outbound_dropped": self.outbound.dropped,
             "duplicate_tool_calls": self.duplicate_tool_calls,
             **self.lifecycle.describe(),
+            # Operational fields only. The full conversation state — which
+            # includes the verified customer once there is one — is
+            # `self.conversation.describe()`, for whoever legitimately needs an
+            # identity. This is the media view, and it carries none.
+            **self.conversation.operational_summary(),
         }
 
 

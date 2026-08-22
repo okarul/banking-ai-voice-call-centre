@@ -472,3 +472,58 @@ def test_the_lifecycle_description_carries_no_speech_or_identity():
     assert described["state"] == CallState.WAITING_FOR_CALLER.value
     for forbidden in ("customer_id", "transcript", "audio", "pin", "text"):
         assert forbidden not in described, forbidden
+
+
+def test_hanging_up_does_not_deadlock_when_the_owner_closes_the_lifecycle():
+    """The real teardown path, which deadlocked before this test existed.
+
+    `on_playback_drained` held the lifecycle lock while hanging up. Hanging up
+    runs the owner's teardown, which closes the bridge, which closes this
+    lifecycle — and that needs the same lock. The call never ended and the
+    suite hung.
+    """
+
+    async def scenario():
+        lifecycle = None
+        ended = []
+
+        async def hang_up(reason):
+            ended.append(reason)
+            # Exactly what the bridge does: close the lifecycle from inside the
+            # hang-up. This is the re-entrant path.
+            await lifecycle.close()
+
+        lifecycle = CallLifecycle(
+            "call-deadlock", speak=Recorder().speak, hang_up=hang_up,
+            silence_seconds=FAST,
+        )
+
+        await lifecycle.on_assistant_audio()
+        await lifecycle.on_goodbye_spoken()
+        await lifecycle.on_generation_ended()
+        await asyncio.wait_for(lifecycle.on_playback_drained(), timeout=5)
+        return ended, lifecycle.closed
+
+    ended, closed = run(scenario())
+
+    assert ended == [EndReason.CALLER_GOODBYE]
+    assert closed is True
+
+
+def test_a_disconnect_does_not_deadlock_on_a_re_entrant_close():
+    async def scenario():
+        lifecycle = None
+        ended = []
+
+        async def hang_up(reason):
+            ended.append(reason)
+            await lifecycle.close()
+
+        lifecycle = CallLifecycle(
+            "call-deadlock2", speak=Recorder().speak, hang_up=hang_up,
+            silence_seconds=FAST,
+        )
+        await asyncio.wait_for(lifecycle.on_caller_disconnected(), timeout=5)
+        return ended
+
+    assert run(scenario()) == [EndReason.CALLER_DISCONNECTED]

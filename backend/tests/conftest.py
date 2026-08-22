@@ -61,3 +61,30 @@ def release_live_calls():
 async def _release_everything() -> None:
     await voice_call_manager.close_all()
     await voice_call_manager.release_all()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def unpinned_capacity():
+    """Do not let the developer's .env decide what the suite can test.
+
+    `REALTIME_MAX_ACTIVE_SESSIONS` is a deployment control, and Phase 6 sets it
+    to 1 for single-call live testing. Tests that open two or three calls to
+    prove they stay isolated were then failing on the ceiling rather than on
+    anything they assert — a suite whose results depend on a local, uncommitted
+    file is a suite that passes on one machine and fails on another.
+
+    So the ambient value is replaced with "no limit" once, at session start.
+
+    Session-scoped deliberately. As a function-scoped fixture this ran *after*
+    module-scoped fixtures that deliberately set a ceiling — so a suite whose
+    whole point was refusing a sixth concurrent call had its ceiling removed,
+    accepted the sixth, and then hung waiting for a call that was never hung up.
+    Running once, first, leaves every later fixture and monkeypatch free to set
+    the ceiling its own test needs.
+    """
+    from app.config import settings
+
+    previous = settings.realtime_max_active_sessions
+    settings.realtime_max_active_sessions = 0
+    yield
+    settings.realtime_max_active_sessions = previous
