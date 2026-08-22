@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import secrets
 import time
 
 from gateway.udp_source import MediaPortAllocator, UdpMediaSource
@@ -52,6 +53,21 @@ def _header(text: str, name: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _contact_uri(text: str) -> str | None:
+    """The address the far side wants in-dialog requests sent to.
+
+    A BYE is addressed at the peer's Contact, not at the URI the call was
+    dialled on: the dialled number identified who to reach, and Contact
+    identifies the leg that answered. Absent Contact, the caller falls back to
+    the network address the request arrived from.
+    """
+    contact = _header(text, "Contact")
+    if not contact:
+        return None
+    match = re.search(r"<([^>]+)>", contact)
+    return match.group(1) if match else contact.split(";")[0].strip()
+
+
 def _sdp_media(text: str) -> tuple[str, int] | None:
     """The address and port the far side wants RTP sent to."""
     body = text.split("\r\n\r\n", 1)[-1]
@@ -63,14 +79,45 @@ def _sdp_media(text: str) -> tuple[str, int] | None:
 
 
 class _Dialog:
-    """One SIP call in progress on this server."""
+    """One SIP call in progress on this server.
 
-    def __init__(self, call_id: str, source: UdpMediaSource) -> None:
+    Carries the minimum SIP identity needed to originate an in-dialog BYE, and
+    nothing else. There is no caller number here and no customer: a dialog is a
+    network conversation, and who is on it is decided by the PIN check.
+    """
+
+    def __init__(
+        self,
+        call_id: str,
+        source: UdpMediaSource,
+        *,
+        peer,
+        remote_from: str,
+        local_to: str,
+        remote_target: str | None,
+    ) -> None:
         self.call_id = call_id
         self.source = source
         self.task: asyncio.Task | None = None
         self.started_at = time.monotonic()
         self.answered = False
+
+        # Where in-dialog requests go, and how they are addressed.
+        self.peer = peer
+        # The INVITE's From, carrying the *remote* tag. Becomes our To on an
+        # outbound request — the role reversal SIP requires.
+        self.remote_from = remote_from
+        # The To we sent in the 200 OK, carrying *our* tag. Becomes our From.
+        # Stored rather than regenerated: a second tag would address a dialog
+        # that does not exist and the BYE would be rejected.
+        self.local_to = local_to
+        self.remote_target = remote_target
+        # Requests we originate in this dialog. The peer has its own sequence.
+        self.local_cseq = 0
+
+        # Set once this call has been terminated by somebody — a peer BYE, our
+        # own BYE, or shutdown. What it guards is a second BYE.
+        self.ended = False
 
 
 class SipUas(asyncio.DatagramProtocol):
@@ -101,9 +148,14 @@ class SipUas(asyncio.DatagramProtocol):
         # the port, which is safe only while it is bound to a private network.
         self._allowed = allowed_peers
         self._dialogs: dict[str, _Dialog] = {}
+        # Removing a dialog is a claim: whoever takes it out of this map is the
+        # one that terminates it. The lock is what makes an inbound BYE racing
+        # the bank's own completion produce one termination rather than two.
+        self._claim_lock = asyncio.Lock()
         self._transport: asyncio.DatagramTransport | None = None
         self.accepted = 0
         self.refused = 0
+        self.byes_sent = 0
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -119,9 +171,22 @@ class SipUas(asyncio.DatagramProtocol):
         return bound
 
     async def close(self) -> None:
-        for dialog in list(self._dialogs.values()):
-            await self._end(dialog)
-        self._dialogs.clear()
+        """Shut the server down, releasing every call it still holds.
+
+        Dialogs are *claimed* rather than merely iterated, so the completion
+        callbacks that fire as each `handle_call` unwinds find nothing to act on
+        and no BYE is sent on the way down. That is deliberate and unchanged
+        from before this fix: shutdown is not a call ending, and a burst of
+        BYEs from a process that is going away is noise a carrier does not need.
+        """
+        async with self._claim_lock:
+            claimed = list(self._dialogs.values())
+            for dialog in claimed:
+                dialog.ended = True
+            self._dialogs.clear()
+
+        for dialog in claimed:
+            await self._release(dialog)
         if self._transport is not None:
             self._transport.close()
             self._transport = None
@@ -141,7 +206,15 @@ class SipUas(asyncio.DatagramProtocol):
         except Exception:  # pragma: no cover - defensive
             return
         if text.startswith("SIP/2.0"):
-            return  # a response to something we sent; nothing to do
+            # A response to something we sent — in practice the 200 to our own
+            # BYE. Deliberately ignored: this leg runs between two processes on
+            # a private link, the BYE is the last thing either of them needs
+            # from the dialog, and the call's resources are already released by
+            # the time it arrives. Retransmission handling would mean a SIP
+            # transaction state machine, which is a great deal of surface for
+            # no behaviour a carrier would notice. A response never creates or
+            # alters a dialog; a test asserts it.
+            return
         asyncio.get_running_loop().create_task(self._handle(text, addr))
 
     async def _handle(self, text: str, addr) -> None:
@@ -164,10 +237,16 @@ class SipUas(asyncio.DatagramProtocol):
         elif method == "ACK":
             await self._ack(call_id)
         elif method in ("BYE", "CANCEL"):
+            # Answer first: the peer is entitled to its 200 whether or not we
+            # still hold the dialog, and a retransmitted BYE must be answered
+            # again rather than ignored.
             self._respond(text, addr, 200, "OK")
-            dialog = self._dialogs.pop(call_id, None)
+            dialog = await self._claim(call_id)
             if dialog is not None:
-                await self._end(dialog)
+                # The peer ended it, so we must not also send a BYE — the
+                # dialog is already gone at their end and a second request
+                # would arrive for a call that no longer exists.
+                await self._release(dialog)
         else:
             self._respond(text, addr, 405, "Method Not Allowed")
 
@@ -199,8 +278,22 @@ class SipUas(asyncio.DatagramProtocol):
             self._respond(text, addr, 486, "Busy Here")
             return
 
-        self._dialogs[call_id] = _Dialog(call_id, source)
-        self._respond(text, addr, 200, "OK", sdp=self._sdp(port))
+        # The tag we answer with, generated once and kept. Every later request
+        # we originate in this dialog must carry this exact value.
+        local_tag = f"gw{secrets.token_hex(4)}"
+        to_header = _header(text, "To") or f"<sip:gateway@{self._advertise}>"
+        if ";tag=" not in to_header:
+            to_header = f"{to_header};tag={local_tag}"
+
+        self._dialogs[call_id] = _Dialog(
+            call_id,
+            source,
+            peer=addr,
+            remote_from=_header(text, "From") or "",
+            local_to=to_header,
+            remote_target=_contact_uri(text),
+        )
+        self._respond(text, addr, 200, "OK", sdp=self._sdp(port), to_override=to_header)
         logger.info("sip: answered call %s on media port %s", source.call_id, port)
 
     def _sdp(self, port: int) -> str:
@@ -228,35 +321,152 @@ class SipUas(asyncio.DatagramProtocol):
         if dialog is None or dialog.answered:
             return
         dialog.answered = True
+        loop = asyncio.get_running_loop()
         dialog.task = asyncio.create_task(
             self._gateway.handle_call(dialog.source),
             name=f"sip-call-{dialog.source.call_id}",
         )
+        # The defect this callback exists for: when the *bank* ends a call —
+        # a spoken goodbye, or a caller who went silent — `handle_call` returns
+        # and nothing told the telephone network. FreeSWITCH kept the leg up and
+        # the caller heard the closing sentence and then dead air until they
+        # hung up themselves.
+        dialog.task.add_done_callback(
+            lambda finished, cid=call_id: self._on_call_finished(cid, finished, loop)
+        )
         self.accepted += 1
 
-    async def _end(self, dialog: _Dialog) -> None:
-        """Release one call. Safe whatever state it reached."""
+    def _on_call_finished(self, call_id: str, task: asyncio.Task, loop) -> None:
+        """The bank has finished with this call. End the SIP leg.
+
+        Runs as a task callback, so it must not raise and cannot await. The
+        task's outcome is consumed here — an unretrieved exception on a task
+        nobody awaits is logged by asyncio at garbage-collection time, long
+        after the call it belonged to.
+        """
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                logger.warning(
+                    "sip: call %s ended with %s", call_id, type(error).__name__
+                )
+        if loop.is_closed():  # pragma: no cover - during interpreter shutdown
+            return
+        loop.create_task(self._bank_finished(call_id), name=f"sip-bye-{call_id}")
+
+    async def _bank_finished(self, call_id: str) -> None:
+        """Terminate the SIP leg because the application is done with the call.
+
+        Claiming first is what makes this safe against the peer hanging up at
+        the same moment: exactly one of the two paths gets the dialog, and only
+        that one acts.
+        """
+        dialog = await self._claim(call_id)
+        if dialog is None:
+            # The peer ended it first, or the server is shutting down. Either
+            # way somebody else owns the teardown.
+            return
+        await self._send_bye(dialog)
+        await self._release(dialog)
+
+    async def _claim(self, call_id: str) -> _Dialog | None:
+        """Take a dialog out of the map, or find somebody else already has.
+
+        The single point at which a call's termination is decided. Returns the
+        dialog to exactly one caller and `None` to every other, so a BYE racing
+        the bank's completion cannot terminate the same call twice.
+        """
+        async with self._claim_lock:
+            dialog = self._dialogs.pop(call_id, None)
+            if dialog is None or dialog.ended:
+                return None
+            dialog.ended = True
+            return dialog
+
+    async def _send_bye(self, dialog: _Dialog) -> None:
+        """Originate one in-dialog BYE for a call the application has finished.
+
+        Role reversal is the part worth reading twice. The To we sent in the
+        200 OK — carrying our tag — becomes the From of this request, and the
+        INVITE's From — carrying theirs — becomes the To. Getting it the wrong
+        way round produces a BYE for a dialog that does not exist, which is
+        answered 481 and leaves the leg up exactly as before.
+        """
+        if self._transport is None:  # pragma: no cover - during shutdown
+            return
+
+        dialog.local_cseq += 1
+        target = dialog.remote_target or f"sip:{dialog.peer[0]}:{dialog.peer[1]}"
+        message = "\r\n".join(
+            [
+                f"BYE {target} SIP/2.0",
+                f"Via: SIP/2.0/UDP {self._advertise}:{self._port}"
+                f";branch=z9hG4bK{secrets.token_hex(6)}",
+                "Max-Forwards: 70",
+                f"From: {dialog.local_to}",
+                f"To: {dialog.remote_from}",
+                f"Call-ID: {dialog.call_id}",
+                f"CSeq: {dialog.local_cseq} BYE",
+                "Content-Length: 0",
+            ]
+        ) + "\r\n\r\n"
+
+        try:
+            self._transport.sendto(message.encode(), dialog.peer)
+            self.byes_sent += 1
+            # Category and call id only. Never a caller number, never audio,
+            # never anything about the customer.
+            logger.info("sip: ended call %s (application finished)", dialog.call_id)
+        except OSError as error:  # pragma: no cover - transient socket failure
+            logger.warning(
+                "sip: could not end call %s: %s", dialog.call_id, type(error).__name__
+            )
+
+    async def _release(self, dialog: _Dialog) -> None:
+        """Release one call's resources. Safe whatever state it reached.
+
+        Closing the source is what frees the media port and unwinds
+        `handle_call`. Awaiting the task is skipped when we are *inside* its own
+        completion callback — it has already finished, and waiting on it from
+        there would be waiting on ourselves.
+        """
         await dialog.source.close()
-        if dialog.task is not None:
+        if dialog.task is not None and not dialog.task.done():
             try:
-                await asyncio.wait_for(dialog.task, timeout=15)
+                await asyncio.wait_for(asyncio.shield(dialog.task), timeout=15)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
+
+    async def _end(self, dialog: _Dialog) -> None:
+        """Backwards-compatible alias for `_release`."""
+        await self._release(dialog)
 
     # --- responses -----------------------------------------------------------
 
     def _respond(
-        self, request: str, addr, code: int, reason: str, *, sdp: str = ""
+        self,
+        request: str,
+        addr,
+        code: int,
+        reason: str,
+        *,
+        sdp: str = "",
+        to_override: str | None = None,
     ) -> None:
-        """Reply to a request, echoing the headers SIP requires be mirrored."""
+        """Reply to a request, echoing the headers SIP requires be mirrored.
+
+        `to_override` carries the dialog's stored To, tag and all. The tag is
+        generated once when the dialog is created and reused for the life of
+        the call, because every in-dialog request has to agree on it.
+        """
         if self._transport is None:  # pragma: no cover - during shutdown
             return
 
-        to_header = _header(request, "To") or ""
+        to_header = to_override or _header(request, "To") or ""
         if code == 200 and ";tag=" not in to_header:
             # A dialog-establishing response must carry a tag, or the far side
             # cannot address anything back to us.
-            to_header += f";tag=gw{int(time.time() * 1000) % 1_000_000}"
+            to_header += f";tag=gw{secrets.token_hex(4)}"
 
         lines = [f"SIP/2.0 {code} {reason}"]
         for name in ("Via", "From", "Call-ID", "CSeq"):

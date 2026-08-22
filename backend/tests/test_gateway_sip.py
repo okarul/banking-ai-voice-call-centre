@@ -15,6 +15,7 @@ Real sockets on loopback, no FreeSWITCH required.
 """
 
 import asyncio
+import re
 import socket
 
 import pytest
@@ -638,3 +639,490 @@ def test_sip_source_is_superseded_and_says_where_to_go():
         SipSource()
 
     assert "sipserver" in str(error.value)
+
+
+# === Phase 6.1: the application ends the SIP leg ============================
+#
+# The defect: when the *bank* finished a call — a spoken goodbye, or a caller
+# who went silent — `handle_call` returned and nothing told the telephone
+# network. FreeSWITCH kept the leg up, so the caller heard the closing sentence
+# and then dead air until they hung up themselves.
+#
+# These drive real loopback UDP, like the rest of this file.
+
+
+class EndableGateway:
+    """A gateway whose call can be finished on demand, as the bank would."""
+
+    def __init__(self) -> None:
+        self.calls = []
+        self.finish = asyncio.Event()
+
+    async def handle_call(self, source):
+        self.calls.append(source)
+        await self.finish.wait()
+        return "completed"
+
+
+def parse_request(raw: str) -> dict:
+    """Split a SIP request into its start line and headers."""
+    lines = raw.split("\r\n")
+    parsed = {"start_line": lines[0], "method": lines[0].split(" ", 1)[0]}
+    for line in lines[1:]:
+        if ": " in line:
+            name, _, value = line.partition(": ")
+            parsed[name.lower()] = value.strip()
+    return parsed
+
+
+async def establish(peer: Peer, call_id="bye-call@test", destination="9001"):
+    """INVITE, read the 200, ACK. Returns the 200 OK we answered with."""
+    peer.send(invite(call_id=call_id, destination=destination))
+    await asyncio.sleep(0.2)
+    answer = await asyncio.get_running_loop().run_in_executor(None, peer.response)
+    peer.send(simple("ACK", call_id=call_id))
+    await asyncio.sleep(0.2)
+    return answer
+
+
+async def collect(peer: Peer, *, timeout: float = 2.0) -> list[str]:
+    """Everything the server sent us, until the socket goes quiet."""
+    loop = asyncio.get_running_loop()
+    seen = []
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        message = await loop.run_in_executor(None, peer.response)
+        if message is None:
+            break
+        seen.append(message)
+    return seen
+
+
+# --- 1-6: the bank finishes the call ---------------------------------------
+
+
+def test_the_bank_finishing_a_call_sends_exactly_one_bye():
+    """The defect, stated as a test."""
+
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peer = Peer(port)
+        await establish(peer)
+
+        gateway.finish.set()                      # the bank is done with the call
+        requests = [
+            parse_request(raw)
+            for raw in await collect(peer)
+            if not raw.startswith("SIP/2.0")
+        ]
+        state = (requests, uas.byes_sent, uas.active_calls)
+        peer.close()
+        await uas.close()
+        return state
+
+    requests, byes_sent, active = run(scenario())
+
+    byes = [r for r in requests if r["method"] == "BYE"]
+    assert len(byes) == 1, f"expected one BYE, got {[r['method'] for r in requests]}"
+    assert byes_sent == 1
+    assert active == 0
+
+
+def test_the_outbound_bye_carries_the_same_call_id():
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peer = Peer(port)
+        await establish(peer, call_id="same-id@test")
+        gateway.finish.set()
+        sent = [parse_request(r) for r in await collect(peer) if not r.startswith("SIP/2.0")]
+        peer.close()
+        await uas.close()
+        return sent
+
+    bye = [r for r in run(scenario()) if r["method"] == "BYE"][0]
+
+    assert bye["call-id"] == "same-id@test"
+
+
+def test_the_outbound_bye_reverses_the_dialog_tags():
+    """Our To becomes the From; theirs becomes the To.
+
+    The wrong way round produces a BYE for a dialog that does not exist, which
+    is answered 481 and leaves the leg up exactly as before.
+    """
+
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peer = Peer(port)
+        answer = await establish(peer)
+        gateway.finish.set()
+        sent = [parse_request(r) for r in await collect(peer) if not r.startswith("SIP/2.0")]
+        peer.close()
+        await uas.close()
+        return answer, sent
+
+    answer, sent = run(scenario())
+    bye = [r for r in sent if r["method"] == "BYE"][0]
+    local_tag = re.search(r";tag=([^\s;]+)", parse_request(answer)["to"]).group(1)
+
+    # Our tag — the one we answered the INVITE with — is on the From.
+    assert f"tag={local_tag}" in bye["from"]
+    # The caller's tag is on the To.
+    assert "tag=abcd" in bye["to"]
+    # The local identity is the URI that was dialled, which is what the INVITE
+    # addressed and what our 200 OK echoed back — not the gateway's own name.
+    assert bye["from"].startswith("<sip:9001@")
+    assert bye["to"].startswith("<sip:anon@")
+
+
+def test_the_local_tag_is_the_one_from_the_two_hundred_ok():
+    """Regenerating it would address a dialog nobody has."""
+
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peer = Peer(port)
+        answer = await establish(peer)
+        gateway.finish.set()
+        sent = [parse_request(r) for r in await collect(peer) if not r.startswith("SIP/2.0")]
+        peer.close()
+        await uas.close()
+        return answer, sent
+
+    answer, sent = run(scenario())
+    answered_to = parse_request(answer)["to"]
+    bye_from = [r for r in sent if r["method"] == "BYE"][0]["from"]
+
+    assert answered_to == bye_from
+
+
+def test_the_outbound_bye_has_a_valid_cseq_and_via():
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peer = Peer(port)
+        await establish(peer)
+        gateway.finish.set()
+        sent = [parse_request(r) for r in await collect(peer) if not r.startswith("SIP/2.0")]
+        peer.close()
+        await uas.close()
+        return sent
+
+    bye = [r for r in run(scenario()) if r["method"] == "BYE"][0]
+
+    number, _, method = bye["cseq"].partition(" ")
+    assert method == "BYE"
+    assert int(number) >= 1
+    assert bye["via"].startswith("SIP/2.0/UDP")
+    assert "branch=z9hG4bK" in bye["via"]
+    assert bye["max-forwards"] == "70"
+    assert bye["content-length"] == "0"
+    assert bye["start_line"].startswith("BYE sip:")
+
+
+def test_the_dialog_and_its_media_are_released_when_the_bank_finishes():
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peer = Peer(port)
+        await establish(peer)
+        source = gateway.calls[0]
+        media_port = source.port
+
+        gateway.finish.set()
+        await collect(peer, timeout=1.0)
+        state = (uas.active_calls, source.closed, media_port)
+        peer.close()
+        await uas.close()
+        return state
+
+    active, closed, media_port = run(scenario())
+
+    assert active == 0, "the dialog leaked"
+    assert closed is True, "the media source was not released"
+    # And the media port is free again.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.bind(("0.0.0.0", media_port))
+    probe.close()
+
+
+# --- 7-9: the peer ends first, and races -----------------------------------
+
+
+def test_a_peer_bye_does_not_produce_a_second_outbound_bye():
+    """Their dialog is already gone; a BYE back would name a dead call."""
+
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peer = Peer(port)
+        await establish(peer, call_id="peer-first@test")
+
+        peer.send(simple("BYE", call_id="peer-first@test"))
+        await asyncio.sleep(0.3)
+        gateway.finish.set()                       # handle_call unwinds after
+        await asyncio.sleep(0.4)
+
+        sent = [parse_request(r) for r in await collect(peer, timeout=1.0)
+                if not r.startswith("SIP/2.0")]
+        state = (sent, uas.byes_sent, uas.active_calls)
+        peer.close()
+        await uas.close()
+        return state
+
+    sent, byes_sent, active = run(scenario())
+
+    assert [r for r in sent if r["method"] == "BYE"] == []
+    assert byes_sent == 0
+    assert active == 0
+
+
+def test_an_inbound_bye_racing_the_bank_yields_at_most_one_bye():
+    """Exactly one of the two paths claims the dialog."""
+
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peer = Peer(port)
+        await establish(peer, call_id="race@test")
+        source = gateway.calls[0]
+
+        # Both endings at once.
+        gateway.finish.set()
+        peer.send(simple("BYE", call_id="race@test"))
+        await asyncio.sleep(0.5)
+
+        sent = [parse_request(r) for r in await collect(peer, timeout=1.0)
+                if not r.startswith("SIP/2.0")]
+        state = (len([r for r in sent if r["method"] == "BYE"]),
+                 uas.byes_sent, uas.active_calls, source.closed)
+        peer.close()
+        await uas.close()
+        return state
+
+    byes, byes_sent, active, closed = run(scenario())
+
+    assert byes <= 1, "the racing paths both sent a BYE"
+    assert byes_sent == byes
+    assert active == 0, "the dialog leaked"
+    assert closed is True
+
+
+def test_a_duplicate_inbound_bye_is_still_harmless():
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peer = Peer(port)
+        await establish(peer, call_id="dupe-bye@test")
+
+        for _ in range(4):
+            peer.send(simple("BYE", call_id="dupe-bye@test"))
+            await asyncio.sleep(0.1)
+        gateway.finish.set()
+        await asyncio.sleep(0.3)
+
+        answers = [r for r in await collect(peer, timeout=1.0) if r.startswith("SIP/2.0")]
+        state = (uas.active_calls, uas.byes_sent, len(answers))
+        peer.close()
+        await uas.close()
+        return state
+
+    active, byes_sent, answered = run(scenario())
+
+    assert active == 0
+    assert byes_sent == 0
+    # Every retransmitted BYE is answered; ignoring one would have the peer
+    # retransmit until it timed the dialog out.
+    assert answered >= 4
+
+
+# --- 10-12: many calls, shutdown, and responses ----------------------------
+
+
+def test_each_of_several_calls_gets_its_own_correctly_addressed_bye():
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peers = [Peer(port) for _ in range(3)]
+        for index, peer in enumerate(peers):
+            await establish(peer, call_id=f"multi-{index}@test")
+
+        gateway.finish.set()
+        await asyncio.sleep(0.6)
+
+        byes = []
+        for peer in peers:
+            for raw in await collect(peer, timeout=1.0):
+                if not raw.startswith("SIP/2.0"):
+                    byes.append(parse_request(raw))
+        state = (byes, uas.byes_sent, uas.active_calls)
+        for peer in peers:
+            peer.close()
+        await uas.close()
+        return state
+
+    byes, byes_sent, active = run(scenario())
+
+    assert byes_sent == 3
+    assert active == 0
+    call_ids = {b["call-id"] for b in byes if b["method"] == "BYE"}
+    assert call_ids == {"multi-0@test", "multi-1@test", "multi-2@test"}
+    # Each BYE carries its own dialog's tags, not another call's.
+    from_tags = {b["from"] for b in byes if b["method"] == "BYE"}
+    assert len(from_tags) == 3
+
+
+def test_closing_the_server_still_releases_every_dialog():
+    """Shutdown is not a call ending; it releases without a burst of BYEs."""
+
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peers = [Peer(port) for _ in range(3)]
+        for index, peer in enumerate(peers):
+            await establish(peer, call_id=f"shut-{index}@test")
+        during = uas.active_calls
+
+        gateway.finish.set()
+        await uas.close()
+        await asyncio.sleep(0.2)
+
+        state = (during, uas.active_calls, uas.byes_sent,
+                 [source.closed for source in gateway.calls])
+        for peer in peers:
+            peer.close()
+        return state
+
+    during, after, byes_sent, closed = run(scenario())
+
+    assert during == 3
+    assert after == 0
+    assert closed == [True, True, True]
+    assert byes_sent == 0, "shutdown should not emit BYEs"
+
+
+def test_a_sip_response_neither_creates_nor_changes_a_dialog():
+    """Responses are ignored by design; this asserts the design is harmless."""
+
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peer = Peer(port)
+
+        # A response arriving out of nowhere, as the 200 to our BYE would.
+        for reply in (
+            "SIP/2.0 200 OK\r\nCall-ID: ghost@test\r\nCSeq: 1 BYE\r\n"
+            "Content-Length: 0\r\n\r\n",
+            "SIP/2.0 481 Call/Transaction Does Not Exist\r\n"
+            "Call-ID: ghost@test\r\nCSeq: 1 BYE\r\nContent-Length: 0\r\n\r\n",
+        ):
+            peer.send(reply.encode())
+        await asyncio.sleep(0.3)
+        before = uas.active_calls
+
+        # And one arriving for a live call does not disturb it either.
+        await establish(peer, call_id="live@test")
+        peer.send(
+            b"SIP/2.0 200 OK\r\nCall-ID: live@test\r\nCSeq: 1 BYE\r\n"
+            b"Content-Length: 0\r\n\r\n"
+        )
+        await asyncio.sleep(0.3)
+        state = (before, uas.active_calls, uas.byes_sent)
+
+        gateway.finish.set()
+        await asyncio.sleep(0.3)
+        peer.close()
+        await uas.close()
+        return state
+
+    before, during, byes_sent = run(scenario())
+
+    assert before == 0, "a response created a dialog"
+    assert during == 1, "a response destroyed a live dialog"
+    assert byes_sent == 0
+
+
+def test_a_failed_gateway_task_still_ends_the_sip_leg():
+    """A call that ends by raising is still a call that has ended."""
+
+    class FailingGateway:
+        def __init__(self):
+            self.calls = []
+
+        async def handle_call(self, source):
+            self.calls.append(source)
+            await asyncio.sleep(0.2)
+            raise RuntimeError("the bank fell over")
+
+    async def scenario():
+        gateway = FailingGateway()
+        uas, port = await _serve(gateway)
+        peer = Peer(port)
+        await establish(peer, call_id="failing@test")
+        await asyncio.sleep(0.5)
+
+        sent = [parse_request(r) for r in await collect(peer, timeout=1.0)
+                if not r.startswith("SIP/2.0")]
+        state = (len([r for r in sent if r["method"] == "BYE"]),
+                 uas.active_calls, gateway.calls[0].closed)
+        peer.close()
+        await uas.close()
+        return state
+
+    byes, active, closed = run(scenario())
+
+    assert byes == 1, "a failed call left the leg up"
+    assert active == 0
+    assert closed is True
+
+
+def test_the_bye_is_addressed_at_the_peers_contact_when_it_offers_one():
+    """A BYE goes to the leg that answered, not the number that was dialled."""
+
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peer = Peer(port)
+
+        with_contact = invite(call_id="contact@test").decode().replace(
+            "CSeq: 1 INVITE\r\n",
+            "CSeq: 1 INVITE\r\nContact: <sip:fs@10.9.9.9:5070>\r\n",
+        )
+        peer.send(with_contact.encode())
+        await asyncio.sleep(0.2)
+        await asyncio.get_running_loop().run_in_executor(None, peer.response)
+        peer.send(simple("ACK", call_id="contact@test"))
+        await asyncio.sleep(0.2)
+
+        gateway.finish.set()
+        sent = [parse_request(r) for r in await collect(peer, timeout=1.0)
+                if not r.startswith("SIP/2.0")]
+        peer.close()
+        await uas.close()
+        return sent
+
+    bye = [r for r in run(scenario()) if r["method"] == "BYE"][0]
+
+    assert bye["start_line"] == "BYE sip:fs@10.9.9.9:5070 SIP/2.0"
+
+
+def test_the_bye_logs_nothing_sensitive(caplog):
+    async def scenario():
+        gateway = EndableGateway()
+        uas, port = await _serve(gateway)
+        peer = Peer(port)
+        await establish(peer, call_id="quiet@test")
+        gateway.finish.set()
+        await collect(peer, timeout=1.0)
+        peer.close()
+        await uas.close()
+
+    with caplog.at_level("INFO", logger="gateway.sip"):
+        run(scenario())
+
+    assert "quiet@test" in caplog.text  # the call id is operational, and useful
+    for forbidden in ("4821", "DEMO001", "media_token", "pin", "secret"):
+        assert forbidden not in caplog.text.lower(), forbidden
