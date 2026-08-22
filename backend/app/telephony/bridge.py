@@ -39,10 +39,25 @@ import logging
 import secrets
 import time
 
+from app.agents import speech
 from app.telephony import audio as codec
+from app.telephony.lifecycle import CallLifecycle, EndReason
 from app.telephony.media import BoundedAudioQueue, MediaTransport
 
 logger = logging.getLogger("app.telephony.bridge")
+
+
+def _item_text(item) -> str:
+    """The text of one history item, however the SDK shaped it."""
+    parts = []
+    for entry in getattr(item, "content", None) or []:
+        for attribute in ("transcript", "text"):
+            value = getattr(entry, attribute, None) or (
+                entry.get(attribute) if isinstance(entry, dict) else None
+            )
+            if value:
+                parts.append(str(value))
+    return " ".join(parts)
 
 # What is sent into the session to make the agent open the call.
 #
@@ -76,6 +91,7 @@ class PhoneCallBridge:
         realtime_manager,
         outbound_max_frames: int,
         on_call_lost=None,
+        on_call_ended=None,
         media_token_ttl: float = 15.0,
     ) -> None:
         self.provider_call_id = provider_call_id
@@ -99,6 +115,10 @@ class PhoneCallBridge:
         # the caller would sit in silence holding a capacity slot until the
         # idle sweep noticed, which is minutes away.
         self._on_call_lost = on_call_lost
+        # Called when the *conversation* ends — a goodbye played out, or a
+        # silent caller prompted and released. Distinct from `on_call_lost`,
+        # which is a failure.
+        self._on_call_ended = on_call_ended
         self._lost_signalled = False
         self._lost_task: asyncio.Task | None = None
 
@@ -129,6 +149,31 @@ class PhoneCallBridge:
         # Counters, for the operator and for the tests. Not audio.
         self.frames_from_caller = 0
         self.frames_to_caller = 0
+        self.duplicate_tool_calls = 0
+
+        # When this call speaks, listens, waits and ends. Channel 1 runs the
+        # equivalent in the browser page; a telephone has no page, so it is
+        # decided here — per call, with its own timer.
+        self.lifecycle = CallLifecycle(
+            provider_call_id,
+            speak=self._speak_silence_line,
+            hang_up=self._end_call,
+        )
+
+        # One logical caller turn produces one assistant response. The model can
+        # be prompted more than once for the same turn — a retried cue, a racing
+        # trigger — and each prompt is a second voice talking over the first.
+        self._response_open = False
+        self._turn_id = 0
+
+        # Tools already executed in this turn, so a repeated call with the same
+        # arguments reads the customer balance once rather than twice. A banking
+        # read is idempotent; a duplicate one is still a second disclosure and a
+        # second audit line.
+        self._tools_this_turn: set[str] = set()
+
+        # Lifecycle transitions scheduled from the synchronous event handler.
+        self._transitions: set[asyncio.Task] = set()
 
     # --- the model's side ----------------------------------------------------
 
@@ -154,12 +199,125 @@ class PhoneCallBridge:
             data = getattr(getattr(event, "audio", None), "data", None)
             if data:
                 self.outbound.put(data)
+                self._response_open = True
+                self._schedule(self.lifecycle.on_assistant_audio())
+
+        elif kind == "audio_end":
+            # The model has finished *generating* this turn. The caller has not
+            # finished *hearing* it — several seconds may still be queued for a
+            # telephone that plays fifty frames a second.
+            self._response_open = False
+            self._schedule(self.lifecycle.on_generation_ended())
+            if not len(self.outbound):
+                # Nothing left to play: the last frame already went out, so no
+                # further drain will be reported and completion is now.
+                self._schedule(self.lifecycle.on_playback_drained())
 
         elif kind == "audio_interrupted":
             # Barge-in. The caller started speaking, so everything queued is a
             # sentence they have stopped listening to. Playing it out would
             # talk over them, and the model has already stopped generating it.
             self.outbound.clear()
+            self._response_open = False
+            self._schedule(self.lifecycle.on_assistant_interrupted())
+
+        elif kind == "history_added":
+            self._on_history(getattr(event, "item", None))
+
+        elif kind == "tool_start":
+            self._note_tool(event)
+
+        elif kind == "raw_model_event":
+            self._on_raw(getattr(event, "data", None))
+
+    # --- reading the conversation -------------------------------------------
+
+    def _on_raw(self, data) -> None:
+        """Caller-speech signals, which are how silence is actually measured.
+
+        Never packet absence: a caller who is listening sends RTP the whole
+        time, so silence on the wire is not silence in the room. What counts is
+        the model reporting a voice.
+        """
+        raw_type = getattr(data, "type", None)
+        if raw_type in ("turn_started", "input_audio_transcription_completed"):
+            self._begin_caller_turn()
+            return
+
+        inner = getattr(data, "data", None)
+        if (
+            isinstance(inner, dict)
+            and inner.get("type") == "input_audio_buffer.speech_started"
+        ):
+            self._begin_caller_turn()
+
+    def _begin_caller_turn(self) -> None:
+        self._turn_id += 1
+        self._tools_this_turn.clear()
+        self._schedule(self.lifecycle.on_caller_speech_started())
+
+    def _on_history(self, item) -> None:
+        """Watch for the assistant's closing line.
+
+        The agent decides to say goodbye, following its instructions. This
+        notices that it has, so the call can be taken down once the line has
+        finished playing — the same division Channel 1 uses, where the page
+        watches for the closing line rather than deciding on it.
+        """
+        if getattr(item, "role", None) != "assistant":
+            return
+        text = _item_text(item)
+        if text and speech.is_closing_line(text):
+            self._schedule(self.lifecycle.on_goodbye_spoken())
+
+    def _note_tool(self, event) -> None:
+        """Record a tool call, and say whether it is a repeat of this turn."""
+        tool = getattr(event, "tool", None)
+        name = getattr(tool, "name", None) or str(tool)
+        signature = f"{name}:{getattr(event, 'arguments', '')}"
+        if signature in self._tools_this_turn:
+            logger.warning(
+                "bridge[%s] duplicate tool in one turn: %s",
+                self.provider_call_id,
+                name,
+            )
+            self.duplicate_tool_calls += 1
+            return
+        self._tools_this_turn.add(signature)
+
+    def _schedule(self, coroutine) -> None:
+        """Run a lifecycle transition from this synchronous event handler.
+
+        The handler is called by the event pump and cannot await. Tasks are
+        held so they are not garbage collected mid-flight, and discarded when
+        they finish.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - no loop during shutdown
+            coroutine.close()
+            return
+        task = loop.create_task(coroutine)
+        self._transitions.add(task)
+        task.add_done_callback(self._transitions.discard)
+
+    # --- what the lifecycle asks for ----------------------------------------
+
+    async def _speak_silence_line(self) -> None:
+        """Prompt the model to say the closing line to a silent caller."""
+        await self._realtime.send_message(
+            self.banking_session_id, speech.SILENCE_CLOSING_CUE
+        )
+
+    async def _end_call(self, reason: EndReason) -> None:
+        """The lifecycle has decided this call is over."""
+        logger.info(
+            "bridge[%s] lifecycle ended the call: %s", self.provider_call_id, reason.value
+        )
+        if self._on_call_ended is not None:
+            await self._on_call_ended(
+                self.provider_call_id, self.banking_session_id, reason.value
+            )
 
     # --- the pumps -----------------------------------------------------------
 
@@ -207,6 +365,12 @@ class PhoneCallBridge:
                 await self.transport.send_audio(codec.model_to_telephony(chunk))
                 self.frames_to_caller += 1
                 self.last_activity = time.monotonic()
+                if not len(self.outbound):
+                    # The queue is empty and this frame has gone out. If the
+                    # model has also finished generating, the caller has now
+                    # heard everything — which is the only safe moment to hang
+                    # up on a closing line.
+                    await self.lifecycle.on_playback_drained()
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -343,6 +507,11 @@ class PhoneCallBridge:
                 return
             self._closed = True
 
+            await self.lifecycle.close()
+            for task in list(self._transitions):
+                task.cancel()
+            self._transitions.clear()
+
             self.outbound.close()
 
             for task in self._tasks:
@@ -377,6 +546,8 @@ class PhoneCallBridge:
             "frames_to_caller": self.frames_to_caller,
             "outbound_queued": len(self.outbound),
             "outbound_dropped": self.outbound.dropped,
+            "duplicate_tool_calls": self.duplicate_tool_calls,
+            **self.lifecycle.describe(),
         }
 
 

@@ -125,6 +125,21 @@ async def handle_event(payload: InboundCallEvent) -> EventResult:
     return await _end_call(payload)
 
 
+async def _on_call_ended(
+    provider_call_id: str, banking_session_id: str, reason: str
+) -> None:
+    """The conversation finished, and the closing line has been heard.
+
+    Distinct from `_on_call_lost`, which is a failure. This is a call that ran
+    to a proper end — the caller said goodbye and the bank answered, or the
+    caller fell silent and was told so. Either way the line has played out
+    before anything is taken down, which is the whole point of waiting.
+    """
+    logger.info("telephony call ended: %s (%s)", provider_call_id, reason)
+    await tear_down(provider_call_id, banking_session_id)
+    recorder.close_phone_call(provider_call_id, reason=reason)
+
+
 async def _on_call_lost(provider_call_id: str, banking_session_id: str) -> None:
     """A call whose media or model failed underneath it.
 
@@ -236,6 +251,7 @@ async def _register_incoming(payload: InboundCallEvent) -> EventResult:
         realtime_manager=voice_call_manager,
         outbound_max_frames=settings.telephony_audio_queue_frames,
         on_call_lost=_on_call_lost,
+        on_call_ended=_on_call_ended,
         # The credential outlives nothing: it expires with the window the
         # gateway has to attach, so a token that leaks is useless seconds later.
         media_token_ttl=settings.telephony_media_connect_timeout,

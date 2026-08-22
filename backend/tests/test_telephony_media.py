@@ -1615,3 +1615,250 @@ def test_a_media_failure_is_recorded_as_a_media_failure(phone, monkeypatch):
             )
         ).one()
     assert row.disconnect_reason == "MEDIA_UNAVAILABLE"
+
+
+# === Phase 6: the bridge drives the lifecycle ===============================
+
+
+def _lifecycle_event(kind, **fields):
+    return FakeEvent(kind, **fields)
+
+
+class _HistoryItem:
+    def __init__(self, role, text):
+        self.role = role
+        self.content = [type("C", (), {"transcript": text, "text": None})()]
+
+
+def test_assistant_audio_moves_the_call_into_speaking(phone):
+    from app.telephony.lifecycle import CallState
+
+    async def scenario():
+        await place("call-lc1")
+        bridge = bridge_for("call-lc1")
+        bridge.on_realtime_event(
+            bridge.banking_session_id, audio_event(b"\x00\x10" * 480)
+        )
+        await wait_until(lambda: bridge.lifecycle.state is CallState.ASSISTANT_SPEAKING)
+        return bridge.lifecycle.state
+
+    assert run(scenario()) is CallState.ASSISTANT_SPEAKING
+
+
+def test_the_wait_starts_when_the_queue_drains_after_generation_ends(phone):
+    """Playback completion is two facts: generation ended, and frames sent."""
+    from app.telephony.lifecycle import CallState
+
+    async def scenario():
+        await place("call-lc2")
+        bridge = bridge_for("call-lc2")
+        session = phone.by_banking_session[bridge.banking_session_id]
+
+        bridge.on_realtime_event(bridge.banking_session_id, audio_event(b"\x00\x10" * 480))
+        await wait_until(lambda: bridge.frames_to_caller >= 1)
+        bridge.on_realtime_event(bridge.banking_session_id, _lifecycle_event("audio_end"))
+        await wait_until(lambda: bridge.lifecycle.waiting_for_caller, timeout=2.0)
+        state = bridge.lifecycle.state
+        await bridge.lifecycle.close()
+        assert session is not None
+        return state
+
+    assert run(scenario()) is CallState.WAITING_FOR_CALLER
+
+
+def test_caller_speech_from_a_raw_event_cancels_the_wait(phone):
+    """Silence is conversational state, and this is where it comes from."""
+    from app.telephony.lifecycle import CallState
+
+    async def scenario():
+        await place("call-lc3")
+        bridge = bridge_for("call-lc3")
+        bridge.on_realtime_event(bridge.banking_session_id, audio_event(b"\x00\x10" * 480))
+        await wait_until(lambda: bridge.frames_to_caller >= 1)
+        bridge.on_realtime_event(bridge.banking_session_id, _lifecycle_event("audio_end"))
+        await wait_until(lambda: bridge.lifecycle.waiting_for_caller, timeout=2.0)
+
+        raw = FakeEvent("raw_model_event", data=FakeEvent("turn_started"))
+        bridge.on_realtime_event(bridge.banking_session_id, raw)
+        await wait_until(lambda: bridge.lifecycle.state is CallState.CALLER_SPEAKING)
+        state = bridge.lifecycle.state
+        await bridge.lifecycle.close()
+        return state
+
+    assert run(scenario()) is CallState.CALLER_SPEAKING
+
+
+def test_the_assistant_goodbye_line_puts_the_call_into_closing(phone):
+    from app.agents import speech
+    from app.telephony.lifecycle import CallState
+
+    async def scenario():
+        await place("call-lc4")
+        bridge = bridge_for("call-lc4")
+        bridge.on_realtime_event(bridge.banking_session_id, audio_event(b"\x00\x10" * 480))
+        item = _HistoryItem("assistant", speech.GOODBYE_SPEECH)
+        bridge.on_realtime_event(
+            bridge.banking_session_id, FakeEvent("history_added", item=item)
+        )
+        await wait_until(lambda: bridge.lifecycle.state is CallState.CLOSING, timeout=2.0)
+        state = bridge.lifecycle.state
+        await bridge.lifecycle.close()
+        return state
+
+    assert run(scenario()) is CallState.CLOSING
+
+
+def test_a_courtesy_reply_does_not_close_the_call(phone):
+    """"Thank you for your service" must leave the line open."""
+    from app.agents import speech
+    from app.telephony.lifecycle import CallState
+
+    async def scenario():
+        await place("call-lc5")
+        bridge = bridge_for("call-lc5")
+        bridge.on_realtime_event(bridge.banking_session_id, audio_event(b"\x00\x10" * 480))
+        item = _HistoryItem("assistant", speech.YOU_ARE_WELCOME_SPEECH)
+        bridge.on_realtime_event(
+            bridge.banking_session_id, FakeEvent("history_added", item=item)
+        )
+        await asyncio.sleep(0.1)
+        state = bridge.lifecycle.state
+        await bridge.lifecycle.close()
+        return state
+
+    assert run(scenario()) is not CallState.CLOSING
+
+
+def test_a_caller_saying_goodbye_does_not_close_the_call_by_itself(phone):
+    """Only the bank's own closing line ends a call."""
+    from app.telephony.lifecycle import CallState
+
+    async def scenario():
+        await place("call-lc6")
+        bridge = bridge_for("call-lc6")
+        item = _HistoryItem("user", "ok goodbye then")
+        bridge.on_realtime_event(
+            bridge.banking_session_id, FakeEvent("history_added", item=item)
+        )
+        await asyncio.sleep(0.1)
+        state = bridge.lifecycle.state
+        await bridge.lifecycle.close()
+        return state
+
+    assert run(scenario()) is not CallState.CLOSING
+
+
+def test_a_repeated_tool_in_one_turn_is_counted_and_suppressed(phone):
+    """A banking read is idempotent; a duplicate is still a second disclosure."""
+
+    async def scenario():
+        await place("call-lc7")
+        bridge = bridge_for("call-lc7")
+        tool = FakeEvent("t")
+        tool.name = "get_account_balance"
+        for _ in range(3):
+            bridge.on_realtime_event(
+                bridge.banking_session_id,
+                FakeEvent("tool_start", tool=tool, arguments='{"account_type":"Savings"}'),
+            )
+        await asyncio.sleep(0.05)
+        duplicates = bridge.duplicate_tool_calls
+        await bridge.lifecycle.close()
+        return duplicates
+
+    assert run(scenario()) == 2
+
+
+def test_a_new_caller_turn_allows_the_same_tool_again(phone):
+    """Asking twice in one call is legitimate; twice in one turn is not."""
+
+    async def scenario():
+        await place("call-lc8")
+        bridge = bridge_for("call-lc8")
+        tool = FakeEvent("t")
+        tool.name = "get_account_balance"
+        event = FakeEvent("tool_start", tool=tool, arguments="{}")
+
+        bridge.on_realtime_event(bridge.banking_session_id, event)
+        raw = FakeEvent("raw_model_event", data=FakeEvent("turn_started"))
+        bridge.on_realtime_event(bridge.banking_session_id, raw)
+        await asyncio.sleep(0.05)
+        bridge.on_realtime_event(bridge.banking_session_id, event)
+        await asyncio.sleep(0.05)
+        duplicates = bridge.duplicate_tool_calls
+        await bridge.lifecycle.close()
+        return duplicates
+
+    assert run(scenario()) == 0
+
+
+def test_the_lifecycle_belongs_to_one_call(phone):
+    """Five concurrent calls, five lifecycles, no shared timer."""
+
+    async def scenario():
+        await asyncio.gather(*(place(f"call-lc9-{n}") for n in range(APPLICATION_TARGET)))
+        bridges = [bridge_for(f"call-lc9-{n}") for n in range(APPLICATION_TARGET)]
+        ids = {id(b.lifecycle) for b in bridges}
+        call_ids = {b.lifecycle.call_id for b in bridges}
+        for b in bridges:
+            await b.lifecycle.close()
+        return ids, call_ids
+
+    ids, call_ids = run(scenario())
+
+    assert len(ids) == APPLICATION_TARGET
+    assert len(call_ids) == APPLICATION_TARGET
+
+
+def test_an_event_for_another_session_never_touches_this_lifecycle(phone):
+    from app.telephony.lifecycle import CallState
+
+    async def scenario():
+        await asyncio.gather(place("call-lcA"), place("call-lcB"))
+        victim = bridge_for("call-lcA")
+        stranger = bridge_for("call-lcB")
+        victim.on_realtime_event(
+            stranger.banking_session_id, audio_event(b"\x00\x10" * 480)
+        )
+        await asyncio.sleep(0.1)
+        state = victim.lifecycle.state
+        for b in (victim, stranger):
+            await b.lifecycle.close()
+        return state
+
+    assert run(scenario()) is CallState.OPENING
+
+
+def test_closing_the_bridge_releases_the_lifecycle_and_its_timer(phone):
+    async def scenario():
+        await place("call-lcC")
+        bridge = bridge_for("call-lcC")
+        await bridge.close()
+        await asyncio.sleep(0.05)
+        leftover = [
+            t for t in asyncio.all_tasks()
+            if (t.get_name() or "").startswith("silence-") and not t.done()
+        ]
+        return bridge.lifecycle.closed, len(leftover)
+
+    closed, leftover = run(scenario())
+
+    assert closed is True
+    assert leftover == 0
+
+
+def test_the_bridge_description_includes_the_conversation_state(phone):
+    async def scenario():
+        await place("call-lcD")
+        bridge = bridge_for("call-lcD")
+        described = bridge.describe()
+        await bridge.lifecycle.close()
+        return described
+
+    described = run(scenario())
+
+    assert "state" in described
+    assert "turns_completed" in described
+    assert "duplicate_tool_calls" in described
+    for forbidden in ("customer_id", "transcript", "media_token", "pin"):
+        assert forbidden not in described, forbidden

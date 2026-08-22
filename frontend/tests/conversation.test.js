@@ -293,7 +293,7 @@ test("the closing line hangs up once it has finished playing", async () => {
 
   deliver(kit, {
     type: "response.output_audio_transcript.done",
-    transcript: "Thank you for calling ABC Demo Bank. Have a good day. Goodbye.",
+    transcript: "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodbye.",
   });
   // Still connected: the sentence is only half spoken.
   assert.equal(kit.ended.length, 0);
@@ -323,7 +323,7 @@ test("a plain thank you does not end the call", async () => {
 
   await assistantFinished(
     kit,
-    "You're welcome. Is there anything else I can help you with today?"
+    "You're most welcome. Is there anything else I can help you with today?"
   );
 
   assert.equal(kit.ended.length, 0);

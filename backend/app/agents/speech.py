@@ -10,6 +10,7 @@ through binary floating point.
 """
 
 from datetime import date
+import re
 from decimal import Decimal, InvalidOperation
 
 from app.authorization import Reason
@@ -67,19 +68,53 @@ FALLBACK_SPEECH = (
 
 DOMAIN_QUESTION = "Certainly. Is that about your account, or your loan?"
 
-GOODBYE_SPEECH = "Thank you for calling ABC Demo Bank. Have a good day. Goodbye."
+# The three lines that end or sustain a call, spoken exactly as written.
+#
+# Exactly matters more than it looks. The telephone channel hangs up when it
+# hears the closing line, so a paraphrase is a call that never ends; and a
+# customer being told the bank is going is the last thing they hear, which is
+# not the moment for improvisation. The model is instructed to reproduce these
+# verbatim, and a test asserts the instructions still carry them.
+GOODBYE_SPEECH = "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodbye."
 
 # A caller saying thank you is being polite, not hanging up. The line stays
 # open and they are asked whether they need anything else — which is what a
 # contact-centre officer does, and what stops a courtesy ending the call.
 YOU_ARE_WELCOME_SPEECH = (
-    "You're welcome. Is there anything else I can help you with today?"
+    "You're most welcome. Is there anything else I can help you with today?"
 )
 
-# Said when the line has gone quiet. The first is a question, so the caller can
-# rescue the call simply by answering it; the second is the closing line.
+# Said when a telephone caller has gone quiet, and then the call ends.
+#
+# Channel 1 asks "do you want to continue?" and waits a second time, because a
+# browser caller may simply have looked away. Channel 2 does not: a telephone
+# caller silent for ten seconds after the bank finished speaking has usually
+# put the handset down, and a second wait holds a line — and a capacity slot —
+# for somebody who is not there.
+SILENCE_CLOSING_SPEECH = "I do not hear anything from you. Thank you."
+
+# Channel 1 only. Kept because the browser page still asks its question.
 SILENCE_CHECK_SPEECH = "I do not hear anything from you. Do you want to continue?"
-SILENCE_CLOSING_SPEECH = "Thank you. Please try again."
+
+# What is sent into a telephone session to make the agent speak its closing
+# line to a silent caller. A cue, not the words: the wording lives in the
+# agent's instructions, which is the one place that decides how this bank
+# speaks. See `app.telephony.lifecycle`.
+SILENCE_CLOSING_CUE = "[The caller has been silent. Close the call now.]"
+
+# Words that mean the bank has said its closing line and the call may be taken
+# down once the line has finished playing.
+#
+# Matched on "goodbye" as a whole word. The greeting says "Thank you for
+# calling" and never says goodbye, so this cannot fire on the opening; and the
+# agent is instructed to say goodbye only when it is genuinely closing, so a
+# caller saying goodbye does not end the call until the bank has said its line.
+_CLOSING_MARKER = re.compile(r"\bgoodbye\b", re.IGNORECASE)
+
+
+def is_closing_line(text: str) -> bool:
+    """Whether this assistant turn is the bank closing the call."""
+    return bool(text) and bool(_CLOSING_MARKER.search(text))
 
 UNSUPPORTED_SPEECH = (
     "I'm sorry, I can't help with that one. I can give you balances, details, "

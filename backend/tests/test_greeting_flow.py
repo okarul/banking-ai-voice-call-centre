@@ -289,7 +289,7 @@ def test_a_plain_thank_you_keeps_the_call_open(manager, utterance):
 
     assert response.speech == speech.YOU_ARE_WELCOME_SPEECH
     assert response.speech == (
-        "You're welcome. Is there anything else I can help you with today?"
+        "You're most welcome. Is there anything else I can help you with today?"
     )
     assert response.intent is not Intent.END_CALL
     assert response.success is True
@@ -321,7 +321,7 @@ def test_an_explicit_goodbye_closes_the_call(manager, utterance):
     assert response.intent is Intent.END_CALL
     assert response.speech == speech.GOODBYE_SPEECH
     assert response.speech == (
-        "Thank you for calling ABC Demo Bank. Have a good day. Goodbye."
+        "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodbye."
     )
 
 
