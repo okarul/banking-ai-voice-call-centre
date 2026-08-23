@@ -591,29 +591,32 @@ class PhoneCallBridge:
         Idempotent by a lock and a flag rather than by hope: a call can end
         from three directions at once — the caller hangs up, the provider sends
         an event, the model session drops — and all three land here.
+
+        **The task running this is never cancelled.** A clean ending arrives
+        from inside one of the very tasks being stopped: the outbound pump
+        drains the queue, the lifecycle sees playback complete, and the teardown
+        that follows runs *on the pump's own stack*. Cancelling the whole list
+        would cancel the caller mid-teardown, so the transport was never
+        released, the media socket stayed open, and the gateway never saw the
+        call end — which is what left the telephone connected after the bank had
+        said goodbye.
         """
         async with self._close_lock:
             if self._closed:
                 return
             self._closed = True
 
+            # Whatever is running this. It gets stopped by returning, not by
+            # being cancelled from within itself.
+            current = asyncio.current_task()
+
             await self.lifecycle.close()
-            for task in list(self._transitions):
-                task.cancel()
+            self._stop_tasks(self._transitions, current)
             self._transitions.clear()
 
             self.outbound.close()
 
-            for task in self._tasks:
-                task.cancel()
-            for task in self._tasks:
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    # A pump that failed on the way down changes nothing: the
-                    # call is over either way, and its exception must not stop
-                    # the transport being released.
-                    pass
+            await self._stop_and_await(self._tasks, current)
             self._tasks = []
 
             try:
@@ -624,6 +627,33 @@ class PhoneCallBridge:
                     self.provider_call_id,
                     type(error).__name__,
                 )
+
+    @staticmethod
+    def _stop_tasks(tasks, current) -> None:
+        """Cancel every task except the one asking."""
+        for task in list(tasks):
+            if task is not current:
+                task.cancel()
+
+    @staticmethod
+    async def _stop_and_await(tasks, current) -> None:
+        """Cancel the others and wait for them to actually stop.
+
+        Awaiting the current task would be awaiting ourselves, which never
+        returns; awaiting the others is what stops a cancelled pump being left
+        half-torn-down while the transport is released underneath it.
+        """
+        others = [task for task in list(tasks) if task is not current]
+        for task in others:
+            task.cancel()
+        for task in others:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                # A pump that failed on the way down changes nothing: the call
+                # is over either way, and its exception must not stop the
+                # transport being released.
+                pass
 
     def describe(self) -> dict:
         """Operator-safe state. No audio, no identity, no provider internals."""

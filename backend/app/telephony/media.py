@@ -216,8 +216,21 @@ class WebSocketMediaTransport:
     gateway in front of this application or a SIP stack inside it. See
     `docs/TELEPHONY_MEDIA.md`.
 
-    The socket is owned by the route that accepted it. This class reads and
-    writes; it does not close the underlying connection out from under FastAPI.
+    **Ownership.** The route accepts the socket and hands it here; from that
+    point this transport may also *close* it, and `on_call_ended` does.
+
+    That is a deliberate change of ownership, and the reason is the deadlock it
+    removes. When the bank ends a call the route is blocked in
+    `websocket.receive()`, waiting for a caller who has been disconnected in
+    every sense except the socket. Nothing else can wake it. The gateway's
+    `async for message in socket` therefore never finishes, `handle_call` never
+    returns, and the outbound SIP BYE that ends the telephone leg never runs —
+    so the caller hears the closing sentence and then dead air.
+
+    Closing here breaks that circle. Audio already sent is not lost: every
+    `send_audio` is awaited before the queue drains, so the close frame is
+    queued behind the audio and the gateway's iterator yields all of it before
+    it sees the socket end.
     """
 
     def __init__(self, *, max_frames: int) -> None:
@@ -291,6 +304,27 @@ class WebSocketMediaTransport:
             logger.info("media socket closed while sending: %s", type(error).__name__)
 
     async def on_call_ended(self) -> None:
+        """Release the transport and close the socket. Safe to call twice.
+
+        The socket reference is taken first, so a second call has nothing left
+        to close and a caller who already hung up cannot turn an ordinary
+        teardown into an error.
+        """
         self._closed = True
         self._attached.set()
         self._inbound.close()
+
+        socket = self._websocket
+        self._websocket = None
+        if socket is None:
+            return
+
+        try:
+            await socket.close()
+        except Exception as error:
+            # Already gone: the caller hung up, or the server tore the
+            # connection down first. That is the normal end of a call, not a
+            # failure, and it must not propagate into the teardown path.
+            logger.info(
+                "media socket already closed on teardown: %s", type(error).__name__
+            )

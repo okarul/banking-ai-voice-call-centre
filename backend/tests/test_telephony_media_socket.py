@@ -624,3 +624,172 @@ def test_the_credential_is_absent_from_the_operator_view(client, sessions):
     assert TOKENS["call-describe-tok"] not in str(described)
     assert "media_token" not in described
     assert described["media_attached"] is False
+
+
+# === Phase 6.2: the application ends the call, and the socket agrees ========
+#
+# The live symptom: the bank said "I do not hear anything from you. Thank you."
+# and the telephone stayed connected. The route was blocked in
+# `websocket.receive()` waiting for a caller who had been disconnected in every
+# sense but the socket, so the gateway's iterator never ended, `handle_call`
+# never returned, and the outbound SIP BYE never ran.
+
+
+def test_the_media_socket_closes_when_the_application_ends_the_call(client, sessions):
+    """What the gateway needs to see so its relay can finish."""
+    from starlette.websockets import WebSocketDisconnect
+
+    announce(client, "call-append")
+    bridge = phone_call_registry.get("call-append")
+
+    with media(client, "call-append") as socket:
+        socket.send_bytes(frame())
+        for _ in range(200):
+            if sessions[0].audio_chunks:
+                break
+            time.sleep(0.01)
+
+        # The bank finishes with the call, exactly as the lifecycle does.
+        asyncio.run(service.tear_down("call-append", bridge.banking_session_id))
+
+        # The far side — the gateway, in production — observes the close.
+        with pytest.raises(WebSocketDisconnect):
+            for _ in range(200):
+                socket.receive_bytes()
+
+    assert bridge.closed is True
+
+
+def test_the_gateway_side_iterator_finishes_so_handle_call_can_return(
+    client, sessions
+):
+    """The circular wait, broken.
+
+    A gateway relays with `async for message in socket`. If that never ends,
+    `handle_call` never returns and the SIP BYE never fires. This asserts the
+    iterator terminates once the application ends the call.
+    """
+    from starlette.websockets import WebSocketDisconnect
+
+    announce(client, "call-iter")
+    bridge = phone_call_registry.get("call-iter")
+
+    ended = False
+    with media(client, "call-iter") as socket:
+        asyncio.run(service.tear_down("call-iter", bridge.banking_session_id))
+        try:
+            for _ in range(500):
+                socket.receive_bytes()
+        except WebSocketDisconnect:
+            ended = True
+
+    assert ended is True, "the relay would have blocked for ever"
+
+
+def test_the_routes_teardown_stays_idempotent(client, sessions):
+    """The route's `finally` runs after the application already tore down."""
+    announce(client, "call-twice")
+    bridge = phone_call_registry.get("call-twice")
+    banking_session_id = bridge.banking_session_id
+
+    with media(client, "call-twice"):
+        asyncio.run(service.tear_down("call-twice", banking_session_id))
+        # And again, as the route's finally will.
+        asyncio.run(service.tear_down("call-twice", banking_session_id))
+
+    asyncio.run(service.tear_down("call-twice", banking_session_id))
+
+    assert phone_call_registry.get("call-twice") is None
+    assert voice_call_manager.used_capacity() == 0
+
+
+def test_a_caller_hangup_still_works_unchanged(client, sessions):
+    """The path that always worked must keep working."""
+    announce(client, "call-hangup")
+    assert voice_call_manager.used_capacity() == 1
+
+    with media(client, "call-hangup"):
+        pass  # the caller goes away
+
+    for _ in range(200):
+        if voice_call_manager.used_capacity() == 0:
+            break
+        time.sleep(0.01)
+
+    assert voice_call_manager.used_capacity() == 0
+    assert phone_call_registry.active_count() == 0
+    assert sessions[0].closed is True
+
+
+def test_an_application_ended_call_leaks_nothing(client, sessions):
+    """No bridge, no banking session, no capacity, no model session."""
+    from app.sessions import session_manager
+
+    announce(client, "call-noleak")
+    bridge = phone_call_registry.get("call-noleak")
+    banking_session_id = bridge.banking_session_id
+    assert voice_call_manager.used_capacity() == 1
+
+    with media(client, "call-noleak"):
+        asyncio.run(service.tear_down("call-noleak", banking_session_id))
+
+    for _ in range(200):
+        if voice_call_manager.used_capacity() == 0:
+            break
+        time.sleep(0.01)
+
+    assert phone_call_registry.active_count() == 0
+    assert voice_call_manager.used_capacity() == 0
+    assert session_manager.get_session(banking_session_id) is None
+    assert sessions[0].closed is True
+
+
+def test_ending_one_call_does_not_close_another_callers_socket(client, sessions):
+    """Two calls in flight; only the one that ended is disconnected."""
+    from starlette.websockets import WebSocketDisconnect
+
+    announce(client, "call-one")
+    announce(client, "call-two")
+    first = phone_call_registry.get("call-one")
+
+    with media(client, "call-one") as socket_one:
+        with media(client, "call-two") as socket_two:
+            asyncio.run(service.tear_down("call-one", first.banking_session_id))
+
+            with pytest.raises(WebSocketDisconnect):
+                for _ in range(200):
+                    socket_one.receive_bytes()
+
+            # The survivor is untouched and still carrying audio.
+            socket_two.send_bytes(frame(2))
+            for _ in range(200):
+                if len(sessions) > 1 and sessions[1].audio_chunks:
+                    break
+                time.sleep(0.01)
+
+            survivor = phone_call_registry.get("call-two")
+            assert survivor is not None
+            assert survivor.closed is False
+
+    assert len(sessions[1].audio_chunks) >= 1
+
+
+def test_the_closing_audio_is_delivered_before_the_socket_closes(client, sessions):
+    """The closing sentence must not be cut off.
+
+    Every `send_audio` is awaited before the bank's queue drains, so the close
+    frame is queued behind the audio rather than racing it.
+    """
+    import array
+
+    announce(client, "call-lastword")
+    bridge = phone_call_registry.get("call-lastword")
+
+    with media(client, "call-lastword") as socket:
+        pcm = array.array("h", [1200] * 480).tobytes()
+        sessions[0].emit(FakeEvent("audio", audio=FakeEvent("audio", data=pcm)))
+        heard = socket.receive_bytes()
+
+        asyncio.run(service.tear_down("call-lastword", bridge.banking_session_id))
+
+    assert len(heard) == codec.ULAW_FRAME_BYTES
