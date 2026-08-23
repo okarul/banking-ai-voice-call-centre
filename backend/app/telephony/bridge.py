@@ -35,6 +35,7 @@ closure that has no name for any other queue.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import secrets
 import time
@@ -178,6 +179,10 @@ class PhoneCallBridge:
 
         # Lifecycle transitions scheduled from the synchronous event handler.
         self._transitions: set[asyncio.Task] = set()
+        # History items already acted on, as "item id:text digest". Guards
+        # against `history_updated` snapshots replaying the whole conversation
+        # on every change. Never holds the text itself.
+        self._seen_history: set[str] = set()
 
     # --- the model's side ----------------------------------------------------
 
@@ -234,6 +239,11 @@ class PhoneCallBridge:
         elif kind == "history_added":
             self._on_history(getattr(event, "item", None))
 
+        elif kind == "history_updated":
+            # The same conversation change, delivered differently. Which one
+            # arrives is the SDK's choice, not ours — see `_on_history_snapshot`.
+            self._on_history_snapshot(getattr(event, "history", None))
+
         elif kind == "tool_start":
             self._note_tool(event)
 
@@ -257,17 +267,20 @@ class PhoneCallBridge:
             # late goodbye can end a call whose reply has already played.
             self._begin_caller_turn(speech_started=False)
 
-            # And this is where the caller's spoken words actually arrive on
-            # the telephone path. `RealtimeManager` has always read them from
-            # here; the bridge was reading a `history_added` user item that the
-            # server-side phone path does not deliver in that form, so the
-            # classifier never saw a goodbye the model had just heard and
-            # answered. Same words, same classifier — read from the event that
-            # really carries them.
-            transcript = getattr(data, "transcript", "") or ""
-            if transcript:
-                self.conversation.last_user_turn = transcript
-                self._read_caller_intent(transcript)
+            # One of the places the caller's spoken words arrive. Not the
+            # only one, which is the whole lesson of this area: see
+            # `_on_caller_text`.
+            self._on_caller_text(getattr(data, "transcript", "") or "")
+            return
+
+        if raw_type == "raw_server_event":
+            # The server event unwrapped one level further. The installed SDK
+            # (openai-agents 0.20.0) names it
+            # `conversation.item.input_audio_transcription.completed`; read
+            # defensively, because this is the representation most likely to
+            # differ between versions, and a shape we do not recognise must be
+            # ignored rather than guessed at.
+            self._on_raw_server_event(getattr(data, "data", None))
             return
         if raw_type == "turn_started":
             self._begin_caller_turn()
@@ -352,6 +365,74 @@ class PhoneCallBridge:
         """
         return self.conversation.active_response_id is None
 
+    def _on_raw_server_event(self, server_event) -> None:
+        """A raw server event, which may or may not be a finished transcript."""
+        if server_event is None:
+            return
+        if isinstance(server_event, dict):
+            kind = server_event.get("type")
+            transcript = server_event.get("transcript")
+        else:
+            kind = getattr(server_event, "type", None)
+            transcript = getattr(server_event, "transcript", None)
+        if kind != "conversation.item.input_audio_transcription.completed":
+            return
+        self._on_caller_text(transcript or "")
+
+    def _on_caller_text(self, text: str) -> None:
+        """Everything the caller said, however it reached us.
+
+        The single funnel, and the reason this method exists at all. The same
+        spoken sentence can arrive as a raw transcription event, as a
+        `history_added` user item, or — because the server usually creates the
+        conversation item when speech *starts* and only fills in the transcript
+        later — as a `history_updated` snapshot with no `history_added` at all.
+        Reading one representation and calling it "the caller's words" is what
+        left explicit goodbyes undetected through three attempts at this bug.
+
+        Repeated delivery of the same utterance is safe: `_read_caller_intent`
+        returns as soon as closure is armed, and `arm_goodbye` returns once a
+        closing reason is set, so the call ends exactly once.
+
+        The text itself is never logged. Callers speak their PIN down this same
+        path.
+        """
+        if not text:
+            return
+        self.conversation.last_user_turn = text
+        self._read_caller_intent(text)
+
+    def _on_history_snapshot(self, history) -> None:
+        """`history_updated` carries the whole conversation, not the change.
+
+        Only the most recent turn of each role can be new, so only those are
+        examined; each is passed on once, keyed by item id and a digest of its
+        text so that a transcript being filled in later counts as new while a
+        repeated identical snapshot does not. The digest is kept rather than
+        the text because these items carry spoken PINs.
+        """
+        if not history:
+            return
+
+        latest = {}
+        for item in history:
+            if getattr(item, "type", "message") != "message":
+                continue
+            role = getattr(item, "role", None)
+            if role in ("user", "assistant"):
+                latest[role] = item
+
+        for role, item in latest.items():
+            text = _item_text(item)
+            if not text:
+                continue
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+            key = f"{getattr(item, 'item_id', '')}:{digest}"
+            if key in self._seen_history:
+                continue
+            self._seen_history.add(key)
+            self._on_history_item(role, text)
+
     def _on_history(self, item) -> None:
         """Read each completed turn, and decide whether the call is ending.
 
@@ -367,14 +448,15 @@ class PhoneCallBridge:
         sentence, so an assistant turn that merely mentions the word cannot end
         a call nobody asked to end.
         """
-        role = getattr(item, "role", None)
         text = _item_text(item)
         if not text:
             return
+        self._on_history_item(getattr(item, "role", None), text)
 
+    def _on_history_item(self, role, text: str) -> None:
+        """One completed turn, from whichever history event delivered it."""
         if role == "user":
-            self.conversation.last_user_turn = text
-            self._read_caller_intent(text)
+            self._on_caller_text(text)
             return
         if role != "assistant":
             return
@@ -383,11 +465,35 @@ class PhoneCallBridge:
         if text.rstrip().endswith("?"):
             self.conversation.last_agent_question = text
 
-        # Armed by the caller: this reply is the goodbye, whatever its wording.
-        # Not armed: only the canonical closing sentence may end the call.
-        if self.conversation.goodbye_armed or speech.is_canonical_closing(text):
+        # Three ways a call may close on an assistant turn, in order of
+        # authority. The caller asked to leave, so this reply is the goodbye
+        # whatever its wording. Or it is the bank's canonical closing sentence.
+        # Or — the safety net — the reply simply *ends* by saying goodbye.
+        #
+        # That last one exists because a bank that has audibly signed off must
+        # never leave the line open. It is deliberately terminal-only: an
+        # assistant sentence that merely uses the word closes nothing.
+        #
+        # None of these hang up here. They hand the decision to
+        # `arm_goodbye`, which releases the SIP leg only once generation has
+        # ended and playback has drained — so queued goodbye audio is never cut
+        # off — and closes at once when both have *already* happened.
+        #
+        # That second case is why this is `arm_goodbye` and not
+        # `on_goodbye_spoken`. Arming alone is correct only while the closing
+        # line is still being generated or played. A history event carrying the
+        # goodbye can arrive after `audio_end` and after the queue has emptied,
+        # and there is then no further drain to complete the closure: the call
+        # would stand in CLOSING for ever. Same late-event trap as the caller's
+        # transcript, same answer — the lifecycle already knows how to tell the
+        # two situations apart, and that knowledge is not duplicated here.
+        if (
+            self.conversation.goodbye_armed
+            or speech.is_canonical_closing(text)
+            or speech.is_terminal_goodbye(text)
+        ):
             self.conversation.closing = True
-            self._schedule(self.lifecycle.on_goodbye_spoken())
+            self._schedule(self.lifecycle.arm_goodbye())
 
     def _read_caller_intent(self, text: str) -> None:
         """Arm closure if the caller explicitly asked to end the call.

@@ -2531,6 +2531,12 @@ def _transcript(bridge, text):
     )
 
 
+# What the bank actually says to a caller being polite. Using its *closing*
+# line here would let these tests pass for the wrong reason — the assistant
+# terminal-goodbye safety net would end the call regardless of the caller.
+COURTESY_REPLY = "You're most welcome. Is there anything else I can help you with today?"
+
+
 async def _spoken(call_id, text, *, reply="Thank you. Goodbye."):
     """A caller turn whose transcript arrives only on the raw event."""
     await place(call_id)
@@ -2594,27 +2600,28 @@ def test_raw_end_the_call_closes(phone):
 
 
 def test_raw_thank_you_does_not_close(phone):
-    ended, reason, armed = run(_spoken("call-raw-ty", "thank you"))
+    ended, reason, armed = run(_spoken("call-raw-ty", "thank you", reply=COURTESY_REPLY))
     assert armed is False, "courtesy was treated as an instruction to hang up"
     assert ended is False
     assert reason is None
 
 
 def test_raw_thanks_does_not_close(phone):
-    ended, reason, armed = run(_spoken("call-raw-th", "thanks"))
+    ended, reason, armed = run(_spoken("call-raw-th", "thanks", reply=COURTESY_REPLY))
     assert armed is False
     assert ended is False
 
 
 def test_raw_thats_great_thanks_does_not_close(phone):
-    ended, reason, armed = run(_spoken("call-raw-tg", "that's great, thanks"))
+    ended, reason, armed = run(_spoken("call-raw-tg", "that's great, thanks", reply=COURTESY_REPLY))
     assert armed is False
     assert ended is False
 
 
 def test_raw_ordinary_banking_text_does_not_close(phone):
     ended, reason, armed = run(
-        _spoken("call-raw-bank", "what is my savings account balance")
+        _spoken("call-raw-bank", "what is my savings account balance",
+                 reply="Your savings balance is available. Anything else?")
     )
     assert armed is False
     assert ended is False

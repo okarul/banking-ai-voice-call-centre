@@ -141,6 +141,29 @@ def is_canonical_closing(text: str) -> bool:
     spoken = _spoken_words(text)
     return spoken == _spoken_words(GOODBYE_SPEECH) or spoken.endswith(_CANONICAL_TAIL)
 
+
+def is_terminal_goodbye(text: str) -> bool:
+    """Whether an assistant turn *ends* by saying goodbye.
+
+    The safety net. If the bank has genuinely signed off, the telephone must
+    not stay connected — whatever the caller's transcript did or did not do.
+
+    Terminal, not merely present. "Goodbye" is a word this agent may
+    legitimately say mid-sentence, and closing a call on any mention of it
+    would hang up on a caller who never asked to leave:
+
+        "You can say goodbye when you are finished."   -> not an ending
+        "I haven't said goodbye yet."                  -> not an ending
+        "Thank you. Goodbye."                          -> an ending
+
+    Matching the last word rather than the whole sentence is what makes this
+    independent of wording: the model may paraphrase everything before it.
+    """
+    if not text:
+        return False
+    spoken = _spoken_words(text)
+    return spoken.endswith("goodbye") or spoken.endswith("good bye")
+
 UNSUPPORTED_SPEECH = (
     "I'm sorry, I can't help with that one. I can give you balances, details, "
     "recent transactions, or your next instalment."
