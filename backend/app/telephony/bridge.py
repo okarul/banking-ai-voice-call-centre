@@ -256,6 +256,18 @@ class PhoneCallBridge:
             # caller starting to talk, and the difference decides whether a
             # late goodbye can end a call whose reply has already played.
             self._begin_caller_turn(speech_started=False)
+
+            # And this is where the caller's spoken words actually arrive on
+            # the telephone path. `RealtimeManager` has always read them from
+            # here; the bridge was reading a `history_added` user item that the
+            # server-side phone path does not deliver in that form, so the
+            # classifier never saw a goodbye the model had just heard and
+            # answered. Same words, same classifier — read from the event that
+            # really carries them.
+            transcript = getattr(data, "transcript", "") or ""
+            if transcript:
+                self.conversation.last_user_turn = transcript
+                self._read_caller_intent(transcript)
             return
         if raw_type == "turn_started":
             self._begin_caller_turn()

@@ -2503,3 +2503,373 @@ def test_a_stranded_call_does_not_re_greet_when_the_goodbye_never_completes(phon
     assert messages == [GREETING_CUE], f"the caller was greeted twice: {messages}"
     assert greeted_again is False
     assert reason is None, "closed before the goodbye was ever spoken"
+
+
+# === Phase 6.5: the transcript the telephone path actually delivers =========
+#
+# Phase 6.3 read the caller's words from a `history_added` user item. Live, on
+# the server-side phone path, the spoken transcript arrives on the raw
+# `input_audio_transcription_completed` event instead — `RealtimeManager` has
+# always read it from exactly there — and the bridge was throwing it away.
+#
+# So the classifier never saw the goodbye the model itself had just heard and
+# answered. The live logs show it plainly: no "caller asked to end the call",
+# no closing armed, no CALLER_GOODBYE, no application finished.
+#
+# These tests deliberately supply **only** the raw event. Adding a history item
+# alongside it is what hid this bug through Phase 6.4.
+
+
+def _transcript(bridge, text):
+    """The raw transcription event, carrying the caller's words as it does live."""
+    bridge.on_realtime_event(
+        bridge.banking_session_id,
+        FakeEvent(
+            "raw_model_event",
+            data=FakeEvent("input_audio_transcription_completed", transcript=text),
+        ),
+    )
+
+
+async def _spoken(call_id, text, *, reply="Thank you. Goodbye."):
+    """A caller turn whose transcript arrives only on the raw event."""
+    await place(call_id)
+    bridge = bridge_for(call_id)
+    _speech_started(bridge)
+    await _assistant_turn(bridge, reply)
+    _transcript(bridge, text)
+    ended = await wait_until(
+        lambda: bridge.lifecycle.end_reason is not None, timeout=2.0
+    )
+    reason = bridge.lifecycle.end_reason
+    armed = bridge.conversation.goodbye_armed
+    if not ended:
+        await bridge.lifecycle.close()
+    return ended, reason, armed
+
+
+def test_a_goodbye_arriving_only_on_the_raw_transcription_event_ends_the_call(phone):
+    """The live failure, with no history item to paper over it."""
+    ended, reason, armed = run(_spoken("call-raw-bye", "that's all, thank you, goodbye"))
+
+    assert armed is True, "the classifier never saw the caller's goodbye"
+    assert ended is True, "the call stayed up after the bank had said goodbye"
+    assert reason is EndReason.CALLER_GOODBYE
+
+
+def test_the_raw_transcript_alone_needs_no_history_item(phone):
+    """No `history_added` anywhere in this path. That is the point."""
+    ended, reason, armed = run(_spoken("call-raw-nohist", "goodbye"))
+
+    assert armed is True
+    assert ended is True
+    assert reason is EndReason.CALLER_GOODBYE
+
+
+def test_raw_bye_closes(phone):
+    ended, reason, _ = run(_spoken("call-raw-b", "bye"))
+    assert ended is True
+    assert reason is EndReason.CALLER_GOODBYE
+
+
+def test_raw_thats_all_closes(phone):
+    ended, reason, _ = run(_spoken("call-raw-ta", "that's all"))
+    assert ended is True
+    assert reason is EndReason.CALLER_GOODBYE
+
+
+def test_raw_thanks_bye_closes(phone):
+    ended, reason, _ = run(_spoken("call-raw-tb", "thanks, bye"))
+    assert ended is True
+    assert reason is EndReason.CALLER_GOODBYE
+
+
+def test_raw_end_the_call_closes(phone):
+    ended, reason, _ = run(_spoken("call-raw-etc", "end the call"))
+    assert ended is True
+    assert reason is EndReason.CALLER_GOODBYE
+
+
+# --- courtesy and ordinary banking must leave the line open -----------------
+
+
+def test_raw_thank_you_does_not_close(phone):
+    ended, reason, armed = run(_spoken("call-raw-ty", "thank you"))
+    assert armed is False, "courtesy was treated as an instruction to hang up"
+    assert ended is False
+    assert reason is None
+
+
+def test_raw_thanks_does_not_close(phone):
+    ended, reason, armed = run(_spoken("call-raw-th", "thanks"))
+    assert armed is False
+    assert ended is False
+
+
+def test_raw_thats_great_thanks_does_not_close(phone):
+    ended, reason, armed = run(_spoken("call-raw-tg", "that's great, thanks"))
+    assert armed is False
+    assert ended is False
+
+
+def test_raw_ordinary_banking_text_does_not_close(phone):
+    ended, reason, armed = run(
+        _spoken("call-raw-bank", "what is my savings account balance")
+    )
+    assert armed is False
+    assert ended is False
+
+
+# --- duplicate safety -------------------------------------------------------
+
+
+def test_a_transcript_and_a_matching_history_item_close_the_call_once(phone):
+    """A future SDK may deliver both. One goodbye, one hang-up.
+
+    `_read_caller_intent` returns early once armed, and `arm_goodbye` returns
+    early once `_closing_for` is set, so the second delivery is inert.
+    """
+
+    async def scenario():
+        await place("call-raw-dup")
+        bridge = bridge_for("call-raw-dup")
+        ends = []
+        original = bridge.lifecycle._hang_up
+
+        async def counting(reason):
+            ends.append(reason)
+            await original(reason)
+
+        bridge.lifecycle._hang_up = counting
+
+        _speech_started(bridge)
+        await _assistant_turn(bridge, "Thank you. Goodbye.")
+
+        # Both deliveries of the same utterance.
+        _transcript(bridge, "that's all, thank you, goodbye")
+        _say(bridge, "user", "that's all, thank you, goodbye")
+
+        await wait_until(lambda: bridge.lifecycle.end_reason is not None, timeout=2.0)
+        await asyncio.sleep(0.15)
+        return ends
+
+    ends = run(scenario())
+
+    assert ends == [EndReason.CALLER_GOODBYE], f"hung up {len(ends)} times: {ends}"
+
+
+def test_a_repeated_raw_transcript_closes_the_call_once(phone):
+    """The same raw event twice — a retry, a duplicated callback."""
+
+    async def scenario():
+        await place("call-raw-twice")
+        bridge = bridge_for("call-raw-twice")
+        ends = []
+        original = bridge.lifecycle._hang_up
+
+        async def counting(reason):
+            ends.append(reason)
+            await original(reason)
+
+        bridge.lifecycle._hang_up = counting
+
+        _speech_started(bridge)
+        await _assistant_turn(bridge, "Thank you. Goodbye.")
+        _transcript(bridge, "goodbye")
+        _transcript(bridge, "goodbye")
+
+        await wait_until(lambda: bridge.lifecycle.end_reason is not None, timeout=2.0)
+        await asyncio.sleep(0.15)
+        return ends
+
+    assert run(scenario()) == [EndReason.CALLER_GOODBYE]
+
+
+# --- the two orderings, both driven from the raw event ----------------------
+
+
+def test_a_late_raw_end_call_uses_the_phase_64_immediate_close(phone):
+    """Reply already delivered: closure completes at once, exactly once."""
+
+    async def scenario():
+        await place("call-raw-late")
+        bridge = bridge_for("call-raw-late")
+        _speech_started(bridge)
+        await _assistant_turn(bridge, "Thank you. Goodbye.")
+        await wait_until(
+            lambda: bridge.lifecycle.state is CallState.WAITING_FOR_CALLER, timeout=2.0
+        )
+
+        _transcript(bridge, "that's all, thank you, goodbye")
+        ended = await wait_until(
+            lambda: bridge.lifecycle.end_reason is not None, timeout=2.0
+        )
+        return ended, bridge.lifecycle.end_reason
+
+    ended, reason = run(scenario())
+
+    assert ended is True
+    assert reason is EndReason.CALLER_GOODBYE
+
+
+def test_an_early_raw_end_call_still_waits_for_the_goodbye_audio(phone):
+    """Transcript first: the caller is still owed the bank's closing line."""
+
+    async def scenario():
+        await place("call-raw-early")
+        bridge = bridge_for("call-raw-early")
+        _speech_started(bridge)
+
+        _transcript(bridge, "that's all, goodbye")
+        await wait_until(lambda: bridge.conversation.goodbye_armed, timeout=1.0)
+        await asyncio.sleep(0.15)
+        premature = bridge.lifecycle.end_reason
+
+        await _assistant_turn(bridge, "Thank you. Goodbye.")
+        ended = await wait_until(
+            lambda: bridge.lifecycle.end_reason is not None, timeout=2.0
+        )
+        return premature, ended, bridge.lifecycle.end_reason
+
+    premature, ended, reason = run(scenario())
+
+    assert premature is None, "hung up before the goodbye was spoken"
+    assert ended is True
+    assert reason is EndReason.CALLER_GOODBYE
+
+
+def test_an_ordinary_late_transcript_does_not_cancel_the_silence_timer(phone):
+    """Phase 6.4's rule, now with a transcript actually attached."""
+
+    async def scenario():
+        await place("call-raw-silence")
+        bridge = bridge_for("call-raw-silence")
+        # Long enough that the check below reads the state the transcript left,
+        # not the state the timer moved it to.
+        bridge.lifecycle._silence_seconds = 0.6
+
+        _speech_started(bridge)
+        await _assistant_turn(bridge, "Your balance is available.")
+        await wait_until(
+            lambda: bridge.lifecycle.state is CallState.WAITING_FOR_CALLER, timeout=2.0
+        )
+
+        _transcript(bridge, "what is my balance")     # ordinary, and late
+        await asyncio.sleep(0.05)
+        state_after = bridge.lifecycle.state
+
+        closing = await wait_until(
+            lambda: bridge.lifecycle.state is CallState.CLOSING, timeout=2.0
+        )
+        prompted = bridge.lifecycle.silence_prompts
+
+        await _assistant_turn(bridge)
+        await wait_until(lambda: bridge.lifecycle.end_reason is not None, timeout=2.0)
+        return state_after, closing, prompted, bridge.lifecycle.end_reason
+
+    state_after, closing, prompted, reason = run(scenario())
+
+    assert state_after is CallState.WAITING_FOR_CALLER, (
+        "a transcript moved the call to %s" % state_after
+    )
+    assert closing is True, "the silence timer was cancelled by a transcript"
+    assert prompted == 1
+    assert reason is EndReason.CALLER_SILENT
+
+
+def test_a_raw_goodbye_call_is_greeted_exactly_once(phone):
+    """Greeting logic untouched, and still one cue per call."""
+
+    async def scenario():
+        await place("call-raw-greet")
+        bridge = bridge_for("call-raw-greet")
+        session = phone.by_banking_session[bridge.banking_session_id]
+        await wait_until(lambda: bridge.greeted, timeout=2.0)
+
+        _speech_started(bridge)
+        await _assistant_turn(bridge, "Thank you. Goodbye.")
+        _transcript(bridge, "goodbye")
+        await wait_until(lambda: bridge.lifecycle.end_reason is not None, timeout=2.0)
+        return session.messages, await bridge.greet()
+
+    messages, greeted_again = run(scenario())
+
+    assert messages == [GREETING_CUE], f"more than one greeting: {messages}"
+    assert greeted_again is False
+
+
+def test_a_manual_disconnect_after_a_raw_goodbye_is_idempotent(phone):
+    async def scenario():
+        await place("call-raw-manual")
+        bridge = bridge_for("call-raw-manual")
+        _speech_started(bridge)
+        _transcript(bridge, "goodbye")
+        await wait_until(lambda: bridge.conversation.goodbye_armed, timeout=1.0)
+
+        await hang_up("call-raw-manual")
+        await hang_up("call-raw-manual")
+        await asyncio.sleep(0.1)
+        return bridge.closed, phone_call_registry.get("call-raw-manual")
+
+    closed, still_registered = run(scenario())
+
+    assert closed is True
+    assert still_registered is None
+
+
+def test_two_calls_stay_isolated_when_one_says_goodbye_on_the_raw_event(phone):
+    async def scenario():
+        await place("call-raw-a")
+        await place("call-raw-b")
+        leaving = bridge_for("call-raw-a")
+        staying = bridge_for("call-raw-b")
+
+        _speech_started(leaving)
+        _speech_started(staying)
+        _transcript(leaving, "that's all, goodbye")
+        _transcript(staying, "what is my balance")
+        await wait_until(lambda: leaving.conversation.goodbye_armed, timeout=1.0)
+        await asyncio.sleep(0.1)
+
+        result = (
+            leaving.conversation.goodbye_armed,
+            staying.conversation.goodbye_armed,
+            staying.closed,
+            staying.lifecycle.end_reason,
+        )
+        await leaving.lifecycle.close()
+        await staying.lifecycle.close()
+        return result
+
+    leaving_armed, staying_armed, staying_closed, staying_reason = run(scenario())
+
+    assert leaving_armed is True
+    assert staying_armed is False, "one caller's goodbye armed another's call"
+    assert staying_closed is False
+    assert staying_reason is None
+
+
+def test_an_empty_transcript_is_ignored(phone):
+    """A transcription that produced no words must not disturb the call."""
+
+    async def scenario():
+        await place("call-raw-empty")
+        bridge = bridge_for("call-raw-empty")
+        _speech_started(bridge)
+        await _assistant_turn(bridge, "How can I help?")
+
+        _transcript(bridge, "")
+        await asyncio.sleep(0.1)
+        result = (
+            bridge.conversation.goodbye_armed,
+            bridge.conversation.last_user_turn,
+            bridge.lifecycle.end_reason,
+        )
+        await bridge.lifecycle.close()
+        return result
+
+    armed, last_turn, reason = run(scenario())
+
+    assert armed is False
+    assert last_turn is None, "an empty transcript overwrote the last caller turn"
+    assert reason is None
