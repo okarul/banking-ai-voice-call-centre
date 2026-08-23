@@ -77,6 +77,10 @@ class ConversationState:
     caller_speaking: bool = False
     assistant_speaking: bool = False
     closing: bool = False
+    # The caller said an explicit ending. Set from their transcript, before the
+    # assistant has replied, and what allows that reply to end the call however
+    # it happens to be worded.
+    goodbye_armed: bool = False
     silence_timer_armed: bool = False
 
     # The last things said, for an operator reading a stuck call. Transcript

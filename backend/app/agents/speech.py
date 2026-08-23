@@ -116,6 +116,31 @@ def is_closing_line(text: str) -> bool:
     """Whether this assistant turn is the bank closing the call."""
     return bool(text) and bool(_CLOSING_MARKER.search(text))
 
+
+# The tail of the canonical closing sentence. `is_closing_line` matches any use
+# of "goodbye", which is right once the caller has asked to end the call and
+# wrong before it: an assistant sentence that merely mentions the word would
+# otherwise hang up on a caller who never asked to leave.
+_CANONICAL_TAIL = "have a pleasant day goodbye"
+
+
+def _spoken_words(text: str) -> str:
+    """Punctuation and casing removed, so wording can be compared as speech."""
+    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def is_canonical_closing(text: str) -> bool:
+    """Whether this is *the* controlled closing response, not a mention of it.
+
+    Deliberately strict. This is the fallback that may end a call the caller
+    never asked to end, so it recognises the bank's own closing sentence and
+    nothing looser.
+    """
+    if not text:
+        return False
+    spoken = _spoken_words(text)
+    return spoken == _spoken_words(GOODBYE_SPEECH) or spoken.endswith(_CANONICAL_TAIL)
+
 UNSUPPORTED_SPEECH = (
     "I'm sorry, I can't help with that one. I can give you balances, details, "
     "recent transactions, or your next instalment."

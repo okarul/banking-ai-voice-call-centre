@@ -137,11 +137,20 @@ class MediaGateway:
                 raise task.exception()
 
     async def _caller_to_bank(self, source: CallSource, socket) -> None:
-        while True:
-            frame = await source.receive_frame()
-            if frame is None:
-                return
-            await socket.send(frame)
+        try:
+            while True:
+                frame = await source.receive_frame()
+                if frame is None:
+                    return
+                await socket.send(frame)
+        except websockets.exceptions.ConnectionClosed:
+            # The bank closed the socket because the call is over — it has said
+            # goodbye and torn the call down. Whichever direction notices first
+            # is a race, and only the other one handled it, so a perfectly
+            # normal ending was logged as "relay failed: ConnectionClosedOK"
+            # and counted against the gateway. Returning ends the relay exactly
+            # as the far direction already does; nothing else changes.
+            return
 
     async def _bank_to_caller(self, source: CallSource, socket) -> None:
         """Assistant audio, repacketised to 20 ms frames and paced in real time.

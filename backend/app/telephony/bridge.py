@@ -39,7 +39,7 @@ import logging
 import secrets
 import time
 
-from app.agents import speech
+from app.agents import intents, speech
 from app.telephony import audio as codec
 from app.telephony.conversation import ConversationState
 from app.telephony.lifecycle import CallLifecycle, EndReason
@@ -328,12 +328,19 @@ class PhoneCallBridge:
         return self.conversation.active_response_id is None
 
     def _on_history(self, item) -> None:
-        """Watch for the assistant's closing line.
+        """Read each completed turn, and decide whether the call is ending.
 
-        The agent decides to say goodbye, following its instructions. This
-        notices that it has, so the call can be taken down once the line has
-        finished playing — the same division Channel 1 uses, where the page
-        watches for the closing line rather than deciding on it.
+        The decision is the caller's. Their transcript is classified by the
+        same deterministic rules the banking agent uses, so "goodbye", "bye" and
+        "that's all" arm closure while "thank you" — courtesy, not instruction —
+        leaves the line open.
+
+        Reading it from the *assistant* is what failed live. It required the
+        model to reproduce a particular sentence closely enough to be
+        recognised, and a paraphrased goodbye was a call that never hung up.
+        That check survives as a fallback, restricted to the bank's own closing
+        sentence, so an assistant turn that merely mentions the word cannot end
+        a call nobody asked to end.
         """
         role = getattr(item, "role", None)
         text = _item_text(item)
@@ -342,6 +349,7 @@ class PhoneCallBridge:
 
         if role == "user":
             self.conversation.last_user_turn = text
+            self._read_caller_intent(text)
             return
         if role != "assistant":
             return
@@ -349,9 +357,32 @@ class PhoneCallBridge:
         self.conversation.last_agent_response = text
         if text.rstrip().endswith("?"):
             self.conversation.last_agent_question = text
-        if speech.is_closing_line(text):
+
+        # Armed by the caller: this reply is the goodbye, whatever its wording.
+        # Not armed: only the canonical closing sentence may end the call.
+        if self.conversation.goodbye_armed or speech.is_canonical_closing(text):
             self.conversation.closing = True
             self._schedule(self.lifecycle.on_goodbye_spoken())
+
+    def _read_caller_intent(self, text: str) -> None:
+        """Arm closure if the caller explicitly asked to end the call.
+
+        Only ever arms. The hang-up itself stays with the lifecycle, which
+        waits for the assistant's reply to finish generating and finish playing
+        — so the caller hears the goodbye they were owed before the line drops.
+        """
+        if self.conversation.goodbye_armed:
+            return
+        if intents.classify(text).intent is not intents.Intent.END_CALL:
+            return
+
+        self.conversation.goodbye_armed = True
+        self.conversation.closing = True
+        logger.info(
+            "bridge[%s] caller asked to end the call; closing after the reply",
+            self.provider_call_id,
+        )
+        self._schedule(self.lifecycle.arm_goodbye())
 
     def _note_tool(self, event) -> None:
         """Record a tool call, and say whether it is a repeat of this turn."""

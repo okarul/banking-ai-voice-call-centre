@@ -124,7 +124,16 @@ class CallLifecycle:
     async def on_assistant_audio(self) -> None:
         """The assistant has produced audio. It is speaking, so nobody waits."""
         async with self._lock:
-            if self._closed or self.state is CallState.CLOSING:
+            if self._closed:
+                return
+            if self.state is CallState.CLOSING:
+                # A closing call does not reopen, so the state stays as it is.
+                # Generation, though, has genuinely started again: this is the
+                # closing line beginning to play. Recording that is what stops
+                # its *first* frame being mistaken for its last — the queue
+                # empties after that frame, and a `_generation_ended` left over
+                # from the previous turn would hang up mid-goodbye.
+                self._generation_ended = False
                 return
             self._generation_ended = False
             self._cancel_silence()
@@ -204,6 +213,31 @@ class CallLifecycle:
             self.state = CallState.CLOSING
             self._cancel_silence()
             logger.info("lifecycle[%s] closing: caller said goodbye", self.call_id)
+
+    async def arm_goodbye(self) -> None:
+        """The *caller* has asked to end the call. Close after the reply plays.
+
+        The counterpart to `on_goodbye_spoken`, and now the primary trigger.
+        Waiting for the assistant to reproduce a particular sentence made the
+        hang-up depend on the model's wording: a paraphrased closing line was a
+        call that never ended, which is exactly what callers hit. The caller's
+        own words are deterministic, so closure is armed from those instead.
+
+        Armed, not executed. Nothing is torn down here — the assistant still
+        owes the caller a goodbye, and the call ends only when that reply has
+        finished generating *and* finished playing, through the same
+        `on_playback_drained` path every other clean ending uses.
+        """
+        async with self._lock:
+            if self._closed or self._closing_for is not None:
+                return
+            self._closing_for = EndReason.CALLER_GOODBYE
+            self.state = CallState.CLOSING
+            self._cancel_silence()
+            logger.info(
+                "lifecycle[%s] closing armed: caller asked to end the call",
+                self.call_id,
+            )
 
     async def on_caller_disconnected(self) -> None:
         """The caller hung up. Nothing to play out; stop at once."""

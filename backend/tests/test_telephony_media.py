@@ -1729,8 +1729,19 @@ def test_a_courtesy_reply_does_not_close_the_call(phone):
     assert run(scenario()) is not CallState.CLOSING
 
 
-def test_a_caller_saying_goodbye_does_not_close_the_call_by_itself(phone):
-    """Only the bank's own closing line ends a call."""
+def test_a_caller_saying_goodbye_arms_closure_but_does_not_hang_up(phone):
+    """Phase 6.3: the caller decides, and still gets their goodbye.
+
+    This test used to assert the opposite — that a caller saying goodbye left
+    the call untouched, because only the bank's own closing line could end one.
+    That rule is what failed live: the model answered "Thank you. Goodbye.",
+    which is not the bank's sentence, so nothing ever hung up and the caller had
+    to disconnect by hand.
+
+    The caller's words now arm closure. What must still hold, and is what this
+    test actually protects, is that arming is not hanging up: the line stays
+    open until the assistant's reply has been generated and played.
+    """
     from app.telephony.lifecycle import CallState
 
     async def scenario():
@@ -1740,12 +1751,19 @@ def test_a_caller_saying_goodbye_does_not_close_the_call_by_itself(phone):
         bridge.on_realtime_event(
             bridge.banking_session_id, FakeEvent("history_added", item=item)
         )
+        await wait_until(lambda: bridge.lifecycle.state is CallState.CLOSING, timeout=2.0)
         await asyncio.sleep(0.1)
+        armed = bridge.conversation.goodbye_armed
         state = bridge.lifecycle.state
+        still_up = not bridge.closed and bridge.lifecycle.end_reason is None
         await bridge.lifecycle.close()
-        return state
+        return armed, state, still_up
 
-    assert run(scenario()) is not CallState.CLOSING
+    armed, state, still_up = run(scenario())
+
+    assert armed is True, "the caller asked to end the call and nothing noticed"
+    assert state is CallState.CLOSING
+    assert still_up is True, "the call dropped before the goodbye was spoken"
 
 
 def test_a_repeated_tool_in_one_turn_is_counted_and_suppressed(phone):
@@ -1862,3 +1880,496 @@ def test_the_bridge_description_includes_the_conversation_state(phone):
     assert "duplicate_tool_calls" in described
     for forbidden in ("customer_id", "transcript", "media_token", "pin"):
         assert forbidden not in described, forbidden
+
+
+
+from app.telephony.lifecycle import CallState, EndReason  # noqa: E402
+
+
+# === Phase 6.3: the caller ends the call ====================================
+#
+# Silence hang-up worked. An explicit goodbye did not. The caller said "That's
+# all, thank you, goodbye", the bank audibly answered "Thank you. Goodbye." and
+# the line stayed open until the caller hung up themselves.
+#
+# The cause was where the decision was read from. `_on_history` waited for the
+# *assistant* to produce something `speech.is_closing_line` recognised, so the
+# hang-up depended on the model reproducing a particular sentence. It said
+# something equivalent instead, and an equivalent sentence was a call that never
+# ended. The existing tests admitted as much in a comment: "A paraphrased
+# closing line is a call that never hangs up."
+#
+# The caller's own words are not a guess. They already classify deterministically
+# as END_CALL, and that is now what arms closure — before the assistant has
+# replied, so it no longer matters how the reply is worded.
+
+
+def _say(bridge, role: str, text: str) -> None:
+    """One completed turn of transcript, as the SDK delivers it."""
+    bridge.on_realtime_event(
+        bridge.banking_session_id,
+        FakeEvent("history_added", item=_HistoryItem(role, text)),
+    )
+
+
+async def _assistant_turn(bridge, text=None):
+    """One complete assistant turn: audio out, delivered, generation ended.
+
+    The wait in the middle is not padding. `audio_end` arriving while frames are
+    still queued leaves completion to the outbound pump, and back-to-back events
+    in a test let the pump drain *first* — before the model has reported the turn
+    finished — so the completion is missed and nothing ever closes. Live there
+    are seconds of queued audio and the ordering is never in doubt.
+    """
+    bridge.on_realtime_event(bridge.banking_session_id, audio_event(b"\x00\x10" * 480))
+    if text is not None:
+        _say(bridge, "assistant", text)
+    await wait_until(lambda: len(bridge.outbound) == 0, timeout=2.0)
+    bridge.on_realtime_event(bridge.banking_session_id, FakeEvent("audio_end"))
+
+
+async def _armed(call_id: str, text: str):
+    """Place a call, let the caller say something, report whether it armed."""
+    await place(call_id)
+    bridge = bridge_for(call_id)
+    _say(bridge, "user", text)
+    await wait_until(lambda: bridge.conversation.goodbye_armed, timeout=1.0)
+    await asyncio.sleep(0.05)
+    armed = bridge.conversation.goodbye_armed
+    closing = bridge.lifecycle.state is CallState.CLOSING
+    await bridge.lifecycle.close()
+    return armed, closing
+
+
+# --- 1-4: phrases that mean the caller is finished --------------------------
+
+
+def test_goodbye_arms_caller_goodbye(phone):
+    armed, closing = run(_armed("call-g1", "goodbye"))
+    assert armed is True
+    assert closing is True
+
+
+def test_bye_arms_caller_goodbye(phone):
+    armed, closing = run(_armed("call-g2", "bye"))
+    assert armed is True
+    assert closing is True
+
+
+def test_thats_all_arms_caller_goodbye(phone):
+    armed, closing = run(_armed("call-g3", "that's all"))
+    assert armed is True
+    assert closing is True
+
+
+def test_thanks_bye_arms_caller_goodbye(phone):
+    """Courtesy attached to an ending is still an ending."""
+    armed, closing = run(_armed("call-g4", "thanks, bye"))
+    assert armed is True
+    assert closing is True
+
+
+def test_the_live_utterance_that_failed_arms_caller_goodbye(phone):
+    """Verbatim from the call that would not hang up."""
+    armed, closing = run(_armed("call-g4b", "That's all, thank you, goodbye."))
+    assert armed is True
+    assert closing is True
+
+
+# --- 5-6: courtesy, which is not an instruction to hang up ------------------
+
+
+def test_plain_thank_you_does_not_arm_closure(phone):
+    """A caller thanking the bank is being polite, not leaving."""
+    armed, closing = run(_armed("call-g5", "thank you"))
+    assert armed is False
+    assert closing is False
+
+
+def test_plain_thanks_does_not_arm_closure(phone):
+    armed, closing = run(_armed("call-g6", "thanks"))
+    assert armed is False
+    assert closing is False
+
+
+def test_thank_you_very_much_does_not_arm_closure(phone):
+    armed, closing = run(_armed("call-g6b", "thank you very much"))
+    assert armed is False
+    assert closing is False
+
+
+# --- 7: armed is not hung up ------------------------------------------------
+
+
+def test_an_explicit_goodbye_does_not_hang_up_before_the_closing_audio_plays(phone):
+    """The whole point of arming rather than closing.
+
+    The caller is owed the bank's goodbye. Ending the call the moment their
+    intent is recognised would cut it off before a single frame went out.
+    """
+
+    async def scenario():
+        await place("call-g7")
+        bridge = bridge_for("call-g7")
+        _say(bridge, "user", "that is all, goodbye")
+        await wait_until(lambda: bridge.conversation.goodbye_armed, timeout=1.0)
+        await asyncio.sleep(0.15)
+
+        closed_early = bridge.closed
+        ended_early = bridge.lifecycle.end_reason
+        transport_released = bridge.transport.ended
+
+        await bridge.lifecycle.close()
+        return closed_early, ended_early, transport_released
+
+    closed_early, ended_early, transport_released = run(scenario())
+
+    assert closed_early is False, "the call dropped before saying goodbye"
+    assert ended_early is None, "the call ended before the closing line played"
+    assert transport_released is False, "the media path went away too early"
+
+
+# --- 8-10: what completion actually requires --------------------------------
+#
+# Driven against the lifecycle directly. The two halves of "the caller has heard
+# it" arrive from different places — the model reports generation, the outbound
+# pump reports playback — and the point of these three is that neither half is
+# sufficient on its own.
+
+
+def _lifecycle():
+    from app.telephony.lifecycle import CallLifecycle
+
+    ended = []
+
+    async def speak(_cue):
+        return None
+
+    async def hang_up(reason):
+        ended.append(reason)
+
+    return CallLifecycle("g-life", speak=speak, hang_up=hang_up), ended
+
+
+def test_generation_end_alone_does_not_hang_up():
+    """The model has stopped talking; the telephone has not finished playing."""
+
+    async def scenario():
+        lifecycle, ended = _lifecycle()
+        await lifecycle.arm_goodbye()
+        await lifecycle.on_assistant_audio()
+        await lifecycle.on_generation_ended()
+        await asyncio.sleep(0.05)
+        await lifecycle.close()
+        return ended
+
+    assert run(scenario()) == [], "hung up with audio still queued"
+
+
+def test_playback_drain_alone_does_not_hang_up():
+    """The queue is empty because the model has not filled it yet."""
+
+    async def scenario():
+        lifecycle, ended = _lifecycle()
+        await lifecycle.arm_goodbye()
+        await lifecycle.on_assistant_audio()
+        await lifecycle.on_playback_drained()
+        await asyncio.sleep(0.05)
+        await lifecycle.close()
+        return ended
+
+    assert run(scenario()) == [], "hung up mid-sentence"
+
+
+def test_generation_end_and_playback_drain_together_complete_the_hangup():
+    async def scenario():
+        lifecycle, ended = _lifecycle()
+        await lifecycle.arm_goodbye()
+        await lifecycle.on_assistant_audio()
+        await lifecycle.on_generation_ended()
+        await lifecycle.on_playback_drained()
+        await asyncio.sleep(0.05)
+        return ended, lifecycle.state
+
+    ended, state = run(scenario())
+
+    assert ended == [EndReason.CALLER_GOODBYE], ended
+    assert state is CallState.CLOSED
+
+
+def test_the_first_frame_of_the_closing_line_is_not_mistaken_for_the_last():
+    """A stale generation flag must not survive into the closing turn.
+
+    The previous turn ended, so `_generation_ended` is True. The caller then
+    says goodbye and the assistant starts its reply. If that leftover True were
+    still standing when the first frame drained the queue, the call would hang
+    up on the first syllable of the goodbye.
+    """
+
+    async def scenario():
+        lifecycle, ended = _lifecycle()
+        await lifecycle.on_assistant_audio()
+        await lifecycle.on_generation_ended()
+        await lifecycle.on_playback_drained()      # a complete earlier turn
+
+        await lifecycle.arm_goodbye()
+        await lifecycle.on_assistant_audio()       # the goodbye begins
+        await lifecycle.on_playback_drained()      # first frame, queue empty
+        await asyncio.sleep(0.05)
+        cut_off = list(ended)
+
+        await lifecycle.on_generation_ended()
+        await lifecycle.on_playback_drained()
+        await asyncio.sleep(0.05)
+        return cut_off, ended
+
+    cut_off, ended = run(scenario())
+
+    assert cut_off == [], "hung up on the first frame of the goodbye"
+    assert ended == [EndReason.CALLER_GOODBYE]
+
+
+# --- 11-13: what the assistant's wording may and may not do -----------------
+
+
+def test_a_paraphrased_goodbye_still_terminates_when_the_caller_armed_it(phone):
+    """The live failure, now passing.
+
+    "Thank you. Goodbye." is not the bank's closing sentence and never matched.
+    Because the caller armed closure, the wording no longer matters.
+    """
+
+    async def scenario():
+        await place("call-g11")
+        bridge = bridge_for("call-g11")
+
+        _say(bridge, "user", "that's all, thank you, goodbye")
+        await wait_until(lambda: bridge.conversation.goodbye_armed, timeout=1.0)
+
+        await _assistant_turn(bridge, "Thank you. Goodbye.")
+
+        ended = await wait_until(
+            lambda: bridge.lifecycle.end_reason is not None, timeout=3.0
+        )
+        return ended, bridge.lifecycle.end_reason
+
+    ended, reason = run(scenario())
+
+    assert ended is True, "a paraphrased goodbye still failed to end the call"
+    assert reason is EndReason.CALLER_GOODBYE
+
+
+def test_the_canonical_closing_line_still_works_as_a_fallback(phone):
+    """Kept, so a model-initiated close is not lost — just no longer the only way."""
+    from app.agents import speech as speech_lines
+
+    async def scenario():
+        await place("call-g12")
+        bridge = bridge_for("call-g12")
+
+        bridge.on_realtime_event(bridge.banking_session_id, audio_event(b"\x00\x10" * 480))
+        _say(bridge, "assistant", speech_lines.GOODBYE_SPEECH)
+        await wait_until(
+            lambda: bridge.lifecycle.state is CallState.CLOSING, timeout=2.0
+        )
+        state = bridge.lifecycle.state
+        armed_by_caller = bridge.conversation.goodbye_armed
+        await bridge.lifecycle.close()
+        return state, armed_by_caller
+
+    state, armed_by_caller = run(scenario())
+
+    assert state is CallState.CLOSING
+    assert armed_by_caller is False, "the fallback fired, not the caller's intent"
+
+
+def test_an_unrelated_assistant_sentence_mentioning_goodbye_cannot_close_a_call(phone):
+    """The risk the caller-driven rule introduces, closed off.
+
+    `is_closing_line` matches the bare word. Once any assistant turn could end a
+    call, a sentence that merely used it would hang up on a caller who never
+    asked to leave. The fallback is restricted to the bank's own sentence.
+    """
+
+    async def scenario():
+        await place("call-g13")
+        bridge = bridge_for("call-g13")
+
+        bridge.on_realtime_event(bridge.banking_session_id, audio_event(b"\x00\x10" * 480))
+        _say(
+            bridge,
+            "assistant",
+            "You can say goodbye to overdraft fees with this account. "
+            "Would you like to hear the details?",
+        )
+        await asyncio.sleep(0.2)
+
+        state = bridge.lifecycle.state
+        closed = bridge.closed
+        reason = bridge.lifecycle.end_reason
+        await bridge.lifecycle.close()
+        return state, closed, reason
+
+    state, closed, reason = run(scenario())
+
+    assert state is not CallState.CLOSING, "an ordinary sentence closed the call"
+    assert closed is False
+    assert reason is None
+
+
+# --- 14: per-call isolation -------------------------------------------------
+
+
+def test_two_concurrent_calls_keep_their_goodbye_state_separate(phone):
+    """No global closing state. One caller leaving must not take the other."""
+
+    async def scenario():
+        await place("call-g14a")
+        await place("call-g14b")
+        leaving = bridge_for("call-g14a")
+        staying = bridge_for("call-g14b")
+
+        _say(leaving, "user", "that's all, goodbye")
+        _say(staying, "user", "what is my account balance")
+        await wait_until(lambda: leaving.conversation.goodbye_armed, timeout=1.0)
+        await asyncio.sleep(0.1)
+
+        result = (
+            leaving.conversation.goodbye_armed,
+            staying.conversation.goodbye_armed,
+            staying.lifecycle.state,
+            staying.closed,
+        )
+        await leaving.lifecycle.close()
+        await staying.lifecycle.close()
+        return result
+
+    leaving_armed, staying_armed, staying_state, staying_closed = run(scenario())
+
+    assert leaving_armed is True
+    assert staying_armed is False, "one caller's goodbye armed another's call"
+    assert staying_state is not CallState.CLOSING
+    assert staying_closed is False
+
+
+def test_a_second_call_can_still_be_closed_by_its_own_caller(phone):
+    """Isolation both ways: the survivor keeps its own working goodbye."""
+
+    async def scenario():
+        await place("call-g14c")
+        await place("call-g14d")
+        first = bridge_for("call-g14c")
+        second = bridge_for("call-g14d")
+
+        _say(first, "user", "goodbye")
+        await wait_until(lambda: first.conversation.goodbye_armed, timeout=1.0)
+
+        _say(second, "user", "bye")
+        await wait_until(lambda: second.conversation.goodbye_armed, timeout=1.0)
+        result = (first.conversation.goodbye_armed, second.conversation.goodbye_armed)
+        await first.lifecycle.close()
+        await second.lifecycle.close()
+        return result
+
+    assert run(scenario()) == (True, True)
+
+
+# --- 15-16: the paths that already worked -----------------------------------
+
+
+def test_the_silence_path_is_unchanged(phone):
+    """Phase 6 behaviour, re-asserted against the new arming code.
+
+    Ten seconds of a caller not speaking still closes the call as CALLER_SILENT
+    — the caller never said an ending phrase, so nothing armed.
+    """
+
+    async def scenario():
+        await place("call-g15")
+        bridge = bridge_for("call-g15")
+        bridge.lifecycle._silence_seconds = 0.05
+
+        await _assistant_turn(bridge)
+        waited = await wait_until(
+            lambda: bridge.lifecycle.state is CallState.WAITING_FOR_CALLER, timeout=2.0
+        )
+        assert waited, "the call never went back to waiting for the caller"
+
+        closing = await wait_until(
+            lambda: bridge.lifecycle.state is CallState.CLOSING, timeout=2.0
+        )
+        assert closing, "the silence timer never fired"
+        prompted = bridge.lifecycle.silence_prompts
+        armed = bridge.conversation.goodbye_armed
+
+        # The closing line the silence path asked the model for.
+        await _assistant_turn(bridge)
+        await wait_until(lambda: bridge.lifecycle.end_reason is not None, timeout=3.0)
+        return prompted, armed, bridge.lifecycle.end_reason
+
+    prompted, armed, reason = run(scenario())
+
+    assert prompted == 1
+    assert armed is False, "silence must not look like an explicit goodbye"
+    assert reason is EndReason.CALLER_SILENT
+
+
+def test_a_caller_hanging_up_after_arming_stays_idempotent(phone):
+    """Both endings racing. Whichever wins, the call ends exactly once."""
+
+    async def scenario():
+        await place("call-g16")
+        bridge = bridge_for("call-g16")
+
+        _say(bridge, "user", "goodbye")
+        await wait_until(lambda: bridge.conversation.goodbye_armed, timeout=1.0)
+
+        await hang_up("call-g16")
+        await hang_up("call-g16")
+        await asyncio.sleep(0.1)
+        return bridge.closed, phone_call_registry.get("call-g16")
+
+    closed, still_registered = run(scenario())
+
+    assert closed is True
+    assert still_registered is None
+
+
+# --- 17: nothing left behind ------------------------------------------------
+
+
+def test_an_explicit_goodbye_leaks_no_session_capacity_or_media(phone):
+    """The full clean ending, checked from the outside."""
+
+    async def scenario():
+        await place("call-g17")
+        bridge = bridge_for("call-g17")
+        banking_session_id = bridge.banking_session_id
+        transport = bridge.transport
+        assert voice_call_manager.used_capacity() == 1
+
+        _say(bridge, "user", "that's all, thank you, goodbye")
+        await wait_until(lambda: bridge.conversation.goodbye_armed, timeout=1.0)
+
+        await _assistant_turn(bridge, "Thank you. Goodbye.")
+
+        await wait_until(lambda: voice_call_manager.used_capacity() == 0, timeout=3.0)
+        await asyncio.sleep(0.1)
+
+        return (
+            bridge.lifecycle.end_reason,
+            phone_call_registry.active_count(),
+            voice_call_manager.used_capacity(),
+            session_manager.get_session(banking_session_id),
+            transport.ended,
+            bridge.closed,
+        )
+
+    reason, bridges, capacity, banking_session, transport_ended, closed = run(scenario())
+
+    assert reason is EndReason.CALLER_GOODBYE
+    assert bridges == 0, "the bridge outlived the call"
+    assert capacity == 0, "a concurrency slot was never released"
+    assert banking_session is None, "the banking session was left open"
+    assert transport_ended is True, "the media path was never released"
+    assert closed is True

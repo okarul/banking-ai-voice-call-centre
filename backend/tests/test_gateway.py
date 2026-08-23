@@ -990,3 +990,142 @@ def test_the_pacing_constants_are_the_production_values():
     assert "frame_interval = 0.020" in source
     assert "FRAME_BYTES" in source
     assert FRAME_BYTES == 160
+
+
+
+import websockets.exceptions  # noqa: E402
+
+
+# === Phase 6.3: a normal application close is not a relay failure ===========
+#
+# Since Phase 6.2 the bank closes the media socket itself when it has finished
+# saying goodbye. Both relay directions see that close, and only one of them
+# handled it: `_bank_to_caller` returned quietly, while `_caller_to_bank` let
+# `ConnectionClosedOK` out of `socket.send`. Which one noticed first was a race,
+# so a perfectly ordinary hang-up was intermittently logged as
+# "relay failed: ConnectionClosedOK" and counted against the gateway.
+
+
+class _ClosedSocket:
+    """A socket the far end has already closed, tidily."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, frame):
+        raise websockets.exceptions.ConnectionClosedOK(None, None)
+
+    async def close(self):
+        return None
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        return
+        yield  # pragma: no cover
+
+
+class _TalkingSource:
+    """A caller who is still sending audio when the bank ends the call."""
+
+    def __init__(self, frames=3):
+        self.call_id = "closing"
+        self._left = frames
+        self.closed = False
+
+    async def receive_frame(self):
+        if self._left <= 0:
+            await asyncio.sleep(0.01)
+            return None
+        self._left -= 1
+        return b"\xff" * FRAME_BYTES
+
+    async def send_frame(self, frame):
+        return None
+
+    async def close(self):
+        self.closed = True
+
+
+def test_an_application_close_does_not_raise_out_of_the_caller_direction():
+    """The direction that was missing the handler."""
+    gateway = _gateway_only()
+
+    async def scenario():
+        await gateway._caller_to_bank(_TalkingSource(), _ClosedSocket())
+
+    asyncio.run(scenario())  # must simply return
+
+
+def test_an_application_close_is_not_logged_as_a_gateway_error(caplog):
+    """The observable symptom: an ERROR line for a healthy call."""
+    import logging
+
+    gateway = _gateway_only()
+
+    async def scenario():
+        with caplog.at_level(logging.WARNING, logger="gateway.service"):
+            await gateway._caller_to_bank(_TalkingSource(), _ClosedSocket())
+
+    asyncio.run(scenario())
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors == [], [r.getMessage() for r in errors]
+
+
+def test_an_application_close_is_not_counted_as_a_failed_call():
+    """`relay failed` also incremented the failure counter."""
+    gateway = _gateway_only()
+    before = gateway.failed
+
+    async def scenario():
+        await gateway._caller_to_bank(_TalkingSource(), _ClosedSocket())
+
+    asyncio.run(scenario())
+
+    assert gateway.failed == before
+
+
+def test_a_genuine_relay_error_is_still_surfaced():
+    """The handler is narrow: only an ordinary close is swallowed."""
+    gateway = _gateway_only()
+
+    class _Broken(_ClosedSocket):
+        async def send(self, frame):
+            raise RuntimeError("socket wedged")
+
+    async def scenario():
+        await gateway._caller_to_bank(_TalkingSource(), _Broken())
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(scenario())
+
+
+def test_the_caller_direction_still_forwards_audio_normally():
+    """Behaviour on the healthy path is unchanged by the new handler."""
+    gateway = _gateway_only()
+
+    class _Recording(_ClosedSocket):
+        async def send(self, frame):
+            self.sent.append(frame)
+
+    socket = _Recording()
+
+    async def scenario():
+        await gateway._caller_to_bank(_TalkingSource(frames=4), socket)
+
+    asyncio.run(scenario())
+
+    assert len(socket.sent) == 4
+    assert all(len(frame) == FRAME_BYTES for frame in socket.sent)
+
+
+def test_the_rtp_pacing_is_untouched_by_the_phase_63_change():
+    """49a24e1 lives in the sibling method and must not have moved."""
+    import inspect
+
+    source = inspect.getsource(MediaGateway._bank_to_caller)
+    assert "frame_interval = 0.020" in source
+    assert "next_send += frame_interval" in source
+    assert "next_send = loop.time()" in source
