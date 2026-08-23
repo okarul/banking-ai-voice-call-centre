@@ -250,7 +250,14 @@ class PhoneCallBridge:
         the model reporting a voice.
         """
         raw_type = getattr(data, "type", None)
-        if raw_type in ("turn_started", "input_audio_transcription_completed"):
+        if raw_type == "input_audio_transcription_completed":
+            # The transcript of speech that began earlier. Still a turn
+            # boundary — duplicate suppression is scoped to one — but not the
+            # caller starting to talk, and the difference decides whether a
+            # late goodbye can end a call whose reply has already played.
+            self._begin_caller_turn(speech_started=False)
+            return
+        if raw_type == "turn_started":
             self._begin_caller_turn()
             return
 
@@ -261,17 +268,23 @@ class PhoneCallBridge:
         ):
             self._begin_caller_turn()
 
-    def _begin_caller_turn(self) -> None:
+    def _begin_caller_turn(self, *, speech_started: bool = True) -> None:
         """A new logical caller turn.
 
         Duplicate suppression is scoped to a turn, which is what stops it
         refusing a caller who legitimately asks the same question twice: the
         second ask is a new turn, so the same tool and the same answer are
         allowed again.
+
+        `speech_started` is False when it is the transcript that arrived rather
+        than the voice that started. The turn bookkeeping is identical; what
+        differs is whether the lifecycle should consider a reply owed again.
         """
         self.conversation.begin_caller_turn()
         self._tools_this_turn.clear()
-        self._schedule(self.lifecycle.on_caller_speech_started())
+        self._schedule(
+            self.lifecycle.on_caller_speech_started(speech_started=speech_started)
+        )
 
     # --- one turn, one response ---------------------------------------------
 

@@ -110,6 +110,12 @@ class CallLifecycle:
         # Set when a closing line is playing, so playback completion hangs up
         # instead of waiting for a caller who is about to be disconnected.
         self._closing_for: EndReason | None = None
+        # True when the assistant's reply to the caller's most recent turn has
+        # both finished generating and finished playing. False while a reply is
+        # owed or in progress. It is the difference between a caller who has
+        # just asked to leave and one whose goodbye has already been said —
+        # states that otherwise look identical, and must not be closed alike.
+        self._reply_complete = False
 
         self._silence_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
@@ -134,8 +140,10 @@ class CallLifecycle:
                 # empties after that frame, and a `_generation_ended` left over
                 # from the previous turn would hang up mid-goodbye.
                 self._generation_ended = False
+                self._reply_complete = False
                 return
             self._generation_ended = False
+            self._reply_complete = False
             self._cancel_silence()
             self.state = CallState.ASSISTANT_SPEAKING
 
@@ -163,6 +171,7 @@ class CallLifecycle:
 
             if self._closing_for is None:
                 self.turns_completed += 1
+                self._reply_complete = True
                 self.state = CallState.WAITING_FOR_CALLER
                 self._arm_silence()
                 return
@@ -180,14 +189,36 @@ class CallLifecycle:
         # the call ever ending.
         await self._finish(reason)
 
-    async def on_caller_speech_started(self) -> None:
-        """The model reports the caller's voice. Cancel the wait immediately."""
+    async def on_caller_speech_started(self, *, speech_started: bool = True) -> None:
+        """The model reports the caller's voice. Cancel the wait immediately.
+
+        `speech_started` separates the caller beginning to talk from their
+        transcript arriving afterwards. Transcription runs as a separate pass
+        and can complete long after the answer it prompted has been spoken, so
+        a transcript is not evidence that anybody is speaking now.
+
+        **A transcript alone changes nothing here.** It does not cancel the
+        silence timer, does not claim the caller is speaking, and does not mark
+        a reply owed. Acting on it would strand the call: an ordinary late
+        transcript would move a waiting call into CALLER_SPEAKING and switch off
+        the timer, leaving it waiting for a turn already taken and an answer
+        already given, with the one thing that would have rescued it — the
+        silence timeout — just turned off.
+
+        What the transcript *is* good for happens elsewhere: the bridge reads it
+        for intent, and a goodbye found in it arms closure through
+        `arm_goodbye`, which decides for itself whether the reply has already
+        been delivered.
+        """
         async with self._lock:
             if self._closed or self.state is CallState.CLOSING:
                 # A caller who speaks over the closing line does not stop it.
                 # The bank has said goodbye; reopening the conversation here
                 # would leave a call nothing ever ends.
                 return
+            if not speech_started:
+                return
+            self._reply_complete = False
             self._cancel_silence()
             self.state = CallState.CALLER_SPEAKING
 
@@ -232,12 +263,36 @@ class CallLifecycle:
             if self._closed or self._closing_for is not None:
                 return
             self._closing_for = EndReason.CALLER_GOODBYE
-            self.state = CallState.CLOSING
             self._cancel_silence()
+
+            if not (self._generation_ended and self._reply_complete):
+                # A reply is owed or still playing. Wait for it, exactly as
+                # before: the caller is owed their goodbye and cutting into
+                # queued audio to deliver a hang-up would talk over it.
+                self.state = CallState.CLOSING
+                logger.info(
+                    "lifecycle[%s] closing armed: caller asked to end the call",
+                    self.call_id,
+                )
+                return
+
+            # The reply this intent belongs to has already been generated in
+            # full and already been heard in full. No further generation or
+            # playback event is coming, so waiting for one leaves the call
+            # standing in CLOSING for ever — which is the caller sitting on a
+            # line the bank has finished with. Close it here instead.
+            self.state = CallState.CLOSED
+            self._closed = True
             logger.info(
-                "lifecycle[%s] closing armed: caller asked to end the call",
+                "lifecycle[%s] closing: caller asked to end the call after the "
+                "reply had already played",
                 self.call_id,
             )
+
+        # Outside the lock, for the same reason as `on_playback_drained`:
+        # hanging up tears down the bridge, which closes this lifecycle, which
+        # needs this lock.
+        await self._finish(EndReason.CALLER_GOODBYE)
 
     async def on_caller_disconnected(self) -> None:
         """The caller hung up. Nothing to play out; stop at once."""

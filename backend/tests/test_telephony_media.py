@@ -2112,6 +2112,12 @@ def test_the_first_frame_of_the_closing_line_is_not_mistaken_for_the_last():
         await lifecycle.on_generation_ended()
         await lifecycle.on_playback_drained()      # a complete earlier turn
 
+        # The caller then speaks. Live this always precedes their transcript —
+        # the model cannot transcribe speech it never detected — and it is what
+        # tells the lifecycle a reply is owed again. Without it the sequence is
+        # indistinguishable from a transcript arriving *after* its reply, which
+        # is the Phase 6.4 case that closes at once.
+        await lifecycle.on_caller_speech_started()
         await lifecycle.arm_goodbye()
         await lifecycle.on_assistant_audio()       # the goodbye begins
         await lifecycle.on_playback_drained()      # first frame, queue empty
@@ -2373,3 +2379,127 @@ def test_an_explicit_goodbye_leaks_no_session_capacity_or_media(phone):
     assert banking_session is None, "the banking session was left open"
     assert transport_ended is True, "the media path was never released"
     assert closed is True
+
+
+# === Phase 6.4: the late transcript, through the real event path ============
+#
+# The lifecycle ordering is pinned down in test_telephony_goodbye_race.py. These
+# two drive it through the bridge instead, so the wiring is covered as well as
+# the state machine: the raw transcription event and the history item both have
+# to arrive as they do live for the closure to complete.
+
+
+def _speech_started(bridge):
+    bridge.on_realtime_event(
+        bridge.banking_session_id,
+        FakeEvent("raw_model_event", data=FakeEvent("speech", data={
+            "type": "input_audio_buffer.speech_started"
+        })),
+    )
+
+
+def _transcription_completed(bridge):
+    """The separate transcription pass finishing — often after the reply."""
+    bridge.on_realtime_event(
+        bridge.banking_session_id,
+        FakeEvent(
+            "raw_model_event",
+            data=FakeEvent("input_audio_transcription_completed"),
+        ),
+    )
+
+
+def test_a_transcript_arriving_after_the_reply_still_ends_the_call(phone):
+    """The live failure, end to end.
+
+    The caller says "that's all, thank you, goodbye". The assistant answers and
+    finishes. Only then does the transcript arrive. Before Phase 6.4 the arming
+    landed in CLOSING with no event left to complete it and the line stayed up.
+    """
+
+    async def scenario():
+        await place("call-late")
+        bridge = bridge_for("call-late")
+
+        _speech_started(bridge)                      # the caller starts talking
+        await _assistant_turn(bridge, "Thank you. Goodbye.")
+        await wait_until(
+            lambda: bridge.lifecycle.state is CallState.WAITING_FOR_CALLER,
+            timeout=2.0,
+        )
+
+        # The transcript, late — both events, in the order the SDK sends them.
+        _transcription_completed(bridge)
+        _say(bridge, "user", "that's all, thank you, goodbye")
+
+        ended = await wait_until(
+            lambda: bridge.lifecycle.end_reason is not None, timeout=3.0
+        )
+        return ended, bridge.lifecycle.end_reason, bridge.conversation.goodbye_armed
+
+    ended, reason, armed = run(scenario())
+
+    assert ended is True, "the late transcript left the call standing"
+    assert reason is EndReason.CALLER_GOODBYE
+    assert armed is True
+
+
+def test_a_late_goodbye_cannot_produce_a_second_greeting(phone):
+    """The reported symptom: the caller hearing the opening line again.
+
+    `greet()` is called once, from one place, behind a `_greeted` guard that is
+    only released when the cue failed to send — so a second greeting cannot come
+    from the bridge. What the caller heard on a stranded call was the model
+    speaking again on a line that should already have been torn down. This
+    asserts the bridge's side of that: exactly one greeting cue, whatever the
+    goodbye does.
+    """
+
+    async def scenario():
+        await place("call-greet-once")
+        bridge = bridge_for("call-greet-once")
+        session = phone.by_banking_session[bridge.banking_session_id]
+        await wait_until(lambda: bridge.greeted, timeout=2.0)
+
+        _speech_started(bridge)
+        await _assistant_turn(bridge, "Thank you. Goodbye.")
+        _transcription_completed(bridge)
+        _say(bridge, "user", "goodbye")
+        await wait_until(
+            lambda: bridge.lifecycle.end_reason is not None, timeout=3.0
+        )
+
+        # And a greeting attempted again after all that changes nothing.
+        greeted_again = await bridge.greet()
+        return session.messages, greeted_again
+
+    messages, greeted_again = run(scenario())
+
+    assert messages == [GREETING_CUE], f"more than one greeting: {messages}"
+    assert greeted_again is False
+
+
+def test_a_stranded_call_does_not_re_greet_when_the_goodbye_never_completes(phone):
+    """Arming without a reply leaves the call open — but never re-greeted."""
+
+    async def scenario():
+        await place("call-stranded")
+        bridge = bridge_for("call-stranded")
+        session = phone.by_banking_session[bridge.banking_session_id]
+        await wait_until(lambda: bridge.greeted, timeout=2.0)
+
+        _speech_started(bridge)
+        _say(bridge, "user", "that's all, goodbye")   # armed, no reply follows
+        await wait_until(lambda: bridge.conversation.goodbye_armed, timeout=1.0)
+        await asyncio.sleep(0.2)
+
+        greeted_again = await bridge.greet()
+        result = (session.messages, greeted_again, bridge.lifecycle.end_reason)
+        await bridge.lifecycle.close()
+        return result
+
+    messages, greeted_again, reason = run(scenario())
+
+    assert messages == [GREETING_CUE], f"the caller was greeted twice: {messages}"
+    assert greeted_again is False
+    assert reason is None, "closed before the goodbye was ever spoken"
