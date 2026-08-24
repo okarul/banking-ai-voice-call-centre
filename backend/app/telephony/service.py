@@ -40,6 +40,7 @@ from app.realtime.browser_calls import voice_call_manager
 from app.realtime.realtime_manager import Reason, RealtimeSessionError
 from app.sessions import session_manager
 from app.telephony.bridge import PhoneCallBridge, phone_call_registry
+from app.telephony import reasons
 from app.telephony.channels import Channel
 from app.telephony.media import LoopbackMediaTransport, WebSocketMediaTransport
 from app.telephony.schemas import InboundCallEvent, TelephonyEventType
@@ -77,6 +78,13 @@ class Outcome(str, Enum):
     ACCEPTED = "accepted"
     DUPLICATE = "duplicate"
     REJECTED_CAPACITY = "rejected_capacity"
+    # A model session that would not open is not a busy switchboard. Reported
+    # separately because it sends an operator somewhere completely different:
+    # capacity means wait, this means look at the provider. Live, a provider
+    # refusing every session was logged by the gateway as `rejected_capacity`,
+    # and the one true fact — that nothing was wrong with capacity at all —
+    # never reached anybody.
+    REJECTED_REALTIME_UNAVAILABLE = "rejected_realtime_unavailable"
     ENDED = "ended"
     ALREADY_ENDED = "already_ended"
     UNKNOWN_CALL = "unknown_call"
@@ -135,21 +143,28 @@ async def _on_call_ended(
     caller fell silent and was told so. Either way the line has played out
     before anything is taken down, which is the whole point of waiting.
     """
-    logger.info("telephony call ended: %s (%s)", provider_call_id, reason)
+    recorded = reasons.for_end_reason(reason)
+    logger.info(
+        "telephony call ended: %s (%s -> %s)", provider_call_id, reason, recorded
+    )
     await tear_down(provider_call_id, banking_session_id)
-    recorder.close_phone_call(provider_call_id, reason=reason)
+    recorder.close_phone_call(provider_call_id, reason=recorded)
 
 
-async def _on_call_lost(provider_call_id: str, banking_session_id: str) -> None:
+async def _on_call_lost(
+    provider_call_id: str,
+    banking_session_id: str,
+    cause: str = reasons.MEDIA_FAILURE,
+) -> None:
     """A call whose media or model failed underneath it.
 
     Converges on the same teardown as every other ending, so a dropped model
     session releases its capacity slot immediately rather than waiting minutes
     for the idle sweep to notice a silent call.
     """
-    logger.warning("telephony call lost: %s", provider_call_id)
+    logger.warning("telephony call lost: %s (%s)", provider_call_id, cause)
     await tear_down(provider_call_id, banking_session_id)
-    recorder.close_phone_call(provider_call_id, reason="PROVIDER_FAILURE")
+    recorder.close_phone_call(provider_call_id, reason=cause)
 
 
 async def _open_conversation(bridge: PhoneCallBridge) -> None:
@@ -180,7 +195,30 @@ async def _open_conversation(bridge: PhoneCallBridge) -> None:
         logger.warning("telephony media never attached: %s", bridge.provider_call_id)
         await tear_down(bridge.provider_call_id, bridge.banking_session_id)
         recorder.mark_phone_call_rejected(
-            bridge.provider_call_id, reason="MEDIA_ATTACH_TIMEOUT"
+            bridge.provider_call_id, reason=reasons.MEDIA_ATTACH_TIMEOUT
+        )
+        return
+
+    # The socket is attached, but attached is not compatible. A gateway that
+    # cannot answer a playback boundary would leave every turn waiting for an
+    # acknowledgement it never sends, and the call would hang with nothing to
+    # explain it. Refuse here instead, while a refusal is still cheap and
+    # legible. This is a startup timeout, not a limit on how long a call may
+    # last.
+    compatible = await _far_end_is_compatible(
+        bridge.transport, settings.telephony_protocol_timeout
+    )
+    if not compatible:
+        if bridge.closed:
+            return
+        logger.error(
+            "telephony media protocol not agreed: %s (gateway version %s)",
+            bridge.provider_call_id,
+            getattr(bridge.transport, "peer_version", None),
+        )
+        await tear_down(bridge.provider_call_id, bridge.banking_session_id)
+        recorder.mark_phone_call_rejected(
+            bridge.provider_call_id, reason=reasons.PROTOCOL_MISMATCH
         )
         return
 
@@ -210,9 +248,25 @@ async def sweep_idle_calls() -> int:
             continue
         logger.info("telephony call idle, closing: %s", bridge.provider_call_id)
         await tear_down(bridge.provider_call_id, bridge.banking_session_id)
-        recorder.close_phone_call(bridge.provider_call_id, reason="SILENCE_TIMEOUT")
+        recorder.close_phone_call(
+            bridge.provider_call_id, reason=reasons.IDLE_TIMEOUT
+        )
         closed += 1
     return closed
+
+
+async def _far_end_is_compatible(transport, timeout: float) -> bool:
+    """Whether this transport's far end agreed a protocol we can work with.
+
+    A transport with nothing on the other side to negotiate with — the loopback
+    used in tests and local development — is compatible by definition, and one
+    that predates negotiation entirely is treated the same way rather than
+    refused.
+    """
+    wait = getattr(transport, "wait_for_protocol", None)
+    if wait is None:
+        return True
+    return await wait(timeout)
 
 
 async def _register_incoming(payload: InboundCallEvent) -> EventResult:
@@ -298,7 +352,7 @@ async def _register_incoming(payload: InboundCallEvent) -> EventResult:
         elif isinstance(error, asyncio.TimeoutError):
             reason = "REALTIME_TIMEOUT"
         else:
-            reason = "UNAVAILABLE"
+            reason = reasons.REALTIME_START_FAILURE
         if not at_capacity:
             # Type only. A provider or SDK message may carry request detail.
             logger.error("telephony call could not start: %s", type(error).__name__)
@@ -309,7 +363,11 @@ async def _register_incoming(payload: InboundCallEvent) -> EventResult:
         recorder.mark_phone_call_rejected(payload.provider_call_id, reason=reason)
         _audit(AuditEvent.CALL_REJECTED, payload, reason=reason)
         return EventResult(
-            Outcome.REJECTED_CAPACITY, payload.provider_event_id, agent_session_id
+            Outcome.REJECTED_CAPACITY
+            if at_capacity
+            else Outcome.REJECTED_REALTIME_UNAVAILABLE,
+            payload.provider_event_id,
+            agent_session_id,
         )
 
     # Registered only once the call is fully built. A bridge in the registry is

@@ -217,10 +217,16 @@ def test_the_lock_applies_to_a_phone_session(monkeypatch):
     from fastapi.testclient import TestClient
 
     import tests.test_telephony_webhook as webhook
+    from app.telephony import service as telephony_service
 
     monkeypatch.setattr(settings, "telephony_enabled", True)
     monkeypatch.setattr(settings, "telephony_webhook_secret", webhook.TEST_SECRET)
     monkeypatch.setattr(settings, "realtime_max_active_sessions", 0)
+    # The lockout is a property of this bank, not of the model provider. Stub
+    # the connector so the assertion does not depend on an external service.
+    monkeypatch.setattr(
+        telephony_service, "open_phone_realtime_session", webhook._stub_connector
+    )
 
     from app.main import create_app
 

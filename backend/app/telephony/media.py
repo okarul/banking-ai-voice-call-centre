@@ -73,6 +73,16 @@ PLAYBACK_DRAINED = "playback_drained"
 MAX_BOUNDARY_ID_LENGTH = 64
 
 
+# A control frame is a handful of short words. Anything larger is not ours,
+# and parsing it would be doing unbounded work on behalf of whoever sent it.
+# The webhook has capped bodies since Phase 2; this path had no equivalent.
+MAX_CONTROL_BYTES = 4096
+
+
+def _too_large(text) -> bool:
+    return not isinstance(text, str) or len(text) > MAX_CONTROL_BYTES
+
+
 def playback_boundary_message(boundary_id: str) -> str:
     """Ask the far end to report when everything before this has been played."""
     return json.dumps({"type": PLAYBACK_BOUNDARY, "id": boundary_id})
@@ -85,7 +95,7 @@ def read_control_message(text) -> tuple[str, str] | None:
     ours to act on, and guessing at it is how a media socket starts doing
     something other than carrying one call's audio.
     """
-    if not isinstance(text, str):
+    if _too_large(text):
         return None
     try:
         payload = json.loads(text)
@@ -103,6 +113,104 @@ def read_control_message(text) -> tuple[str, str] | None:
     if not boundary_id or len(boundary_id) > MAX_BOUNDARY_ID_LENGTH:
         return None
     return kind, boundary_id
+
+
+# --- negotiation ------------------------------------------------------------
+#
+# The playback boundary only works if the far end answers it. A backend that
+# expects an acknowledgement from a gateway too old to send one waits for ever:
+# the turn never completes, the silence timer never arms, and the call sits
+# open with nobody able to explain why. Deploying the two together is the
+# intent, but intent is not a mechanism, and a hung call is a bad way to
+# discover a mismatched release.
+#
+# So the two ends say what they are before any conversation depends on it:
+#
+#     backend -> gateway   {"type": "protocol_hello", "version": 1,
+#                           "features": ["playback_ack"]}
+#     gateway -> backend   {"type": "protocol_ready", "version": 1,
+#                           "features": ["playback_ack"]}
+#
+# Answered and compatible, the call proceeds. Unanswered, refused, or missing
+# the feature, the call is given up before the caller is greeted — a refusal
+# an operator can read beats a conversation that cannot end.
+
+PROTOCOL_HELLO = "protocol_hello"
+PROTOCOL_READY = "protocol_ready"
+
+# Bumped only when the wire contract changes in a way an older peer cannot
+# honour. Adding a feature name does not need a new version; removing or
+# redefining one does.
+PROTOCOL_VERSION = 1
+
+# The one capability a telephone call cannot do without. Named rather than
+# implied by the version, so a later gateway can offer more without either end
+# having to guess what a version number includes.
+FEATURE_PLAYBACK_ACK = "playback_ack"
+REQUIRED_FEATURES = (FEATURE_PLAYBACK_ACK,)
+
+# Bounds. A negotiation frame is a handful of short words; anything larger is
+# not ours and is not worth parsing.
+MAX_FEATURES = 16
+MAX_FEATURE_LENGTH = 32
+
+
+def protocol_hello_message() -> str:
+    """What this backend is, and what it needs the far end to support."""
+    return json.dumps(
+        {
+            "type": PROTOCOL_HELLO,
+            "version": PROTOCOL_VERSION,
+            "features": list(REQUIRED_FEATURES),
+        }
+    )
+
+
+def protocol_ready_message() -> str:
+    """The same, in answer. Used by the gateway; defined here as the contract."""
+    return json.dumps(
+        {
+            "type": PROTOCOL_READY,
+            "version": PROTOCOL_VERSION,
+            "features": list(REQUIRED_FEATURES),
+        }
+    )
+
+
+def read_protocol_message(text) -> tuple[str, int, tuple[str, ...]] | None:
+    """Parse a negotiation frame, or None if it is not one.
+
+    As strict as the playback parser and for the same reason: a media socket
+    that acts on frames it cannot fully understand is a media socket doing
+    something other than carrying one call's audio.
+    """
+    if _too_large(text):
+        return None
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    kind = payload.get("type")
+    if kind not in (PROTOCOL_HELLO, PROTOCOL_READY):
+        return None
+
+    version = payload.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+        return None
+
+    features = payload.get("features")
+    if not isinstance(features, list) or len(features) > MAX_FEATURES:
+        return None
+    if not all(
+        isinstance(name, str) and 0 < len(name) <= MAX_FEATURE_LENGTH
+        for name in features
+    ):
+        return None
+
+    return kind, version, tuple(features)
 
 
 class MediaTransportError(Exception):
@@ -235,6 +343,14 @@ class MediaTransport(Protocol):
         """
         ...
 
+    async def wait_for_protocol(self, timeout: float) -> bool:
+        """Whether the far end has agreed a compatible protocol in time.
+
+        False means no conversation may begin on this transport. A transport
+        with no far end to negotiate with is compatible by definition.
+        """
+        ...
+
 
 class LoopbackMediaTransport:
     """An in-memory transport for tests and local development.
@@ -274,6 +390,10 @@ class LoopbackMediaTransport:
         whatever speed it reads. Its queue emptying really is completion.
         """
         return False
+
+    async def wait_for_protocol(self, timeout: float) -> bool:
+        """No far end, so nothing to disagree with."""
+        return True
 
     async def on_call_ended(self) -> None:
         self.ended = True
@@ -322,6 +442,12 @@ class WebSocketMediaTransport:
         self._inbound = BoundedAudioQueue(max_frames=max_frames, name="ws-in")
         self._closed = False
         self._attached = asyncio.Event()
+        # Negotiation. The event is set on any outcome — agreed, refused or
+        # the call ending — so nobody waits out the timeout for an answer that
+        # has already arrived.
+        self._negotiated = asyncio.Event()
+        self._compatible = False
+        self._peer_version: int | None = None
 
     @property
     def inbound(self) -> BoundedAudioQueue:
@@ -387,6 +513,67 @@ class WebSocketMediaTransport:
             self._closed = True
             logger.info("media socket closed while sending: %s", type(error).__name__)
 
+    @property
+    def compatible(self) -> bool:
+        """Whether the far end answered with a protocol this backend can use."""
+        return self._compatible
+
+    @property
+    def peer_version(self) -> int | None:
+        """The version the far end reported, for the operator. None if silent."""
+        return self._peer_version
+
+    async def send_protocol_hello(self) -> bool:
+        """Say what this backend is. False if there is nothing to say it to."""
+        if self._closed or self._websocket is None:
+            return False
+        try:
+            await self._websocket.send_text(protocol_hello_message())
+            return True
+        except Exception as error:
+            self._closed = True
+            self._negotiated.set()
+            logger.info(
+                "media socket closed during negotiation: %s", type(error).__name__
+            )
+            return False
+
+    def on_protocol_ready(self, version: int, features: tuple[str, ...]) -> bool:
+        """Record the far end's answer. False means this call cannot proceed.
+
+        Both halves matter. A version this backend does not speak is a
+        mismatched release; the right version without `playback_ack` is a
+        gateway that would never answer a playback boundary, which is the hang
+        this negotiation exists to prevent.
+        """
+        self._peer_version = version
+        missing = [name for name in REQUIRED_FEATURES if name not in features]
+
+        if version != PROTOCOL_VERSION:
+            logger.error(
+                "media protocol version mismatch: gateway=%s backend=%s",
+                version,
+                PROTOCOL_VERSION,
+            )
+        elif missing:
+            logger.error("media protocol missing feature: %s", ",".join(missing))
+        else:
+            self._compatible = True
+
+        self._negotiated.set()
+        return self._compatible
+
+    async def wait_for_protocol(self, timeout: float) -> bool:
+        """Wait for the far end to agree a protocol. False if it never did."""
+        if self._closed:
+            return False
+        try:
+            await asyncio.wait_for(self._negotiated.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.error("media protocol negotiation timed out after %ss", timeout)
+            return False
+        return self._compatible and not self._closed
+
     async def send_playback_boundary(self, boundary_id: str) -> bool:
         """Ask the gateway when this turn has actually reached the telephone."""
         if self._closed or self._websocket is None:
@@ -410,6 +597,8 @@ class WebSocketMediaTransport:
         """
         self._closed = True
         self._attached.set()
+        # Anything waiting on negotiation is waiting for a call that has ended.
+        self._negotiated.set()
         self._inbound.close()
 
         socket = self._websocket

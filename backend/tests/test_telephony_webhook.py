@@ -33,6 +33,7 @@ from app.database.models import AgentSession, AgentToolEvent, ConversationMessag
 from app.main import create_app
 from app.realtime.browser_calls import browser_call_manager
 from app.sessions import session_manager
+from app.telephony import service as telephony_service
 from app.telephony.schemas import InboundCallEvent
 from app.telephony.signature import (
     MAX_BODY_BYTES,
@@ -71,11 +72,53 @@ def clean_operational_tables():
     wipe()
 
 
+class _StubRealtimeSession:
+    """Stands in for the paid model session. Opens no socket, costs nothing."""
+
+    def __init__(self) -> None:
+        self.audio_chunks: list[bytes] = []
+        self.messages: list[str] = []
+        self.closed = False
+        self._events: asyncio.Queue = asyncio.Queue()
+
+    async def send_audio(self, audio: bytes) -> None:
+        self.audio_chunks.append(audio)
+
+    async def send_message(self, text: str) -> None:
+        self.messages.append(text)
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def __aiter__(self):
+        while True:
+            event = await self._events.get()
+            if event is None:
+                return
+            yield event
+
+
+async def _stub_connector(_context):
+    return _StubRealtimeSession()
+
+
 @pytest.fixture
 def telephony_on(monkeypatch):
-    """An application built with the telephone channel switched on."""
+    """An application built with the telephone channel switched on.
+
+    The model connector is stubbed. Every test in this file is about the
+    *bank's* behaviour — signature checking, admission, capacity, the PIN flow,
+    per-call isolation — and none of it is about the model provider. Left
+    unstubbed it opened a real paid realtime session for every accepted call,
+    which made the whole file fail whenever that provider was unreachable,
+    out of credit, or merely slow. A deterministic suite must not depend on an
+    external service being up to tell us whether our own routing works.
+    """
     monkeypatch.setattr(settings, "telephony_enabled", True)
     monkeypatch.setattr(settings, "telephony_webhook_secret", TEST_SECRET)
+    monkeypatch.setattr(
+        telephony_service, "open_phone_realtime_session", _stub_connector
+    )
     return create_app()
 
 

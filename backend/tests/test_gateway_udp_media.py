@@ -995,19 +995,27 @@ def test_no_relay_or_socket_outlives_its_call(run, gateway, allocator, sessions)
             for n in range(REALTIME_LIVE_CEILING)
         ]
         await wait_until(lambda: len(phone_rows()) == REALTIME_LIVE_CEILING)
-        during = len(
-            [t for t in asyncio.all_tasks() if (t.get_name() or "").startswith("gw-")]
-        )
+
+        def relays():
+            return [
+                task
+                for task in asyncio.all_tasks()
+                if (task.get_name() or "").startswith("gw-") and not task.done()
+            ]
+
+        # Two relay tasks per call, one each way — waited for rather than
+        # sampled. Creating a task is not the same as the loop having run it,
+        # and a fixed pause here made this test fail under load while proving
+        # nothing about leaks. The waits are bounded, so a genuine leak still
+        # fails; only the guessing is gone.
+        await wait_until(lambda: len(relays()) == REALTIME_LIVE_CEILING * 2)
+        during = len(relays())
+
         for call in calls:
             await call.hang_up()
-        await asyncio.sleep(0.2)
-        after = len(
-            [
-                t
-                for t in asyncio.all_tasks()
-                if (t.get_name() or "").startswith("gw-") and not t.done()
-            ]
-        )
+
+        await wait_until(lambda: not relays())
+        after = len(relays())
         transports = [call.source._transport for call in calls]
         return during, after, transports
 

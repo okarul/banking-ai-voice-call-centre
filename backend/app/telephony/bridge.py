@@ -44,6 +44,7 @@ from app.agents import intents, speech
 from app.telephony import audio as codec
 from app.telephony.conversation import ConversationState
 from app.telephony.lifecycle import CallLifecycle, EndReason
+from app.telephony import reasons
 from app.telephony.media import BoundedAudioQueue, MediaTransport
 
 logger = logging.getLogger("app.telephony.bridge")
@@ -672,7 +673,7 @@ class PhoneCallBridge:
                     )
                     # The model session has gone, so this call cannot continue.
                     # Say so rather than leaving a silent call holding a slot.
-                    self._signal_lost()
+                    self._signal_lost(reasons.REALTIME_RUNTIME_FAILURE)
                     break
         except asyncio.CancelledError:
             raise
@@ -682,7 +683,7 @@ class PhoneCallBridge:
                 self.provider_call_id,
                 type(error).__name__,
             )
-            self._signal_lost()
+            self._signal_lost(reasons.MEDIA_FAILURE)
 
     async def _pump_model_to_caller(self) -> None:
         """Assistant audio, converted, back to this caller and no other."""
@@ -706,7 +707,7 @@ class PhoneCallBridge:
                 self.provider_call_id,
                 type(error).__name__,
             )
-            self._signal_lost()
+            self._signal_lost(reasons.MEDIA_FAILURE)
 
     # --- the media credential ------------------------------------------------
 
@@ -785,7 +786,7 @@ class PhoneCallBridge:
         self.last_activity = time.monotonic()
         return True
 
-    def _signal_lost(self) -> None:
+    def _signal_lost(self, cause: str = None) -> None:
         """Tell the owner this call has failed, exactly once.
 
         The task is deliberately **not** kept in `self._tasks`. Cleanup cancels
@@ -802,7 +803,11 @@ class PhoneCallBridge:
             return
         # Held in an attribute so it is not garbage collected mid-flight.
         self._lost_task = loop.create_task(
-            self._on_call_lost(self.provider_call_id, self.banking_session_id),
+            self._on_call_lost(
+                self.provider_call_id,
+                self.banking_session_id,
+                cause or reasons.MEDIA_FAILURE,
+            ),
             name=f"phone-lost-{self.provider_call_id}",
         )
 

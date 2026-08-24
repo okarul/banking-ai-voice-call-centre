@@ -184,6 +184,13 @@ class Settings:
         self.telephony_realtime_connect_timeout: int = _positive_int(
             os.getenv("TELEPHONY_REALTIME_CONNECT_TIMEOUT"), default=30
         )
+        # How long the gateway has to answer the protocol hello. Short: it is
+        # one small frame each way over a socket that has already connected, so
+        # a gateway that has not answered in this long is not going to. An
+        # infrastructure startup budget, not a limit on call length.
+        self.telephony_protocol_timeout: int = _positive_int(
+            os.getenv("TELEPHONY_PROTOCOL_TIMEOUT"), default=10
+        )
         # A call with no audio in either direction for this long is assumed
         # dead and cleaned up, so a provider that never sends an end event
         # cannot leak a capacity slot for ever.

@@ -25,6 +25,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Awaitable, Callable
 
 from app.realtime.context import BankingRealtimeContext
@@ -34,6 +35,65 @@ from app.sessions import SessionManager, SessionNotFoundError
 from app.sessions import session_manager as default_manager
 
 logger = logging.getLogger("app.realtime")
+
+
+class RealtimeStage(str, Enum):
+    """How far a model session got before it failed.
+
+    An operator reading "connection failed" cannot tell a wrong URL from an
+    expired key from a provider outage. The stage narrows it to one of four
+    places before they open anything else.
+    """
+
+    CONNECTING = "CONNECTING"
+    SESSION_CREATE = "SESSION_CREATE"
+    SESSION_CONFIGURE = "SESSION_CONFIGURE"
+    RUNNING = "RUNNING"
+
+
+# Provider error codes worth telling an operator apart, because each sends them
+# somewhere completely different. Matched against the close reason, which is the
+# only place the provider explains itself before hanging up.
+#
+# `credit_balance_exhausted` is here because it cost this project a live
+# deployment: the socket opened, the provider refused and closed, and the
+# application reported nothing but `ConnectionClosedError`. Standard API
+# connectivity checks returned 200 the whole time, so it looked like a code
+# defect for as long as the reason was being discarded.
+_PROVIDER_HINTS = (
+    "credit_balance_exhausted",
+    "insufficient_quota",
+    "invalid_api_key",
+    "account_deactivated",
+    "model_not_found",
+    "beta_api_shape_disabled",
+    "rate_limit_exceeded",
+)
+
+
+def describe_connection_failure(error: Exception) -> str:
+    """A safe one-line account of why a model session would not open.
+
+    Carries the exception type, the WebSocket close code, and — only when it
+    matches a known provider code — what the provider said. Never the URL,
+    never a header, never the key: a close reason is provider text, so it is
+    matched against a list rather than echoed.
+    """
+    parts = [type(error).__name__]
+
+    code = getattr(error, "code", None)
+    if isinstance(code, int):
+        parts.append(f"close={code}")
+
+    reason = getattr(error, "reason", None) or str(error)
+    if isinstance(reason, str):
+        lowered = reason.lower()
+        for hint in _PROVIDER_HINTS:
+            if hint in lowered:
+                parts.append(f"provider={hint}")
+                break
+
+    return " ".join(parts)
 
 
 class Reason:
@@ -342,12 +402,13 @@ class RealtimeManager:
             raise
         except Exception as error:
             # Nothing has been written to the banking session yet, so it is
-            # already intact. Do not leak the provider's error text.
+            # already intact.
             await self.release(banking_session_id)
             logger.error(
-                "realtime[%s] connection failed: %s",
+                "realtime[%s] connection failed at %s: %s",
                 banking_session_id,
-                type(error).__name__,
+                RealtimeStage.CONNECTING,
+                describe_connection_failure(error),
             )
             raise RealtimeSessionError(Reason.REALTIME_CONNECTION_FAILED) from error
 

@@ -7,10 +7,11 @@ reached through routers, never directly from this module.
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.observability.readiness import readiness_report
 from app.redaction import install_redaction
 from app.routers import (
     admin,
@@ -116,8 +117,31 @@ def create_app() -> FastAPI:
 
     @application.get("/health")
     def health() -> dict:
-        """Liveness check used by tooling and monitoring."""
+        """Liveness only: is this process answering?
+
+        Deliberately cheap and dependency-free. A liveness check that touches
+        the database restarts a healthy process during a database blip, which
+        turns one outage into two.
+        """
         return {"status": "ok"}
+
+    @application.get("/readiness")
+    def readiness(response: Response) -> dict:
+        """Whether this process can actually serve a call right now.
+
+        Separate from liveness because the answers lead to different actions:
+        liveness failing means restart me, readiness failing means do not send
+        me traffic yet. Reported per dependency so an operator can see which.
+
+        **No paid usage.** The model provider is reported from configuration
+        only — whether a key and a model are present — and never by opening a
+        realtime session. A readiness endpoint that cost money per call would
+        be one a monitoring system could bankrupt.
+        """
+        checks = readiness_report()
+        if not checks["ready"]:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return checks
 
     return application
 

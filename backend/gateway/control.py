@@ -28,6 +28,19 @@ from __future__ import annotations
 
 import json
 
+PROTOCOL_HELLO = "protocol_hello"
+PROTOCOL_READY = "protocol_ready"
+
+# What this gateway speaks. Must match the application's `PROTOCOL_VERSION`;
+# the two are checked against each other before a call carries conversation,
+# so a mismatched release refuses the call instead of hanging it.
+PROTOCOL_VERSION = 1
+FEATURE_PLAYBACK_ACK = "playback_ack"
+SUPPORTED_FEATURES = (FEATURE_PLAYBACK_ACK,)
+
+MAX_FEATURES = 16
+MAX_FEATURE_LENGTH = 32
+
 PLAYBACK_BOUNDARY = "playback_boundary"
 PLAYBACK_DRAINED = "playback_drained"
 
@@ -41,6 +54,58 @@ def playback_drained_message(boundary_id: str) -> str:
     return json.dumps({"type": PLAYBACK_DRAINED, "id": boundary_id})
 
 
+# A control frame is a handful of short words. Anything larger is not ours,
+# and parsing it would be doing unbounded work on behalf of whoever sent it.
+# The webhook has capped bodies since Phase 2; this path had no equivalent.
+MAX_CONTROL_BYTES = 4096
+
+
+def _too_large(text) -> bool:
+    return not isinstance(text, str) or len(text) > MAX_CONTROL_BYTES
+
+
+def protocol_ready_message() -> str:
+    """What this gateway is, in answer to the application's hello."""
+    return json.dumps(
+        {
+            "type": PROTOCOL_READY,
+            "version": PROTOCOL_VERSION,
+            "features": list(SUPPORTED_FEATURES),
+        }
+    )
+
+
+def read_protocol_message(text) -> tuple[str, int, tuple[str, ...]] | None:
+    """Parse a negotiation frame, or None if it is not one."""
+    if _too_large(text):
+        return None
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    kind = payload.get("type")
+    if kind not in (PROTOCOL_HELLO, PROTOCOL_READY):
+        return None
+
+    version = payload.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+        return None
+
+    features = payload.get("features")
+    if not isinstance(features, list) or len(features) > MAX_FEATURES:
+        return None
+    if not all(
+        isinstance(name, str) and 0 < len(name) <= MAX_FEATURE_LENGTH
+        for name in features
+    ):
+        return None
+
+    return kind, version, tuple(features)
+
+
 def read_control_message(text) -> tuple[str, str] | None:
     """Parse a control frame, or None if it is not one we recognise.
 
@@ -48,7 +113,7 @@ def read_control_message(text) -> tuple[str, str] | None:
     ours to act on, and guessing at it is how a media socket starts doing
     something other than carrying one call's audio.
     """
-    if not isinstance(text, str):
+    if _too_large(text):
         return None
     try:
         payload = json.loads(text)

@@ -36,7 +36,7 @@ from app.database.models import AgentSession, AgentToolEvent, ConversationMessag
 from app.realtime.browser_calls import voice_call_manager
 from app.sessions import session_manager
 from app.telephony import audio as codec
-from app.telephony import service
+from app.telephony import reasons, service
 from app.telephony.bridge import (
     GREETING_CUE,
     PhoneCallBridge,
@@ -685,7 +685,7 @@ def test_a_failed_model_session_leaves_no_call_behind(phone, monkeypatch):
 
     result = run(scenario())
 
-    assert result.outcome.value == "rejected_capacity"
+    assert result.outcome.value == "rejected_realtime_unavailable"
     assert phone_call_registry.active_count() == 0
     assert voice_call_manager.used_capacity() == 0
     assert session_manager.list_active_sessions() == []
@@ -704,7 +704,7 @@ def test_a_model_session_that_times_out_leaves_no_call_behind(phone, monkeypatch
 
     result = run(scenario())
 
-    assert result.outcome.value == "rejected_capacity"
+    assert result.outcome.value == "rejected_realtime_unavailable"
     assert phone_call_registry.active_count() == 0
     assert voice_call_manager.used_capacity() == 0
 
@@ -1517,12 +1517,21 @@ def test_a_websocket_call_is_not_greeted_before_the_gateway_attaches(
         before = bridge.greeted
 
         bridge.transport.attach(_FakeSocket())
-        await wait_until(lambda: bridge.greeted, timeout=2.0)
-        return before, bridge.greeted
+        during = bridge.greeted
 
-    before, after = run(scenario())
+        # Attached is not yet compatible. A real gateway answers the hello,
+        # and until one does the caller is not greeted — a call that cannot
+        # complete a turn is worse than a call that never starts.
+        from app.telephony.media import FEATURE_PLAYBACK_ACK, PROTOCOL_VERSION
+
+        bridge.transport.on_protocol_ready(PROTOCOL_VERSION, (FEATURE_PLAYBACK_ACK,))
+        await wait_until(lambda: bridge.greeted, timeout=2.0)
+        return before, during, bridge.greeted
+
+    before, during, after = run(scenario())
 
     assert before is False, "greeted before the gateway attached"
+    assert during is False, "greeted before the gateway agreed a protocol"
     assert after is True, "never greeted after the gateway attached"
 
 
@@ -1550,6 +1559,11 @@ def test_a_call_refused_for_a_non_capacity_reason_says_so(phone, monkeypatch):
     so a model session that would not open was recorded as a bank at capacity —
     the opposite of the diagnosis, sending an operator to look at the wrong
     thing entirely.
+
+    The database reason was fixed first; the *outcome* still said capacity,
+    because there was no other outcome to say. That is what the gateway logs,
+    so `refused by the bank: rejected_capacity` was what an operator actually
+    saw while a provider was refusing every session. Both now agree.
     """
 
     async def explode(_context):
@@ -1562,13 +1576,16 @@ def test_a_call_refused_for_a_non_capacity_reason_says_so(phone, monkeypatch):
 
     result = run(scenario())
 
-    assert result.outcome.value == "rejected_capacity"
+    assert result.outcome.value == "rejected_realtime_unavailable"
     with session_scope() as db:
         row = db.scalars(
             select(AgentSession).where(AgentSession.provider_call_id == "call-not-full")
         ).one()
     assert row.status == "REJECTED"
-    assert row.disconnect_reason == "UNAVAILABLE"
+    # Phase 6.8 named this precisely: `UNAVAILABLE` said something had gone
+    # wrong without saying what, and every failure path shared it. A model
+    # session that would not open is now its own category.
+    assert row.disconnect_reason == reasons.REALTIME_START_FAILURE
 
 
 def test_a_call_refused_because_the_bank_is_full_says_that(phone):

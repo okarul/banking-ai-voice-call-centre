@@ -46,11 +46,14 @@ from app.observability import recorder
 from app.observability.events import AuditEvent, safe_event
 from app.telephony import service
 from app.telephony.bridge import phone_call_registry
+from app.telephony import reasons
 from app.telephony.channels import Channel
 from app.telephony.media import (
     PLAYBACK_DRAINED,
+    PROTOCOL_READY,
     WebSocketMediaTransport,
     read_control_message,
+    read_protocol_message,
 )
 from app.telephony.schemas import InboundCallEvent, InboundEventAccepted
 from app.telephony.signature import (
@@ -244,6 +247,10 @@ async def media_socket(websocket: WebSocket, provider_call_id: str) -> None:
 
     await websocket.accept()
     transport.attach(websocket)
+    # Before anything conversational depends on it, ask what the far end
+    # speaks. The answer arrives on the loop below; `start_phone_call` waits
+    # for it and gives the call up if it never comes or does not fit.
+    await transport.send_protocol_hello()
     logger.info(
         "telephony media attached: %s",
         safe_event(
@@ -270,8 +277,16 @@ async def media_socket(websocket: WebSocket, provider_call_id: str) -> None:
             if text is None:
                 continue
 
-            # Text is control, never audio. Only this call's bridge is ever
-            # told, so a frame on one socket cannot affect another call.
+            # Text is control, never audio. Only this call's bridge and this
+            # call's transport are ever told, so a frame on one socket cannot
+            # affect another call.
+            negotiation = read_protocol_message(text)
+            if negotiation is not None:
+                kind, version, features = negotiation
+                if kind == PROTOCOL_READY:
+                    transport.on_protocol_ready(version, features)
+                continue
+
             control = read_control_message(text)
             if control is None:
                 # Unknown or malformed. Ignored rather than fatal: a frame we
@@ -296,7 +311,13 @@ async def media_socket(websocket: WebSocket, provider_call_id: str) -> None:
         # idempotent, so an end event arriving at the same moment is harmless.
         await service.tear_down(provider_call_id, bridge.banking_session_id)
         try:
-            recorder.close_phone_call(provider_call_id, reason="CUSTOMER_ENDED")
+            # Only recorded if nothing else closed this call first — the update
+            # moves the row `WHERE ended_at IS NULL`. So a goodbye, a silence
+            # close or a failure keeps its own reason, and a socket closing is
+            # read as a caller hang-up only when it genuinely was one.
+            recorder.close_phone_call(
+                provider_call_id, reason=reasons.CALLER_HANGUP
+            )
         except Exception as error:
             # This runs in a `finally`. An observability failure here would
             # replace whatever actually ended the call, and the call is already

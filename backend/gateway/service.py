@@ -29,8 +29,11 @@ from gateway.client import AcceptedCall, BackendClient, BackendUnavailable, Call
 from gateway.config import GatewaySettings, gateway_settings
 from gateway.control import (
     PLAYBACK_BOUNDARY,
+    PROTOCOL_HELLO,
     playback_drained_message,
+    protocol_ready_message,
     read_control_message,
+    read_protocol_message,
 )
 from gateway.sources import FRAME_BYTES, SILENCE, CallSource
 
@@ -243,6 +246,12 @@ class MediaGateway:
         audio on the same socket. Both are small, unfragmented messages, which
         the websockets library writes as complete frames; they cannot interleave.
         """
+        negotiation = read_protocol_message(message)
+        if negotiation is not None:
+            if negotiation[0] == PROTOCOL_HELLO:
+                await self._answer_hello(socket)
+            return next_send
+
         control = read_control_message(message)
         if control is None:
             return next_send
@@ -258,6 +267,20 @@ class MediaGateway:
             # The call ended while we were answering. Nothing to report to.
             pass
         return next_send
+
+    @staticmethod
+    async def _answer_hello(socket) -> None:
+        """Say what this gateway speaks, so the bank can refuse a mismatch.
+
+        Answered unconditionally: deciding compatibility is the application's
+        business, because it is the one that would hang waiting for something
+        this gateway does not send. All this end does is state the truth about
+        itself and let the other end judge.
+        """
+        try:
+            await socket.send(protocol_ready_message())
+        except websockets.exceptions.ConnectionClosed:
+            return
 
     @staticmethod
     async def _play_final_frame(

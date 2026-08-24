@@ -13,6 +13,7 @@ All customers and PINs here are synthetic seed data.
 """
 
 import array
+import contextlib
 import asyncio
 import json
 import time
@@ -30,7 +31,9 @@ from app.sessions import session_manager
 from app.telephony import audio as codec
 from app.telephony import service
 from app.routers.telephony import MEDIA_TOKEN_HEADER
+from app.telephony.media import PROTOCOL_HELLO, read_protocol_message
 from app.telephony.bridge import phone_call_registry
+from gateway import control as gateway_control
 from app.telephony.signature import SIGNATURE_HEADER, TIMESTAMP_HEADER, sign_payload
 
 TEST_SECRET = "phase3-media-socket-test-secret-not-a-real-credential"
@@ -81,11 +84,19 @@ def clean_state():
 
     TOKENS.clear()
     wipe()
+    # A clean slate, waited for rather than assumed. These tests drive a server
+    # running its own event loop in another thread, and `start_phone_call` is a
+    # background task on it with a media-attach budget of its own. Tearing down
+    # from a fresh loop here does not make that task finish, so without this a
+    # test could begin while the previous call was still holding its slot — and
+    # fail on a capacity assertion that had nothing to do with it.
+    until(lambda: voice_call_manager.used_capacity() == 0)
     yield
     TOKENS.clear()
     asyncio.run(phone_call_registry.close_all())
     asyncio.run(voice_call_manager.close_all())
     asyncio.run(voice_call_manager.release_all())
+    until(lambda: voice_call_manager.used_capacity() == 0)
     session_manager.clear()
     wipe()
 
@@ -147,14 +158,49 @@ def announce(client, call_id: str) -> dict:
     return accepted
 
 
-def media(client, call_id: str, *, token: str | None = ...):
-    """Attach a media socket the way the gateway does: with its credential."""
+@contextlib.contextmanager
+def media(client, call_id: str, *, token: str | None = ..., negotiate: bool = True):
+    """Attach a media socket the way the gateway does.
+
+    Credential first, then the protocol handshake. The handshake is part of
+    attaching, not an extra: the application asks what the far end speaks and
+    will not greet a caller until it has an answer it can work with. A test
+    socket that skipped it would be standing in for a gateway this project
+    deliberately refuses.
+
+    `negotiate=False` is for the tests that expect the socket to be turned
+    away before any of this — there is nothing to answer when the credential
+    was the problem.
+    """
     if token is ...:
         token = TOKENS.get(call_id)
     headers = {MEDIA_TOKEN_HEADER: token} if token else {}
-    return client.websocket_connect(
+    with client.websocket_connect(
         f"/api/telephony/media/{call_id}", headers=headers
-    )
+    ) as socket:
+        if negotiate:
+            hello = read_protocol_message(socket.receive_text())
+            assert hello is not None, "the application did not open with a hello"
+            assert hello[0] == PROTOCOL_HELLO
+            socket.send_text(gateway_control.protocol_ready_message())
+        yield socket
+
+
+def until(predicate, *, timeout: float = 10.0) -> bool:
+    """Wait for something to become true, or give up and let the test fail.
+
+    These are synchronous tests watching work done on the server's event loop,
+    so waiting is unavoidable. What is avoidable is guessing how long: a fixed
+    two-second budget made several of these fail under load while proving
+    nothing, because the thing being waited for had not stopped working — it
+    had merely not happened yet. Bounded, so a genuine leak still fails.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
 
 
 def frame(seed: int = 1) -> bytes:
@@ -171,10 +217,7 @@ def test_a_socket_attaches_to_an_announced_call(client, sessions):
     with media(client, "call-ws") as socket:
         socket.send_bytes(frame())
         # The frame reaches this call's model session, converted on the way.
-        for _ in range(200):
-            if sessions[0].audio_chunks:
-                break
-            time.sleep(0.01)
+        until(lambda: sessions[0].audio_chunks)
 
     assert len(sessions[0].audio_chunks) == 1
     assert len(sessions[0].audio_chunks[0]) == codec.ULAW_FRAME_BYTES * 2 * 3
@@ -231,10 +274,7 @@ def test_two_calls_each_get_their_own_socket_and_audio(client, sessions):
         with media(client, "call-y") as socket_y:
             socket_x.send_bytes(frame(1))
             socket_y.send_bytes(frame(2))
-            for _ in range(200):
-                if all(session.audio_chunks for session in sessions[:2]):
-                    break
-                time.sleep(0.01)
+            until(lambda: all(session.audio_chunks for session in sessions[:2]))
 
             # Checked while both are live: closing either socket ends its call,
             # so after the `with` blocks the registry is legitimately empty.
@@ -265,10 +305,7 @@ def test_a_text_message_on_the_media_socket_is_ignored(client, sessions):
     with media(client, "call-text") as socket:
         socket.send_text(json.dumps({"event": "hangup", "customer_id": "DEMO001"}))
         socket.send_bytes(frame())
-        for _ in range(200):
-            if sessions[0].audio_chunks:
-                break
-            time.sleep(0.01)
+        until(lambda: sessions[0].audio_chunks)
 
     assert len(sessions[0].audio_chunks) == 1
     with session_scope() as db:
@@ -286,10 +323,7 @@ def test_the_caller_going_away_releases_the_call(client, sessions):
     with media(client, "call-bye"):
         pass
 
-    for _ in range(200):
-        if voice_call_manager.used_capacity() == 0:
-            break
-        time.sleep(0.01)
+    until(lambda: voice_call_manager.used_capacity() == 0)
 
     assert voice_call_manager.used_capacity() == 0
     assert phone_call_registry.active_count() == 0
@@ -369,10 +403,7 @@ def test_the_caller_is_greeted_when_the_gateway_attaches(client, sessions):
     assert sessions[0].messages == []
 
     with media(client, "call-greet"):
-        for _ in range(200):
-            if bridge.greeted:
-                break
-            time.sleep(0.01)
+        until(lambda: bridge.greeted)
 
     assert bridge.greeted is True
     assert sessions[0].messages == [GREETING_CUE]
@@ -386,10 +417,7 @@ def test_two_attached_callers_are_greeted_once_each(client, sessions):
 
     with media(client, "call-g1"):
         with media(client, "call-g2"):
-            for _ in range(200):
-                if all(s.messages for s in sessions[:2]):
-                    break
-                time.sleep(0.01)
+            until(lambda: all(s.messages for s in sessions[:2]))
             greeted = [
                 phone_call_registry.get("call-g1").greeted,
                 phone_call_registry.get("call-g2").greeted,
@@ -409,10 +437,7 @@ def test_a_reattaching_socket_does_not_greet_again(client, sessions):
     announce(client, "call-reattach")
 
     with media(client, "call-reattach"):
-        for _ in range(200):
-            if sessions[0].messages:
-                break
-            time.sleep(0.01)
+        until(lambda: sessions[0].messages)
 
     # The first socket closing ended the call, so a second attach is refused
     # outright — and in either case only one greeting was ever spoken.
@@ -511,10 +536,7 @@ def test_a_second_socket_cannot_hijack_a_live_call(client, sessions):
 
         # The original socket still works: the hijack attempt changed nothing.
         first.send_bytes(frame())
-        for _ in range(200):
-            if sessions[0].audio_chunks:
-                break
-            time.sleep(0.01)
+        until(lambda: sessions[0].audio_chunks)
 
     assert len(sessions[0].audio_chunks) == 1
 
@@ -644,10 +666,7 @@ def test_the_media_socket_closes_when_the_application_ends_the_call(client, sess
 
     with media(client, "call-append") as socket:
         socket.send_bytes(frame())
-        for _ in range(200):
-            if sessions[0].audio_chunks:
-                break
-            time.sleep(0.01)
+        until(lambda: sessions[0].audio_chunks)
 
         # The bank finishes with the call, exactly as the lifecycle does.
         asyncio.run(service.tear_down("call-append", bridge.banking_session_id))
@@ -711,10 +730,7 @@ def test_a_caller_hangup_still_works_unchanged(client, sessions):
     with media(client, "call-hangup"):
         pass  # the caller goes away
 
-    for _ in range(200):
-        if voice_call_manager.used_capacity() == 0:
-            break
-        time.sleep(0.01)
+    until(lambda: voice_call_manager.used_capacity() == 0)
 
     assert voice_call_manager.used_capacity() == 0
     assert phone_call_registry.active_count() == 0
@@ -733,10 +749,7 @@ def test_an_application_ended_call_leaks_nothing(client, sessions):
     with media(client, "call-noleak"):
         asyncio.run(service.tear_down("call-noleak", banking_session_id))
 
-    for _ in range(200):
-        if voice_call_manager.used_capacity() == 0:
-            break
-        time.sleep(0.01)
+    until(lambda: voice_call_manager.used_capacity() == 0)
 
     assert phone_call_registry.active_count() == 0
     assert voice_call_manager.used_capacity() == 0
@@ -762,10 +775,7 @@ def test_ending_one_call_does_not_close_another_callers_socket(client, sessions)
 
             # The survivor is untouched and still carrying audio.
             socket_two.send_bytes(frame(2))
-            for _ in range(200):
-                if len(sessions) > 1 and sessions[1].audio_chunks:
-                    break
-                time.sleep(0.01)
+            until(lambda: len(sessions) > 1 and sessions[1].audio_chunks)
 
             survivor = phone_call_registry.get("call-two")
             assert survivor is not None

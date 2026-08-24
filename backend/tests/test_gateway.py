@@ -42,6 +42,14 @@ TEST_SECRET = "gateway-suite-shared-secret-not-a-real-credential"
 # === a real backend on a real port ==========================================
 
 
+class _Sessions(list):
+    """Model sessions made during a test, by creation order and by identity."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.by_banking_session: dict[str, "MockRealtimeSession"] = {}
+
+
 class MockRealtimeSession:
     """Stands in for the paid Realtime session. Opens no socket, costs nothing."""
 
@@ -132,12 +140,21 @@ def backend():
 
 @pytest.fixture
 def sessions(monkeypatch):
-    """Mocked model sessions, one per call, in creation order."""
-    made: list[MockRealtimeSession] = []
+    """Mocked model sessions, one per call.
 
-    async def connect(_context):
+    Creation order is kept for the tests that only count sessions, but it is
+    not an identity: five calls started with `asyncio.gather` connect in
+    whatever order the loop runs them, so position says nothing about which
+    call a session belongs to. `by_banking_session` is the real mapping — the
+    id the connector is handed, and the one the database records against the
+    provider's call id.
+    """
+    made = _Sessions()
+
+    async def connect(context):
         session = MockRealtimeSession()
         made.append(session)
+        made.by_banking_session[context.session_id] = session
         return session
 
     monkeypatch.setattr(telephony_service, "open_phone_realtime_session", connect)
@@ -513,14 +530,36 @@ def test_five_concurrent_calls_keep_their_audio_to_themselves(gateway, sessions,
 
     run(scenario())
 
+    # Which session belongs to which call is looked up, not assumed. The
+    # calls are started concurrently, so creation order is arbitrary; the
+    # database holds the real mapping from provider call id to banking session
+    # id, and the connector was handed that same banking session id.
+    with session_scope() as db:
+        call_of_session = {
+            row.banking_session_id: row.provider_call_id
+            for row in db.scalars(select(AgentSession))
+            if row.banking_session_id is not None
+        }
+    session_of_call = {
+        call_id: sessions.by_banking_session[banking_id]
+        for banking_id, call_id in call_of_session.items()
+        if banking_id in sessions.by_banking_session
+    }
+
+    assert len(session_of_call) == APPLICATION_TARGET, (
+        f"expected {APPLICATION_TARGET} calls, mapped {len(session_of_call)}"
+    )
+
     # Each model session received exactly one frame, and it was its own caller's.
     for n in range(APPLICATION_TARGET):
-        session = sessions[n]
+        session = session_of_call[f"iso-{n}"]
         assert len(session.audio_chunks) == 1, f"call {n} got {len(session.audio_chunks)}"
+        assert session.audio_chunks[0] == codec.telephony_to_model(frames[n]), (
+            f"call {n} heard another caller"
+        )
+
     delivered = {bytes(s.audio_chunks[0]) for s in sessions}
     assert len(delivered) == APPLICATION_TARGET, "two callers' audio was identical"
-    for n in range(APPLICATION_TARGET):
-        assert sessions[n].audio_chunks[0] == codec.telephony_to_model(frames[n])
 
 
 def test_assistant_audio_returns_only_to_its_own_caller(gateway, sessions, run):
