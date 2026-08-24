@@ -786,7 +786,7 @@ class PhoneCallBridge:
         self.last_activity = time.monotonic()
         return True
 
-    def _signal_lost(self, cause: str = None) -> None:
+    def _signal_lost(self, cause: str | None = None) -> None:
         """Tell the owner this call has failed, exactly once.
 
         The task is deliberately **not** kept in `self._tasks`. Cleanup cancels

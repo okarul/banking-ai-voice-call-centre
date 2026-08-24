@@ -80,7 +80,20 @@ MAX_CONTROL_BYTES = 4096
 
 
 def _too_large(text) -> bool:
-    return not isinstance(text, str) or len(text) > MAX_CONTROL_BYTES
+    if not isinstance(text, str):
+        return True
+    # The cap is in bytes, so it is measured in bytes. `len` on a `str` counts
+    # code points, which for the ASCII control frames this actually carries is
+    # the same number — but a multibyte frame would have been four times the
+    # advertised limit before anything rejected it, which is exactly the
+    # unbounded work the cap exists to prevent.
+    #
+    # The character count is checked first purely as a cheap lower bound: a
+    # string too long in characters is certainly too long in bytes, and
+    # rejecting it there keeps the encode below bounded to a small string.
+    if len(text) > MAX_CONTROL_BYTES:
+        return True
+    return len(text.encode("utf-8")) > MAX_CONTROL_BYTES
 
 
 def playback_boundary_message(boundary_id: str) -> str:
@@ -545,7 +558,15 @@ class WebSocketMediaTransport:
         mismatched release; the right version without `playback_ack` is a
         gateway that would never answer a playback boundary, which is the hang
         this negotiation exists to prevent.
+
+        Answered once. A well-behaved gateway sends one `protocol_ready` per
+        hello, but a replayed or repeated frame would otherwise overwrite the
+        peer version an operator is reading and log a protocol error against a
+        call that is running perfectly well.
         """
+        if self._negotiated.is_set():
+            return self._compatible
+
         self._peer_version = version
         missing = [name for name in REQUIRED_FEATURES if name not in features]
 

@@ -29,6 +29,7 @@ from app.telephony.media import (
     PROTOCOL_VERSION,
     WebSocketMediaTransport,
     protocol_hello_message,
+    protocol_ready_message,
     read_protocol_message,
 )
 from gateway import control as gateway_protocol
@@ -153,6 +154,37 @@ def test_an_overlong_feature_name_is_rejected():
     assert read_protocol_message(payload) is None
 
 
+def test_the_size_cap_is_measured_in_bytes_at_both_ends():
+    """A cap named in bytes has to be enforced in bytes.
+
+    `len` on a `str` counts code points, so a multibyte frame could be four
+    times the advertised limit before anything rejected it — the unbounded
+    parse the cap exists to prevent. Both ends must apply the identical rule,
+    or one accepts a frame the other refuses and the protocol has quietly
+    diverged.
+    """
+    from app.telephony.media import MAX_CONTROL_BYTES, _too_large
+    from gateway.control import MAX_CONTROL_BYTES as GATEWAY_MAX
+    from gateway.control import _too_large as gateway_too_large
+
+    assert MAX_CONTROL_BYTES == GATEWAY_MAX
+
+    # Comfortably under the cap in characters, far over it in bytes.
+    multibyte = "一" * (MAX_CONTROL_BYTES - 1)
+    assert len(multibyte) < MAX_CONTROL_BYTES
+    assert len(multibyte.encode("utf-8")) > MAX_CONTROL_BYTES
+
+    assert _too_large(multibyte) is True
+    assert gateway_too_large(multibyte) is True
+
+    # And an ordinary ASCII frame is still accepted by both.
+    ordinary = protocol_ready_message()
+    assert _too_large(ordinary) is False
+    assert gateway_too_large(ordinary) is False
+    assert read_protocol_message(ordinary) is not None
+    assert gateway_protocol.read_protocol_message(ordinary) is not None
+
+
 # === the transport's half ===================================================
 
 
@@ -243,6 +275,43 @@ def test_a_late_bad_answer_cannot_undo_an_agreed_protocol():
 
     assert agreed is True
     assert still is True, "a stray frame downgraded a working call"
+
+
+def test_a_late_bad_answer_leaves_the_reported_version_alone():
+    """Not just harmless — invisible.
+
+    Compatibility could not regress, but the stray frame still overwrote the
+    version an operator reads and logged a protocol error against a call that
+    was running perfectly well. A negotiation whose job is legibility should
+    not be a source of false alarms.
+    """
+    import logging
+
+    transport, _ = attached()
+
+    async def scenario():
+        transport.on_protocol_ready(*ready())
+        await transport.wait_for_protocol(timeout=1.0)
+        transport.on_protocol_ready(*ready(version=99))
+        return transport.peer_version
+
+    logger = logging.getLogger("app.telephony.media")
+    records: list[logging.LogRecord] = []
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = Collect()
+    logger.addHandler(handler)
+    try:
+        peer = run(scenario())
+    finally:
+        logger.removeHandler(handler)
+
+    assert peer == PROTOCOL_VERSION, f"reported version became {peer}"
+    errors = [r for r in records if r.levelno >= logging.ERROR]
+    assert errors == [], f"a healthy call logged {[r.getMessage() for r in errors]}"
 
 
 def test_a_call_that_ends_while_negotiating_releases_the_waiter():

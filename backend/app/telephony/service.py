@@ -85,6 +85,10 @@ class Outcome(str, Enum):
     # and the one true fact — that nothing was wrong with capacity at all —
     # never reached anybody.
     REJECTED_REALTIME_UNAVAILABLE = "rejected_realtime_unavailable"
+    # And the audio path failing is not a busy switchboard either. Same
+    # reasoning as above, applied to the other supplier: an operator reading
+    # this needs to know whether to look at the model provider or the gateway.
+    REJECTED_MEDIA_UNAVAILABLE = "rejected_media_unavailable"
     ENDED = "ended"
     ALREADY_ENDED = "already_ended"
     UNKNOWN_CALL = "unknown_call"
@@ -147,8 +151,16 @@ async def _on_call_ended(
     logger.info(
         "telephony call ended: %s (%s -> %s)", provider_call_id, reason, recorded
     )
-    await tear_down(provider_call_id, banking_session_id)
+    # Recorded *before* the teardown, and the order is load-bearing. Tearing
+    # down closes the media socket, which is exactly what wakes the media
+    # route's `finally` — and that writes `CALLER_HANGUP`. Both writers move
+    # the row `WHERE ended_at IS NULL`, so whichever arrives first wins for
+    # ever. Reversed, a goodbye would be recorded as a hang-up whenever the
+    # loop happened to schedule the route first, and an operator would be told
+    # the caller rang off in the middle of the bank's own closing line.
+    # This call is synchronous, so nothing can interleave before it commits.
     recorder.close_phone_call(provider_call_id, reason=recorded)
+    await tear_down(provider_call_id, banking_session_id)
 
 
 async def _on_call_lost(
@@ -163,8 +175,11 @@ async def _on_call_lost(
     for the idle sweep to notice a silent call.
     """
     logger.warning("telephony call lost: %s (%s)", provider_call_id, cause)
-    await tear_down(provider_call_id, banking_session_id)
+    # Before the teardown, for the reason given in `_on_call_ended`: the
+    # teardown wakes the media route, and the route would otherwise record
+    # this failure as a caller hang-up.
     recorder.close_phone_call(provider_call_id, reason=cause)
+    await tear_down(provider_call_id, banking_session_id)
 
 
 async def _open_conversation(bridge: PhoneCallBridge) -> None:
@@ -193,10 +208,13 @@ async def _open_conversation(bridge: PhoneCallBridge) -> None:
             # The call ended by itself while we waited. Nothing to give up on.
             return
         logger.warning("telephony media never attached: %s", bridge.provider_call_id)
-        await tear_down(bridge.provider_call_id, bridge.banking_session_id)
+        # Recorded before the teardown. No socket ever attached here, so there
+        # is no route to race with today — but the ordering is the same at
+        # every site so that none of them has to be reasoned about separately.
         recorder.mark_phone_call_rejected(
             bridge.provider_call_id, reason=reasons.MEDIA_ATTACH_TIMEOUT
         )
+        await tear_down(bridge.provider_call_id, bridge.banking_session_id)
         return
 
     # The socket is attached, but attached is not compatible. A gateway that
@@ -216,10 +234,15 @@ async def _open_conversation(bridge: PhoneCallBridge) -> None:
             bridge.provider_call_id,
             getattr(bridge.transport, "peer_version", None),
         )
-        await tear_down(bridge.provider_call_id, bridge.banking_session_id)
+        # Before the teardown, and here it matters most of all: a socket *is*
+        # attached, so the route is live and blocked on `receive()`. Tearing
+        # down first would let it record `CUSTOMER_ENDED` and flip the row from
+        # REJECTED to COMPLETED — a refused call reported as a finished one,
+        # which is the single most misleading thing this table could say.
         recorder.mark_phone_call_rejected(
             bridge.provider_call_id, reason=reasons.PROTOCOL_MISMATCH
         )
+        await tear_down(bridge.provider_call_id, bridge.banking_session_id)
         return
 
     await bridge.greet()
@@ -247,10 +270,15 @@ async def sweep_idle_calls() -> int:
         if now - bridge.last_activity < timeout:
             continue
         logger.info("telephony call idle, closing: %s", bridge.provider_call_id)
-        await tear_down(bridge.provider_call_id, bridge.banking_session_id)
+        # Recorded before the teardown, like every other ending. A gateway that
+        # vanished without closing its socket leaves the route still attached,
+        # so tearing down first would wake it and let `CUSTOMER_ENDED` land on
+        # a call that no caller was on — which is the one thing an idle sweep
+        # exists to be able to say.
         recorder.close_phone_call(
             bridge.provider_call_id, reason=reasons.IDLE_TIMEOUT
         )
+        await tear_down(bridge.provider_call_id, bridge.banking_session_id)
         closed += 1
     return closed
 
@@ -348,9 +376,9 @@ async def _register_incoming(payload: InboundCallEvent) -> EventResult:
             and error.reason == Reason.REALTIME_AT_CAPACITY
         )
         if at_capacity:
-            reason = "CAPACITY_REJECTED"
+            reason = reasons.CAPACITY_REJECTED
         elif isinstance(error, asyncio.TimeoutError):
-            reason = "REALTIME_TIMEOUT"
+            reason = reasons.REALTIME_TIMEOUT
         else:
             reason = reasons.REALTIME_START_FAILURE
         if not at_capacity:
@@ -386,14 +414,24 @@ async def _register_incoming(payload: InboundCallEvent) -> EventResult:
     try:
         await bridge.start()
     except Exception as error:
-        await tear_down(payload.provider_call_id, session.session_id)
+        # Recorded before the teardown, like every other refusal path.
         recorder.mark_phone_call_rejected(
-            payload.provider_call_id, reason="MEDIA_UNAVAILABLE"
+            payload.provider_call_id, reason=reasons.MEDIA_UNAVAILABLE
         )
+        await tear_down(payload.provider_call_id, session.session_id)
         logger.error("telephony media failed to start: %s", type(error).__name__)
-        _audit(AuditEvent.CALL_REJECTED, payload, reason="MEDIA_UNAVAILABLE")
+        _audit(
+            AuditEvent.CALL_REJECTED, payload, reason=reasons.MEDIA_UNAVAILABLE
+        )
+        # Not `REJECTED_CAPACITY`. The audio path failing has nothing to do
+        # with how many calls are in progress, and reporting it as a full
+        # switchboard is the same mistake this phase fixed on the realtime
+        # path: it sends an operator to look at capacity while the database
+        # row says the media failed.
         return EventResult(
-            Outcome.REJECTED_CAPACITY, payload.provider_event_id, agent_session_id
+            Outcome.REJECTED_MEDIA_UNAVAILABLE,
+            payload.provider_event_id,
+            agent_session_id,
         )
 
     # Waits for the caller's audio path, then greets them. Exits by itself when
@@ -442,8 +480,15 @@ async def _end_call(payload: InboundCallEvent) -> EventResult:
     cannot reach another caller's session, and it cannot release a slot that
     this call does not hold.
     """
+    # `PROVIDER_ENDED`, not `CUSTOMER_ENDED`. This handler runs on the
+    # provider's `ended` webhook — the carrier telling us the call is over —
+    # which is precisely what `PROVIDER_HANGUP` was defined to mean and, until
+    # now, nothing wrote. A caller who physically hangs up is still recorded as
+    # `CALLER_HANGUP`, because the media socket closes the moment the SIP BYE
+    # lands and that path reaches the recorder first; the `WHERE ended_at IS
+    # NULL` predicate makes whichever noticed first the one that stands.
     banking_session_id = recorder.close_phone_call(
-        payload.provider_call_id, reason="CUSTOMER_ENDED"
+        payload.provider_call_id, reason=reasons.PROVIDER_HANGUP
     )
 
     if banking_session_id is None:
@@ -457,5 +502,5 @@ async def _end_call(payload: InboundCallEvent) -> EventResult:
     # that closed this call, and therefore the one that may hand the slot back.
     await tear_down(payload.provider_call_id, banking_session_id)
 
-    _audit(AuditEvent.CALL_ENDED, payload, reason="CUSTOMER_ENDED")
+    _audit(AuditEvent.CALL_ENDED, payload, reason=reasons.PROVIDER_HANGUP)
     return EventResult(Outcome.ENDED, payload.provider_event_id)

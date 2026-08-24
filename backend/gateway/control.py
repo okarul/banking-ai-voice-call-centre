@@ -61,7 +61,14 @@ MAX_CONTROL_BYTES = 4096
 
 
 def _too_large(text) -> bool:
-    return not isinstance(text, str) or len(text) > MAX_CONTROL_BYTES
+    # Byte-for-byte the same rule as the application's `media._too_large`. The
+    # two ends must agree on what is too large, or one accepts a frame the
+    # other refuses and the protocol has silently diverged.
+    if not isinstance(text, str):
+        return True
+    if len(text) > MAX_CONTROL_BYTES:
+        return True
+    return len(text.encode("utf-8")) > MAX_CONTROL_BYTES
 
 
 def protocol_ready_message() -> str:

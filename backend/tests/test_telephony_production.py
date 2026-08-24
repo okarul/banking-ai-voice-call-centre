@@ -132,6 +132,61 @@ def test_realtime_and_media_failures_are_told_apart():
     assert reasons.REALTIME_RUNTIME_FAILURE != reasons.MEDIA_FAILURE
 
 
+def test_the_admission_refusals_are_in_the_vocabulary():
+    """`ALL` claims to be exhaustive, so the refusals have to be in it.
+
+    These three are written by the admission path rather than by an ending,
+    and were therefore missed when the vocabulary was assembled. An operator
+    building a dashboard filter by enumerating `ALL` would have had three live
+    categories silently absent from the board.
+    """
+    for name in ("CAPACITY_REJECTED", "REALTIME_TIMEOUT", "MEDIA_UNAVAILABLE"):
+        assert hasattr(reasons, name), f"no reason named {name}"
+        assert getattr(reasons, name) in reasons.ALL, f"{name} is outside ALL"
+
+
+def test_every_reason_the_service_can_persist_is_in_the_vocabulary():
+    """The claim `ALL` makes, checked against the code rather than a list.
+
+    Every string literal this module hands to the recorder should be a member
+    of the vocabulary. Reading them out of the source is crude, but it is the
+    only version of this assertion that keeps working when somebody adds a
+    fifth refusal path and forgets this file exists.
+    """
+    import ast
+    from pathlib import Path
+
+    persisting = {"close_phone_call", "mark_phone_call_rejected"}
+    tree = ast.parse(Path(service.__file__).read_text(encoding="utf-8"))
+
+    literals = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        called = getattr(node.func, "attr", None)
+        if called not in persisting:
+            continue
+        for keyword in node.keywords:
+            # Only bare strings. A `reasons.X` reference is correct by
+            # construction and needs no checking.
+            if keyword.arg == "reason" and isinstance(keyword.value, ast.Constant):
+                literals.add(keyword.value.value)
+
+    outside = {value for value in literals if value not in reasons.ALL}
+    assert not outside, f"persisted outside the vocabulary: {sorted(outside)}"
+
+
+def test_historical_values_are_recorded_rather_than_dropped():
+    """Renaming a reason does not rewrite the rows already carrying it."""
+    assert reasons.HISTORICAL["SILENCE_TIMEOUT"] == reasons.IDLE_TIMEOUT
+    for old in reasons.HISTORICAL:
+        assert old not in reasons.ALL, f"{old} is historical, not current"
+    # One value covered two events, so it resolves to neither. Saying so is
+    # more useful than inventing a precision the row never had.
+    assert "PROVIDER_FAILURE" in reasons.AMBIGUOUS_HISTORICAL
+    assert "PROVIDER_FAILURE" not in reasons.HISTORICAL
+
+
 def test_a_goodbye_records_caller_goodbye(phone):
     async def scenario():
         result = await service.handle_event(event("say-bye"))
@@ -222,6 +277,88 @@ def test_an_ending_already_recorded_is_not_overwritten_by_the_socket(phone):
 
     assert second is None, "a closed call was closed again"
     assert row("keeps-reason").disconnect_reason == reasons.CALLER_GOODBYE
+
+
+def test_the_authoritative_reason_is_written_before_the_teardown(phone):
+    """The ordering itself, asserted rather than assumed.
+
+    `tear_down` is what closes the media socket and so what wakes the route
+    that would record a hang-up. Recording after it was a race; recording
+    before it is not. This pins the order at the unit level — the same
+    property is proved against a real socket in
+    `test_telephony_disconnect_reasons.py`.
+    """
+    from app.observability import recorder
+
+    order: list[str] = []
+    real_close = recorder.close_phone_call
+    real_tear_down = service.tear_down
+
+    def watched_close(call_id, reason):
+        order.append(f"record:{reason}")
+        return real_close(call_id, reason=reason)
+
+    async def watched_tear_down(call_id, banking_session_id):
+        order.append("tear_down")
+        return await real_tear_down(call_id, banking_session_id)
+
+    async def scenario():
+        await service.handle_event(event("ordered"))
+        bridge = phone_call_registry.get("ordered")
+        service.recorder.close_phone_call = watched_close
+        service.tear_down = watched_tear_down
+        try:
+            await service._on_call_ended(
+                "ordered", bridge.banking_session_id, EndReason.CALLER_GOODBYE.value
+            )
+        finally:
+            service.recorder.close_phone_call = real_close
+            service.tear_down = real_tear_down
+
+    run(scenario())
+
+    assert order == [f"record:{reasons.CALLER_GOODBYE}", "tear_down"], order
+
+
+def test_a_provider_ended_event_records_a_provider_hangup(phone):
+    """The carrier saying the call is over is not the caller hanging up.
+
+    `PROVIDER_HANGUP` was defined for exactly this and nothing wrote it: the
+    `ended` webhook recorded `CUSTOMER_ENDED`, so a carrier-side disconnect
+    was indistinguishable from a customer ringing off.
+    """
+
+    async def scenario():
+        await service.handle_event(event("carrier-drop"))
+        return await service.handle_event(
+            event("carrier-drop", event_id="evt-carrier-end", event_type="ended")
+        )
+
+    result = run(scenario())
+
+    assert result.outcome.value == "ended"
+    assert row("carrier-drop").disconnect_reason == reasons.PROVIDER_HANGUP
+    assert row("carrier-drop").disconnect_reason == "PROVIDER_ENDED"
+
+
+def test_a_provider_ended_event_does_not_overwrite_a_specific_reason(phone):
+    """First writer wins, so an ending already explained keeps its name."""
+
+    async def scenario():
+        await service.handle_event(event("already-said-bye"))
+        bridge = phone_call_registry.get("already-said-bye")
+        await service._on_call_ended(
+            "already-said-bye",
+            bridge.banking_session_id,
+            EndReason.CALLER_GOODBYE.value,
+        )
+        return await service.handle_event(
+            event("already-said-bye", event_id="evt-late", event_type="ended")
+        )
+
+    run(scenario())
+
+    assert row("already-said-bye").disconnect_reason == reasons.CALLER_GOODBYE
 
 
 # === L: failure injection ===================================================
@@ -337,9 +474,29 @@ def test_every_failure_path_gives_the_capacity_slot_back(phone, monkeypatch):
 
 
 @pytest.fixture
-def app_client():
+def app_client(monkeypatch):
+    """A client whose readiness answer depends on nothing outside this test.
+
+    These assertions used to read whatever `backend/.env` happened to hold. On
+    a developer machine with a key configured they passed; on a machine
+    without one — a fresh checkout, or CI — `/readiness` reported
+    `no_api_key`, the ready assertions failed, and the `probed` assertion died
+    on a `KeyError` instead of saying what was wrong. A deterministic suite
+    cannot be deterministic and also read the ambient environment.
+
+    The stub is a string, never used to open anything: readiness reports the
+    provider from configuration alone and never connects, which is the
+    property `test_readiness_never_opens_a_paid_realtime_session` exists to
+    hold it to.
+    """
     from app.main import create_app
 
+    monkeypatch.setattr(
+        settings, "openai_api_key", "sk-test-not-a-real-key", raising=False
+    )
+    monkeypatch.setattr(
+        settings, "realtime_model", "test-model-not-a-real-model", raising=False
+    )
     return TestClient(create_app())
 
 
@@ -409,6 +566,31 @@ def test_readiness_refuses_without_realtime_configuration(app_client, monkeypatc
 
     assert response.status_code == 503
     assert response.json()["checks"]["realtime"]["reason"] == "no_api_key"
+
+
+def test_an_unreadable_capacity_does_not_make_the_service_unready(
+    app_client, monkeypatch
+):
+    """"Never a reason to refuse" has to hold when the check itself fails.
+
+    The failure branch returned `ready: False`, and `readiness_report` takes
+    `all()` over the checks — so a counter that could not be read would have
+    pulled a process with a healthy database, a configured provider and a
+    working telephone channel out of rotation.
+    """
+    def unreadable():
+        raise RuntimeError("capacity is not readable")
+
+    # The real `_capacity`, with the one thing it depends on raising.
+    monkeypatch.setattr(voice_call_manager, "used_capacity", unreadable)
+
+    response = app_client.get("/readiness")
+
+    assert response.status_code == 200, "an unreadable counter refused traffic"
+    body = response.json()
+    assert body["ready"] is True
+    assert body["checks"]["capacity"]["ready"] is True
+    assert body["checks"]["capacity"]["reason"] == "capacity_unavailable"
 
 
 def test_a_full_switchboard_is_busy_not_unready(app_client, monkeypatch):

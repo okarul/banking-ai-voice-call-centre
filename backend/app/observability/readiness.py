@@ -92,7 +92,13 @@ def _capacity() -> dict:
         }
     except Exception as error:
         logger.error("readiness: capacity unreadable (%s)", type(error).__name__)
-        return {"ready": False, "reason": "unreadable"}
+        # Still ready. "Never a reason to refuse" has to hold for the failure
+        # branch too, or the promise is only kept while nothing goes wrong:
+        # `readiness_report` takes `all()` over these, so returning False here
+        # would pull a process with a healthy database, a configured provider
+        # and a working telephone channel out of rotation because a counter
+        # could not be read. The operator is told, and the verdict is not.
+        return {"ready": True, "reason": "capacity_unavailable"}
 
 
 def readiness_report() -> dict:

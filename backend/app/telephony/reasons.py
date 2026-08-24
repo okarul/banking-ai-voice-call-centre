@@ -81,6 +81,28 @@ APPLICATION_ERROR = "APPLICATION_ERROR"
 APPLICATION_END = "APPLICATION_END"
 
 
+# --- refusals at admission --------------------------------------------------
+#
+# A call refused before it ever carried conversation. These are written by the
+# admission path rather than by an ending, but they land in the same
+# `disconnect_reason` column and are read off the same dashboard, so leaving
+# them out of this module made `ALL` a promise it did not keep.
+
+#: Every slot was in use. The one refusal that genuinely means "try later".
+CAPACITY_REJECTED = "CAPACITY_REJECTED"
+
+#: The model session did not open within the connect budget. Kept apart from
+#: `REALTIME_START_FAILURE` because a timeout and a refusal point at different
+#: things: one is a slow or unreachable provider, the other is one that
+#: answered and said no.
+REALTIME_TIMEOUT = "REALTIME_TIMEOUT"
+
+#: The audio path could not be built at admission, before the call was ever
+#: greeted. Distinct from `MEDIA_FAILURE`, which is a path that worked and
+#: then broke underneath a live call.
+MEDIA_UNAVAILABLE = "MEDIA_UNAVAILABLE"
+
+
 # --- mapping ----------------------------------------------------------------
 
 # What the lifecycle calls an ending, and what gets recorded for it. The
@@ -94,6 +116,12 @@ FROM_END_REASON = {
 
 # Every reason this application may record, for tests and for anyone reading
 # dashboard values back.
+#
+# This tuple is only useful if it is exhaustive. An operator builds a dashboard
+# filter by enumerating it, so a value written anywhere in this application but
+# missing here does not show up as an unknown category — it silently does not
+# show up at all. `test_every_persisted_reason_is_in_the_vocabulary` holds the
+# admission path to that.
 ALL = (
     CALLER_GOODBYE,
     CALLER_SILENT,
@@ -107,7 +135,31 @@ ALL = (
     IDLE_TIMEOUT,
     APPLICATION_ERROR,
     APPLICATION_END,
+    CAPACITY_REJECTED,
+    REALTIME_TIMEOUT,
+    MEDIA_UNAVAILABLE,
 )
+
+
+# --- values written by earlier releases -------------------------------------
+#
+# Renaming a reason does not rewrite the rows already carrying the old name.
+# These are recorded here rather than dropped, so a query over historical data
+# can resolve them instead of treating them as corrupt.
+
+#: Old name -> the reason it would be written as today. Unambiguous cases only.
+HISTORICAL = {
+    # Phase 6.8 split this: a caller who has stopped talking is `CALLER_SILENT`,
+    # a call nobody is on is `IDLE_TIMEOUT`. Rows written before the split are
+    # the second of those, because that is the only thing the sweep recorded.
+    "SILENCE_TIMEOUT": IDLE_TIMEOUT,
+}
+
+#: Old names that cannot be resolved, because one value covered two events that
+#: this application now deliberately tells apart. A row carrying one of these
+#: means "the model session or the audio path failed" and nothing narrower;
+#: mapping it to either would invent a precision the row never had.
+AMBIGUOUS_HISTORICAL = ("PROVIDER_FAILURE",)
 
 
 def for_end_reason(end_reason: str) -> str:

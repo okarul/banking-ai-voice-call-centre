@@ -728,7 +728,11 @@ def test_a_failed_media_start_leaves_no_call_behind(phone, monkeypatch):
 
     result = run(scenario())
 
-    assert result.outcome.value == "rejected_capacity"
+    # Phase 6.8 correction: this said `rejected_capacity`, which is what the
+    # gateway logs — so a broken audio path was reported to an operator as a
+    # full bank. The slot accounting below was always right; only the story
+    # told about it was wrong.
+    assert result.outcome.value == "rejected_media_unavailable"
     assert phone_call_registry.active_count() == 0
     assert voice_call_manager.used_capacity() == 0
 
@@ -1623,7 +1627,7 @@ def test_a_media_failure_is_recorded_as_a_media_failure(phone, monkeypatch):
     async def scenario():
         return await place("call-media-broken")
 
-    run(scenario())
+    result = run(scenario())
 
     with session_scope() as db:
         row = db.scalars(
@@ -1632,6 +1636,50 @@ def test_a_media_failure_is_recorded_as_a_media_failure(phone, monkeypatch):
             )
         ).one()
     assert row.disconnect_reason == "MEDIA_UNAVAILABLE"
+    assert row.disconnect_reason in reasons.ALL
+    # And the outcome agrees with the row. This said `rejected_capacity`,
+    # which the gateway logs verbatim — so an operator read "the bank is full"
+    # while the database said the audio path had failed. Same mistake the
+    # realtime path was corrected for, one branch further down.
+    assert result.outcome.value == "rejected_media_unavailable"
+
+
+def test_a_full_bank_and_a_broken_media_path_are_told_apart(phone, monkeypatch):
+    """Two refusals that send an operator to two different places.
+
+    Capacity means wait and try again. Media means the audio path is broken
+    and waiting will not help. Reporting both as `rejected_capacity` is how
+    the first one hides the second.
+    """
+    original = service.build_transport
+
+    def broken_transport():
+        transport = original()
+
+        async def refuse():
+            raise RuntimeError("no media path")
+
+        transport.on_call_started = refuse
+        return transport
+
+    async def scenario():
+        # A genuine capacity refusal first, with the media path intact.
+        await asyncio.gather(*(place(f"full-{n}") for n in range(APPLICATION_TARGET)))
+        full = await place("refused-because-full")
+
+        # Then a media failure, with room to spare.
+        await phone_call_registry.close_all()
+        await voice_call_manager.close_all()
+        await voice_call_manager.release_all()
+        monkeypatch.setattr(service, "build_transport", broken_transport)
+        broken = await place("refused-because-media")
+        return full, broken
+
+    full, broken = run(scenario())
+
+    assert full.outcome.value == "rejected_capacity"
+    assert broken.outcome.value == "rejected_media_unavailable"
+    assert full.outcome is not broken.outcome
 
 
 # === Phase 6: the bridge drives the lifecycle ===============================

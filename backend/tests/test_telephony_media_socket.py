@@ -159,7 +159,7 @@ def announce(client, call_id: str) -> dict:
 
 
 @contextlib.contextmanager
-def media(client, call_id: str, *, token: str | None = ..., negotiate: bool = True):
+def media(client, call_id: str, *, token: str | None = ...):
     """Attach a media socket the way the gateway does.
 
     Credential first, then the protocol handshake. The handshake is part of
@@ -168,9 +168,10 @@ def media(client, call_id: str, *, token: str | None = ..., negotiate: bool = Tr
     socket that skipped it would be standing in for a gateway this project
     deliberately refuses.
 
-    `negotiate=False` is for the tests that expect the socket to be turned
-    away before any of this — there is nothing to answer when the credential
-    was the problem.
+    The refusal tests need no escape hatch from this. A socket the application
+    turned away is already closed, so the `receive_text` below raises
+    `WebSocketDisconnect` while the context manager is still being entered,
+    which is exactly what those tests assert.
     """
     if token is ...:
         token = TOKENS.get(call_id)
@@ -178,11 +179,10 @@ def media(client, call_id: str, *, token: str | None = ..., negotiate: bool = Tr
     with client.websocket_connect(
         f"/api/telephony/media/{call_id}", headers=headers
     ) as socket:
-        if negotiate:
-            hello = read_protocol_message(socket.receive_text())
-            assert hello is not None, "the application did not open with a hello"
-            assert hello[0] == PROTOCOL_HELLO
-            socket.send_text(gateway_control.protocol_ready_message())
+        hello = read_protocol_message(socket.receive_text())
+        assert hello is not None, "the application did not open with a hello"
+        assert hello[0] == PROTOCOL_HELLO
+        socket.send_text(gateway_control.protocol_ready_message())
         yield socket
 
 
