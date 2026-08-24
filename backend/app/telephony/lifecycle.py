@@ -158,12 +158,30 @@ class CallLifecycle:
                 return
             self._generation_ended = True
 
-    async def on_playback_drained(self) -> None:
-        """The outbound queue is empty.
+    @property
+    def generation_ended(self) -> bool:
+        """Whether the model has finished generating the current turn.
 
-        Together with `on_generation_ended` this means the caller has heard
-        everything the assistant said. Called by the outbound pump, which is
-        the only thing that knows when the last frame actually went out.
+        Read by the bridge when deciding whether to ask the gateway if playback
+        has completed. Exposed rather than duplicated: two flags for one fact
+        drift apart the moment anything drives one of them directly.
+        """
+        return self._generation_ended
+
+    async def on_playback_drained(self) -> None:
+        """Downstream playback for this turn has completed.
+
+        The caller has *heard* everything the assistant said — not merely that
+        the application finished writing bytes somewhere. On the telephone path
+        those are seconds apart: the backend hands audio to the gateway as fast
+        as a socket takes it, and the gateway paces it onto RTP at the rate a
+        telephone plays. This is reported once the gateway confirms it has
+        finished pacing the turn, so it is the only safe moment to start waiting
+        for a silent caller or to hang up on a closing line.
+
+        Where nothing downstream paces audio — a loopback transport in tests —
+        the owner's own queue emptying genuinely is completion, and reports it
+        here directly.
         """
         async with self._lock:
             if self._closed or not self._generation_ended:

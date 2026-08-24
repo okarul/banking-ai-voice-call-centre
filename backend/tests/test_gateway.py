@@ -1129,3 +1129,340 @@ def test_the_rtp_pacing_is_untouched_by_the_phase_63_change():
     assert "frame_interval = 0.020" in source
     assert "next_send += frame_interval" in source
     assert "next_send = loop.time()" in source
+
+import json  # noqa: E402
+
+from gateway import control  # noqa: E402
+
+
+# === Phase 6.7: the gateway answers the playback boundary ===================
+#
+# The backend cannot know when the caller has heard an answer. It hands audio
+# to this gateway as fast as the socket takes it; the gateway paces it onto RTP
+# at 160 bytes every 20 ms. A twenty-second answer leaves the backend in a
+# fraction of a second and takes twenty seconds to play.
+#
+# So the backend asks. The answer is true because `_bank_to_caller` is serial:
+# by the time a text frame is read, every binary message before it has already
+# been through `source.send_frame` at telephone rate.
+
+
+def _boundary(boundary_id):
+    """The backend side of the contract, written out rather than imported.
+
+    The gateway never sends this message, so it has no formatter for it. Spelling
+    the wire format here is the point: if the application ever changes it, this
+    test is where the two ends stop agreeing.
+    """
+    return json.dumps({"type": "playback_boundary", "id": boundary_id})
+
+
+class _PacedSocket:
+    """Messages in, replies recorded. Audio and control on one socket."""
+
+    def __init__(self, messages):
+        self._messages = list(messages)
+        self.replies = []
+        self.closed = False
+
+    async def send(self, payload):
+        self.replies.append(payload)
+
+    async def close(self):
+        self.closed = True
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for message in self._messages:
+            yield message
+
+
+def _relay_with_control(messages):
+    gateway = _gateway_only()
+    sink = _Sink()
+    socket = _PacedSocket(messages)
+
+    async def scenario():
+        await gateway._bank_to_caller(sink, socket)
+        return sink.frames, socket.replies
+
+    return asyncio.run(scenario())
+
+
+def test_a_playback_boundary_is_acknowledged_with_the_same_id():
+    frames, replies = _relay_with_control(
+        [
+            b"\xff" * (FRAME_BYTES * 2),
+            _boundary("4"),
+        ]
+    )
+
+    assert len(frames) == 2
+    assert replies == [control.playback_drained_message("4")]
+    assert json.loads(replies[0]) == {"type": "playback_drained", "id": "4"}
+
+
+def test_the_acknowledgement_follows_every_frame_before_it():
+    """The guarantee the backend relies on: paced out first, answered after."""
+    order = []
+
+    gateway = _gateway_only()
+
+    class _Recording(_Sink):
+        async def send_frame(self, frame):
+            order.append("frame")
+            await super().send_frame(frame)
+
+    class _Watching(_PacedSocket):
+        async def send(self, payload):
+            order.append("ack")
+            await super().send(payload)
+
+    socket = _Watching(
+        [
+            b"\xff" * (FRAME_BYTES * 3),
+            _boundary("1"),
+        ]
+    )
+
+    async def scenario():
+        await gateway._bank_to_caller(_Recording(), socket)
+
+    asyncio.run(scenario())
+
+    assert order == ["frame", "frame", "frame", "ack"], order
+
+
+def test_audio_after_a_boundary_still_relays_normally():
+    frames, replies = _relay_with_control(
+        [
+            b"\xff" * FRAME_BYTES,
+            _boundary("1"),
+            b"\xee" * FRAME_BYTES,
+            _boundary("2"),
+        ]
+    )
+
+    assert len(frames) == 2
+    assert replies == [
+        control.playback_drained_message("1"),
+        control.playback_drained_message("2"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "not json",
+        "[]",
+        '{"type": "playback_drained", "id": "1"}',
+        '{"type": "playback_boundary"}',
+        '{"type": "playback_boundary", "id": 1}',
+        '{"type": "unknown", "id": "1"}',
+    ],
+)
+def test_an_unrecognised_text_frame_is_ignored(text):
+    """Not ours to act on, and not a reason to drop a working call."""
+    frames, replies = _relay_with_control([b"\xff" * FRAME_BYTES, text])
+
+    assert len(frames) == 1, "relaying stopped on an unknown control frame"
+    assert replies == []
+
+
+def test_a_closed_socket_during_acknowledgement_is_not_an_error():
+    gateway = _gateway_only()
+
+    class _Gone(_PacedSocket):
+        async def send(self, payload):
+            raise websockets.exceptions.ConnectionClosedOK(None, None)
+
+    async def scenario():
+        await gateway._bank_to_caller(
+            _Sink(), _Gone([_boundary("1")])
+        )
+
+    asyncio.run(scenario())  # must simply return
+
+
+def test_the_rtp_pacing_is_untouched_by_the_control_protocol():
+    """49a24e1 still stands, and control frames do not go near it."""
+    import inspect
+
+    source = inspect.getsource(MediaGateway._bank_to_caller)
+    assert "frame_interval = 0.020" in source
+    assert "next_send += frame_interval" in source
+    assert "next_send = loop.time()" in source
+    assert FRAME_BYTES == 160
+
+
+# === the final partial frame ===============================================
+#
+# A turn almost never ends on a 160-byte boundary. When the boundary arrives
+# there are usually 1..159 bytes still buffered — real audio the steady-state
+# loop cannot emit, because RTP carries whole packets. Acknowledging with those
+# bytes unsent would make the acknowledgement a lie, and the bank would hang up
+# on the last syllable of a sentence.
+
+
+def test_exactly_one_frame_then_a_boundary_plays_it_before_acknowledging():
+    order = []
+
+    gateway = _gateway_only()
+
+    class _Recording(_Sink):
+        async def send_frame(self, frame):
+            order.append(("frame", len(frame)))
+            await super().send_frame(frame)
+
+    class _Watching(_PacedSocket):
+        async def send(self, payload):
+            order.append(("ack", json.loads(payload)["id"]))
+            await super().send(payload)
+
+    socket = _Watching([b"\xa0" * FRAME_BYTES, _boundary("1")])
+    asyncio.run(gateway._bank_to_caller(_Recording(), socket))
+
+    assert order == [("frame", 160), ("ack", "1")], order
+
+
+def test_a_partial_tail_is_played_before_the_acknowledgement():
+    """160 + 80 bytes. Two packets go out, then the answer."""
+    order = []
+
+    gateway = _gateway_only()
+
+    class _Recording(_Sink):
+        async def send_frame(self, frame):
+            order.append(("frame", len(frame)))
+            await super().send_frame(frame)
+
+    class _Watching(_PacedSocket):
+        async def send(self, payload):
+            order.append(("ack", json.loads(payload)["id"]))
+            await super().send(payload)
+
+    sink = _Recording()
+    socket = _Watching([b"\xa0" * FRAME_BYTES + b"\xb0" * 80, _boundary("2")])
+    asyncio.run(gateway._bank_to_caller(sink, socket))
+
+    assert order == [("frame", 160), ("frame", 160), ("ack", "2")], order
+    # The tail is the real audio, padded out to a whole packet.
+    assert sink.frames[1][:80] == b"\xb0" * 80
+    assert sink.frames[1][80:] == b"\xff" * 80, "padded with something other than silence"
+
+
+def test_audio_shorter_than_one_frame_is_not_discarded():
+    """Fewer than 160 bytes in total. It is still speech and must be played."""
+    gateway = _gateway_only()
+    sink = _Sink()
+    socket = _PacedSocket([b"\xc0" * 40, _boundary("3")])
+
+    asyncio.run(gateway._bank_to_caller(sink, socket))
+
+    assert len(sink.frames) == 1, "the caller never heard the last of the sentence"
+    assert len(sink.frames[0]) == FRAME_BYTES
+    assert sink.frames[0][:40] == b"\xc0" * 40
+    assert sink.frames[0][40:] == b"\xff" * (FRAME_BYTES - 40)
+    assert socket.replies == [control.playback_drained_message("3")]
+
+
+def test_messages_crossing_frame_boundaries_keep_their_order():
+    """Reassembly is unchanged; the tail joins the end of it."""
+    gateway = _gateway_only()
+    sink = _Sink()
+    payload = bytes(range(256)) * 2          # 512 bytes = 3 frames + 32
+    socket = _PacedSocket(
+        [payload[:100], payload[100:300], payload[300:], _boundary("4")]
+    )
+
+    asyncio.run(gateway._bank_to_caller(sink, socket))
+
+    assert len(sink.frames) == 4             # 3 whole + 1 padded tail
+    played = b"".join(sink.frames)
+    assert played[: len(payload)] == payload, "audio was reordered or lost"
+    assert played[len(payload):] == b"\xff" * (FRAME_BYTES * 4 - len(payload))
+    assert socket.replies == [control.playback_drained_message("4")]
+
+
+def test_a_boundary_with_no_audio_at_all_still_acknowledges():
+    gateway = _gateway_only()
+    sink = _Sink()
+    socket = _PacedSocket([_boundary("5")])
+
+    asyncio.run(gateway._bank_to_caller(sink, socket))
+
+    assert sink.frames == [], "invented a packet for a turn that produced none"
+    assert socket.replies == [control.playback_drained_message("5")]
+
+
+def test_a_second_boundary_immediately_after_the_first_sends_nothing_extra():
+    gateway = _gateway_only()
+    sink = _Sink()
+    socket = _PacedSocket([b"\xd0" * 50, _boundary("6"), _boundary("7")])
+
+    asyncio.run(gateway._bank_to_caller(sink, socket))
+
+    assert len(sink.frames) == 1, "played the tail twice"
+    assert socket.replies == [
+        control.playback_drained_message("6"),
+        control.playback_drained_message("7"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "not json",
+        "[]",
+        '{"type": "playback_drained", "id": "1"}',
+        '{"type": "playback_boundary"}',
+        '{"type": "unknown", "id": "1"}',
+    ],
+)
+def test_a_malformed_control_frame_does_not_flush_the_buffer(text):
+    """Media is untouched by a frame we cannot read, and nothing is answered."""
+    gateway = _gateway_only()
+    sink = _Sink()
+    # 80 buffered bytes, then rubbish, then a real boundary.
+    socket = _PacedSocket([b"\xe0" * 80, text, _boundary("8")])
+
+    asyncio.run(gateway._bank_to_caller(sink, socket))
+
+    assert len(sink.frames) == 1, "a malformed frame flushed the media buffer"
+    assert sink.frames[0][:80] == b"\xe0" * 80
+    assert socket.replies == [control.playback_drained_message("8")], socket.replies
+
+
+def test_the_tail_is_paced_like_every_other_packet():
+    """The acknowledgement must mean played, not merely sent."""
+    gateway = _gateway_only()
+    sink = _Sink()
+    socket = _PacedSocket([b"\xf0" * (FRAME_BYTES * 2 + 40), _boundary("9")])
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await gateway._bank_to_caller(sink, socket)
+        return loop.time() - started
+
+    elapsed = asyncio.run(scenario())
+
+    assert len(sink.frames) == 3
+    # Three packets at 20 ms each; the tail is not exempt from playout time.
+    assert elapsed >= 0.055, f"acknowledged after only {elapsed:.3f}s"
+
+
+def test_the_steady_state_contract_is_unchanged():
+    """Whole frames still 160 bytes, still paced at 20 ms, padding unused."""
+    gateway = _gateway_only()
+    sink = _Sink()
+    socket = _PacedSocket([b"\x11" * (FRAME_BYTES * 4), _boundary("10")])
+
+    asyncio.run(gateway._bank_to_caller(sink, socket))
+
+    assert len(sink.frames) == 4
+    assert all(len(frame) == FRAME_BYTES for frame in sink.frames)
+    assert b"".join(sink.frames) == b"\x11" * (FRAME_BYTES * 4), "padding leaked in"
+    assert FRAME_BYTES == 160

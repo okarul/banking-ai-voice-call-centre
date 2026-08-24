@@ -47,7 +47,11 @@ from app.observability.events import AuditEvent, safe_event
 from app.telephony import service
 from app.telephony.bridge import phone_call_registry
 from app.telephony.channels import Channel
-from app.telephony.media import WebSocketMediaTransport
+from app.telephony.media import (
+    PLAYBACK_DRAINED,
+    WebSocketMediaTransport,
+    read_control_message,
+)
 from app.telephony.schemas import InboundCallEvent, InboundEventAccepted
 from app.telephony.signature import (
     MAX_BODY_BYTES,
@@ -260,6 +264,27 @@ async def media_socket(websocket: WebSocket, provider_call_id: str) -> None:
                 # full queue: a socket read that blocked would stop this call
                 # reading while the gateway kept sending.
                 transport.deliver(frame)
+                continue
+
+            text = message.get("text")
+            if text is None:
+                continue
+
+            # Text is control, never audio. Only this call's bridge is ever
+            # told, so a frame on one socket cannot affect another call.
+            control = read_control_message(text)
+            if control is None:
+                # Unknown or malformed. Ignored rather than fatal: a frame we
+                # cannot parse is not a reason to drop a working call. The
+                # payload is deliberately not logged.
+                logger.info(
+                    "telephony media control frame ignored on %s", provider_call_id
+                )
+                continue
+
+            kind, boundary_id = control
+            if kind == PLAYBACK_DRAINED:
+                bridge.on_playback_acknowledged(boundary_id)
     except WebSocketDisconnect:
         pass
     except Exception as error:

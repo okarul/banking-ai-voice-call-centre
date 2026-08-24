@@ -27,7 +27,12 @@ import websockets
 
 from gateway.client import AcceptedCall, BackendClient, BackendUnavailable, CallRefused
 from gateway.config import GatewaySettings, gateway_settings
-from gateway.sources import FRAME_BYTES, CallSource
+from gateway.control import (
+    PLAYBACK_BOUNDARY,
+    playback_drained_message,
+    read_control_message,
+)
+from gateway.sources import FRAME_BYTES, SILENCE, CallSource
 
 logger = logging.getLogger("gateway")
 
@@ -181,9 +186,14 @@ class MediaGateway:
 
         try:
             async for message in socket:
-                # Binary only. The bank sends audio down this socket and
-                # nothing else, so anything textual is not ours to interpret.
                 if not isinstance(message, bytes):
+                    # Text is control. This loop is serial, so every binary
+                    # message before it has already been paced out below at
+                    # telephone rate — except for a final partial frame, which
+                    # the boundary handler plays before answering.
+                    next_send = await self._boundary_reached(
+                        socket, source, message, buffer, next_send
+                    )
                     continue
 
                 buffer.extend(message)
@@ -207,6 +217,72 @@ class MediaGateway:
             # relay failure, and counting them as one would report healthy
             # calls as errors.
             return
+
+    async def _boundary_reached(
+        self, socket, source: CallSource, message, buffer: bytearray, next_send: float
+    ) -> float:
+        """Answer a playback boundary — but only once everything is played.
+
+        A turn almost never ends on a 160-byte boundary, so when the boundary
+        arrives there are usually 1..159 bytes still in `buffer`: real audio,
+        too short for an RTP packet, that the steady-state loop above cannot
+        emit. Answering with those bytes unsent would make the acknowledgement
+        a lie, and the bank would hang up on the last syllable of a sentence.
+
+        Only a valid boundary touches the media at all. Anything unparseable or
+        unknown leaves the buffer exactly as it was and is not answered — a
+        frame we cannot read is not a reason to flush a call's audio.
+
+        The tail is padded to a whole packet with µ-law silence rather than
+        sent short. `gateway.sources.SILENCE` is the project's convention and
+        says why: µ-law silence is 0xFF, not 0x00, because the encoding is
+        inverted. A short payload is the other failure this gateway already
+        documents — a carrier drops it or plays it as a burst of noise.
+
+        The reply is sent from this task while `_caller_to_bank` may be sending
+        audio on the same socket. Both are small, unfragmented messages, which
+        the websockets library writes as complete frames; they cannot interleave.
+        """
+        control = read_control_message(message)
+        if control is None:
+            return next_send
+        kind, boundary_id = control
+        if kind != PLAYBACK_BOUNDARY:
+            return next_send
+
+        next_send = await self._play_final_frame(source, buffer, next_send)
+
+        try:
+            await socket.send(playback_drained_message(boundary_id))
+        except websockets.exceptions.ConnectionClosed:
+            # The call ended while we were answering. Nothing to report to.
+            pass
+        return next_send
+
+    @staticmethod
+    async def _play_final_frame(
+        source: CallSource, buffer: bytearray, next_send: float
+    ) -> float:
+        """Play a turn's leftover bytes as one padded packet, at playout pace.
+
+        Waits out that packet's 20 ms like every other, so that when this
+        returns the audio really has been played rather than merely sent.
+        """
+        if not buffer:
+            return next_send
+
+        tail = bytes(buffer) + SILENCE[: FRAME_BYTES - len(buffer)]
+        del buffer[:]
+        await source.send_frame(tail)
+
+        loop = asyncio.get_running_loop()
+        next_send += 0.020
+        delay = next_send - loop.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        else:
+            next_send = loop.time()
+        return next_send
 
 
 async def _quietly(awaitable) -> None:

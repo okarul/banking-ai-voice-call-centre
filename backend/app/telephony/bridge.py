@@ -179,6 +179,11 @@ class PhoneCallBridge:
 
         # Lifecycle transitions scheduled from the synchronous event handler.
         self._transitions: set[asyncio.Task] = set()
+        # Playback boundaries. The backend's queue emptying is not the caller
+        # having heard anything — the gateway is still pacing those bytes onto
+        # RTP — so completion waits for the gateway to say so.
+        self._boundary_counter = 0
+        self._pending_boundary: str | None = None
         # History items already acted on, as "item id:text digest". Guards
         # against `history_updated` snapshots replaying the whole conversation
         # on every change. Never holds the text itself.
@@ -210,6 +215,9 @@ class PhoneCallBridge:
             if data and self._admit_response(getattr(payload, "response_id", None)):
                 self.outbound.put(data)
                 self.conversation.assistant_speaking = True
+                # More audio for this turn, so any boundary already asked about
+                # is stale: it was asked before this arrived.
+                self._pending_boundary = None
                 self._schedule(self.lifecycle.on_assistant_audio())
 
         elif kind == "audio_end":
@@ -217,11 +225,7 @@ class PhoneCallBridge:
             # finished *hearing* it — several seconds may still be queued for a
             # telephone that plays fifty frames a second.
             self.conversation.complete_turn()
-            self._schedule(self.lifecycle.on_generation_ended())
-            if not len(self.outbound):
-                # Nothing left to play: the last frame already went out, so no
-                # further drain will be reported and completion is now.
-                self._schedule(self.lifecycle.on_playback_drained())
+            self._schedule(self._generation_finished())
 
         elif kind == "audio_interrupted":
             # Barge-in. The caller started speaking, so everything queued is a
@@ -234,6 +238,10 @@ class PhoneCallBridge:
             # active for ever and every later answer would be suppressed.
             self.conversation.active_response_id = None
             self.conversation.assistant_speaking = False
+            # The turn is abandoned, so any boundary outstanding for it is
+            # stale. A late acknowledgement must not complete a turn the
+            # caller talked over.
+            self._pending_boundary = None
             self._schedule(self.lifecycle.on_assistant_interrupted())
 
         elif kind == "history_added":
@@ -364,6 +372,79 @@ class PhoneCallBridge:
         cheaper and clearer to not ask twice.
         """
         return self.conversation.active_response_id is None
+
+    async def _generation_finished(self) -> None:
+        """Record that the model has stopped, then ask about playback.
+
+        One scheduled unit rather than two, because the second step reads what
+        the first one writes. Scheduled separately, correctness would depend on
+        which task the event loop happened to run first — and losing that race
+        is unrecoverable for a turn whose queue is already empty, which is every
+        short or silent one: the boundary is never issued, no pump event is left
+        to retry from, and the call waits for an acknowledgement that cannot
+        come.
+        """
+        await self.lifecycle.on_generation_ended()
+        await self._request_playback_boundary()
+
+    async def _request_playback_boundary(self) -> None:
+        """Ask the gateway to report when this turn has reached the caller.
+
+        Only once both halves are true: the model has finished generating, and
+        every byte of it has left our queue. Either can happen first — audio
+        keeps arriving after `audio_end` on a long answer, and a short one
+        drains before `audio_end` arrives — so both paths call this and
+        whichever completes the pair asks the question.
+        """
+        if self._closed:
+            return
+        if not self.lifecycle.generation_ended or len(self.outbound):
+            return
+        if self._pending_boundary is not None:
+            return
+
+        self._boundary_counter += 1
+        boundary_id = str(self._boundary_counter)
+        self._pending_boundary = boundary_id
+
+        ask = getattr(self.transport, "send_playback_boundary", None)
+        asked = await ask(boundary_id) if ask is not None else False
+        if asked:
+            logger.info(
+                "bridge[%s] playback boundary %s issued",
+                self.provider_call_id,
+                boundary_id,
+            )
+            return
+
+        # Nobody to ask: a transport that does not pace, or a socket already
+        # gone. Its own queue is then the only playout there is.
+        self._pending_boundary = None
+        await self.lifecycle.on_playback_drained()
+
+    def on_playback_acknowledged(self, boundary_id: str) -> None:
+        """The gateway has finished pacing this turn onto RTP.
+
+        Now, and not when our queue emptied, the caller has heard the whole
+        turn. Anything that does not match the boundary outstanding right now
+        is ignored: a duplicate, or an acknowledgement for a turn the caller
+        interrupted, must not complete the turn in progress.
+        """
+        if self._pending_boundary is None or boundary_id != self._pending_boundary:
+            logger.info(
+                "bridge[%s] stale playback acknowledgement %s ignored",
+                self.provider_call_id,
+                boundary_id,
+            )
+            return
+
+        logger.info(
+            "bridge[%s] playback acknowledged %s",
+            self.provider_call_id,
+            boundary_id,
+        )
+        self._pending_boundary = None
+        self._schedule(self.lifecycle.on_playback_drained())
 
     def _on_raw_server_event(self, server_event) -> None:
         """A raw server event, which may or may not be a finished transcript."""
@@ -614,11 +695,9 @@ class PhoneCallBridge:
                 self.frames_to_caller += 1
                 self.last_activity = time.monotonic()
                 if not len(self.outbound):
-                    # The queue is empty and this frame has gone out. If the
-                    # model has also finished generating, the caller has now
-                    # heard everything — which is the only safe moment to hang
-                    # up on a closing line.
-                    await self.lifecycle.on_playback_drained()
+                    # Our queue is empty and this frame has gone out — into the
+                    # gateway, which has not finished playing it. Ask.
+                    await self._request_playback_boundary()
         except asyncio.CancelledError:
             raise
         except Exception as error:

@@ -31,11 +31,78 @@ not. Drops are counted so an operator can see the call was degraded.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import deque
 from typing import Protocol, runtime_checkable
 
 logger = logging.getLogger("app.telephony.media")
+
+
+# === the playback control protocol =========================================
+#
+# Binary frames on the media socket are audio. Text frames are control, and
+# there are exactly two messages:
+#
+#     backend -> gateway   {"type": "playback_boundary", "id": "<opaque>"}
+#     gateway -> backend   {"type": "playback_drained",  "id": "<same>"}
+#
+# They exist because the two ends of that socket run at completely different
+# speeds. The backend hands over audio as fast as the socket will take it; the
+# gateway paces it onto RTP at 160 bytes every 20 ms, because that is the rate
+# a telephone plays. A twenty-second answer leaves the backend's queue in a
+# fraction of a second and takes twenty seconds to reach the caller.
+#
+# Treating our own queue emptying as "the caller has heard it" is what closed a
+# live call mid-sentence: the ten-second silence timer was armed while the
+# gateway still had several seconds of speech to play, and it expired while the
+# agent was still talking. Playback completion is something only the far end
+# knows, so the boundary asks it.
+#
+# The id is an opaque per-call counter. These messages carry no transcript, no
+# customer identity, no banking data and no credential, and are never logged.
+#
+# The gateway's copy is `gateway/control.py`, deliberately duplicated rather
+# than imported: the gateway is standalone and replaceable, so the two ends
+# agree by wire contract. The two must be changed together.
+
+PLAYBACK_BOUNDARY = "playback_boundary"
+PLAYBACK_DRAINED = "playback_drained"
+
+# An id longer than this is not something we issued.
+MAX_BOUNDARY_ID_LENGTH = 64
+
+
+def playback_boundary_message(boundary_id: str) -> str:
+    """Ask the far end to report when everything before this has been played."""
+    return json.dumps({"type": PLAYBACK_BOUNDARY, "id": boundary_id})
+
+
+def read_control_message(text) -> tuple[str, str] | None:
+    """Parse a control frame, or None if it is not one we recognise.
+
+    Strict on purpose. Anything unparseable, unknown, or the wrong shape is not
+    ours to act on, and guessing at it is how a media socket starts doing
+    something other than carrying one call's audio.
+    """
+    if not isinstance(text, str):
+        return None
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    kind = payload.get("type")
+    boundary_id = payload.get("id")
+    if kind not in (PLAYBACK_BOUNDARY, PLAYBACK_DRAINED):
+        return None
+    if not isinstance(boundary_id, str):
+        return None
+    if not boundary_id or len(boundary_id) > MAX_BOUNDARY_ID_LENGTH:
+        return None
+    return kind, boundary_id
 
 
 class MediaTransportError(Exception):
@@ -159,6 +226,15 @@ class MediaTransport(Protocol):
         """Release the transport. Must be safe to call more than once."""
         ...
 
+    async def send_playback_boundary(self, boundary_id: str) -> bool:
+        """Ask the far end to report when it has finished playing.
+
+        True if the question was asked and an answer should be waited for.
+        False if there is nobody to ask — then this transport's own queue is
+        the only playout there is, and emptying it is completion.
+        """
+        ...
+
 
 class LoopbackMediaTransport:
     """An in-memory transport for tests and local development.
@@ -190,6 +266,14 @@ class LoopbackMediaTransport:
 
     async def send_audio(self, frame: bytes) -> None:
         self.sent.append(frame)
+
+    async def send_playback_boundary(self, boundary_id: str) -> bool:
+        """Nothing paces audio here, so there is nobody to ask.
+
+        The loopback transport delivers straight into a test's hands at
+        whatever speed it reads. Its queue emptying really is completion.
+        """
+        return False
 
     async def on_call_ended(self) -> None:
         self.ended = True
@@ -302,6 +386,20 @@ class WebSocketMediaTransport:
             # error worth propagating into the banking session.
             self._closed = True
             logger.info("media socket closed while sending: %s", type(error).__name__)
+
+    async def send_playback_boundary(self, boundary_id: str) -> bool:
+        """Ask the gateway when this turn has actually reached the telephone."""
+        if self._closed or self._websocket is None:
+            return False
+        try:
+            await self._websocket.send_text(playback_boundary_message(boundary_id))
+            return True
+        except Exception as error:
+            self._closed = True
+            logger.info(
+                "media socket closed while sending control: %s", type(error).__name__
+            )
+            return False
 
     async def on_call_ended(self) -> None:
         """Release the transport and close the socket. Safe to call twice.
