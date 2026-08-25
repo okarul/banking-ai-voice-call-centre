@@ -30,11 +30,15 @@ from typing import Any, Awaitable, Callable
 
 from app.realtime.context import BankingRealtimeContext
 from app.realtime.events import log_event
+from app.observability import business
 from app.realtime.turn_gate import open_turn, record_turn
 from app.sessions import SessionManager, SessionNotFoundError
 from app.sessions import session_manager as default_manager
 
 logger = logging.getLogger("app.realtime")
+
+# Where the per-call set of already-recorded turns lives on the session.
+_RECORDED_TURNS = "_recorded_turn_items"
 
 
 class RealtimeStage(str, Enum):
@@ -528,7 +532,18 @@ class RealtimeManager:
         try:
             async for event in connection.session:
                 log_event(connection.banking_session_id, event)
-                self._feed_gate(connection.banking_session_id, event)
+
+                turn = self._feed_gate(connection.banking_session_id, event)
+                if turn is not None:
+                    # Off this loop. `to_thread` hands the write to a worker,
+                    # so the audio pumps sharing this loop keep running while
+                    # PostgreSQL is busy. Awaited rather than left to run free:
+                    # a task nobody holds can be collected mid-write, and on
+                    # teardown the pump's cancellation would abandon it. Awaited
+                    # here, a cancel arrives at this point *after* the worker
+                    # has been handed the work, so the row is still written.
+                    await asyncio.to_thread(business.record_turn_decision, *turn)
+
                 if on_event is None:
                     continue
                 result = on_event(connection.banking_session_id, event)
@@ -544,7 +559,7 @@ class RealtimeManager:
                 type(error).__name__,
             )
 
-    def _feed_gate(self, banking_session_id: str, event: Any) -> None:
+    def _feed_gate(self, banking_session_id: str, event: Any):
         """Open and rule on caller turns as the events for them arrive.
 
         Two signals matter, and nothing else here does:
@@ -556,10 +571,20 @@ class RealtimeManager:
         is classified directly. A failure here must never break the call, but it
         must also never quietly open the gate, so the turn is left pending and
         the tools refuse.
+
+        Stays synchronous, and stays free of I/O. The ruling has to be in force
+        before the next tool call is admitted, so it cannot be deferred — which
+        is exactly why nothing slow may happen here. What the operations record
+        needs is *returned* instead, for the pump to persist off this loop.
+
+        Returns `(session, decision)` when this event produced a turn worth
+        recording, or None. The same utterance reaches this method in more than
+        one representation, so the return is deduplicated per conversation item:
+        the ruling is applied every time, the row is written once.
         """
         session = self._manager.get_session(banking_session_id)
         if session is None:
-            return
+            return None
 
         try:
             kind = getattr(event, "type", "")
@@ -568,28 +593,59 @@ class RealtimeManager:
                 data = getattr(event, "data", None)
                 raw_type = getattr(data, "type", None)
                 if raw_type == "input_audio_transcription_completed":
-                    record_turn(session, getattr(data, "transcript", "") or "")
-                    return
+                    text = getattr(data, "transcript", "") or ""
+                    decision = record_turn(session, text)
+                    return self._turn_to_record(session, data, text, decision)
                 inner = getattr(data, "data", None)
                 if (
                     isinstance(inner, dict)
                     and inner.get("type") == "input_audio_buffer.speech_started"
                 ):
                     open_turn(session)
-                return
+                return None
 
             if kind == "history_added":
                 item = getattr(event, "item", None)
                 if getattr(item, "role", None) == "user":
                     text = _user_text(item)
                     if text:
-                        record_turn(session, text)
+                        decision = record_turn(session, text)
+                        return self._turn_to_record(session, item, text, decision)
         except Exception as error:
             logger.error(
                 "realtime[%s] scope gate could not read an event: %s",
                 banking_session_id,
                 type(error).__name__,
             )
+        return None
+
+    @staticmethod
+    def _turn_to_record(session, carrier: Any, text: str, decision):
+        """Whether this turn still needs writing down, keyed by its item.
+
+        The transcription event and the history item for one utterance carry
+        the same `item_id`, so that is the key: the second representation to
+        arrive finds the turn already recorded and asks for nothing. Keyed on
+        the id rather than on the words, because two identical questions asked
+        on different turns are two turns and must both be recorded.
+
+        The seen-set lives on the banking session, so it is bounded by the
+        length of one call and disappears with it.
+        """
+        if decision is None:
+            return None
+
+        item_id = getattr(carrier, "item_id", None)
+        if not item_id:
+            # No id to key on — fall back to the words, which at least stops a
+            # single utterance being written twice within one turn.
+            item_id = f"turn{getattr(session, 'turn_counter', '')}:{hash(text)}"
+
+        seen = session.conversation_context.setdefault(_RECORDED_TURNS, set())
+        if item_id in seen:
+            return None
+        seen.add(item_id)
+        return session, decision
 
     async def _shutdown(self, connection: RealtimeConnection) -> None:
         """Release provider resources for one call, tolerating failures."""

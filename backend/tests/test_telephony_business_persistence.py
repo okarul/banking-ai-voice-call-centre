@@ -47,6 +47,8 @@ from app.sessions import session_manager
 # Synthetic demo credentials from the Phase 2 seed. Not real.
 PINS = {"DEMO001": "4821", "DEMO002": "7315"}
 DEMO001_SAVINGS = "12450.75"
+# One wording for the cross-customer probe, used by several tests below.
+CROSS_CUSTOMER = "What is the balance for DEMO002?"
 
 
 @pytest.fixture(autouse=True)
@@ -109,6 +111,62 @@ def phone_call(call_id="phase69-call"):
     return session, BankingRealtimeContext(
         session_id=session.session_id, manager=session_manager
     )
+
+
+class Raw:
+    """A `raw_model_event` payload, in the shape the SDK delivers."""
+
+    def __init__(self, type_, **fields):
+        self.type = type_
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
+class Event:
+    def __init__(self, type_, **fields):
+        self.type = type_
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
+class HistoryItem:
+    """A user history item carrying the same utterance as its transcription."""
+
+    def __init__(self, item_id, text):
+        self.item_id = item_id
+        self.role = "user"
+        self.type = "message"
+        self.content = [Raw("input_audio", transcript=text, text=None)]
+
+
+def transcription_event(text, item_id="item-1"):
+    return Event(
+        "raw_model_event",
+        data=Raw(
+            "input_audio_transcription_completed", transcript=text, item_id=item_id
+        ),
+    )
+
+
+def history_event(text, item_id="item-1"):
+    return Event("history_added", item=HistoryItem(item_id, text))
+
+
+def feed_turn(banking_session_id, text, *, item_id="item-1", events=None):
+    """Drive one caller turn exactly as `_pump_events` does.
+
+    `_feed_gate` rules synchronously and returns what still needs writing; the
+    pump then persists it off the event loop. Tests go through both halves so
+    they exercise the real contract rather than the mirror in isolation.
+    """
+    from app.observability import business
+    from app.realtime.realtime_manager import RealtimeManager
+
+    realtime = RealtimeManager(manager=session_manager)
+    for event in events or [transcription_event(text, item_id)]:
+        turn = realtime._feed_gate(banking_session_id, event)
+        if turn is not None:
+            business.record_turn_decision(*turn)
 
 
 def row(banking_session_id):
@@ -293,6 +351,10 @@ def test_a_refused_channel_2_tool_is_not_recorded_as_a_success():
     assert refused.get("success") is False, refused
 
     events = tool_events(session.session_id)
+    # Non-empty first. `all()` over an empty list is True, so without this the
+    # assertion below passed precisely *because* nothing was being recorded —
+    # which is how the missing scope-refusal recording hid from its own test.
+    assert events, "a refused enquiry was not recorded at all"
     assert all(event.status != "OK" for event in events), (
         "a refused enquiry was recorded as a successful tool call"
     )
@@ -463,14 +525,13 @@ def test_a_channel_2_call_does_not_touch_another_session(browser):
 
 
 def test_a_channel_2_turn_persists_its_domain_and_intent():
-    """Classified by the same gate both channels use, recorded once."""
+    """Through the real pump path: classify on the loop, persist off it."""
     session, context = phone_call("phase69-turn")
 
     run(call_tool(tools.submit_customer_id, context, spoken_customer_id="DEMO001"))
     run(call_tool(tools.submit_pin, context, spoken_pin=PINS["DEMO001"]))
 
-    live = session_manager.get_session(session.session_id)
-    record_turn(live, "What is my savings balance?")
+    feed_turn(session.session_id, "What is my savings balance?")
 
     record = row(session.session_id)
     assert record.last_intent == "OWN_ACCOUNT_ENQUIRY", record.last_intent
@@ -485,8 +546,7 @@ def test_a_refused_turn_shows_as_refused_not_as_banking():
     run(call_tool(tools.submit_customer_id, context, spoken_customer_id="DEMO001"))
     run(call_tool(tools.submit_pin, context, spoken_pin=PINS["DEMO001"]))
 
-    live = session_manager.get_session(session.session_id)
-    record_turn(live, "What is DEMO002's balance?")
+    feed_turn(session.session_id, CROSS_CUSTOMER)
 
     record = row(session.session_id)
     assert record.current_domain == "GENERAL/SCOPE", record.current_domain
@@ -571,15 +631,33 @@ def test_recording_releases_every_session_it_touches():
     from app.realtime.browser_calls import voice_call_manager
 
     before = voice_call_manager.used_capacity()
+    assert before == 0, f"the suite began with {before} slots already in use"
+
+    async def one_call(index):
+        """A call that genuinely holds a slot while its tools are recorded.
+
+        The earlier version of this test only created a database row, so the
+        capacity counter was zero before and after by construction and the
+        assertion could not fail. A real reservation is taken here, so a slot
+        the mirror failed to release would actually be caught.
+        """
+        session, context = phone_call(f"phase69-capacity-{index}")
+        await voice_call_manager.reserve(session.session_id)
+        assert voice_call_manager.used_capacity() == 1, "the slot was not taken"
+        try:
+            await call_tool(
+                tools.submit_customer_id, context, spoken_customer_id="DEMO001"
+            )
+            await call_tool(tools.submit_pin, context, spoken_pin=PINS["DEMO001"])
+            feed_turn(session.session_id, "What is my savings balance?",
+                      item_id=f"cap-{index}")
+            await call_tool(tools.get_account_balance, context, account_type="Savings")
+        finally:
+            await voice_call_manager.release(session.session_id)
+            session_manager.destroy_session(session.session_id)
 
     for index in range(3):
-        session, context = phone_call(f"phase69-capacity-{index}")
-        run(call_tool(tools.submit_customer_id, context, spoken_customer_id="DEMO001"))
-        run(call_tool(tools.submit_pin, context, spoken_pin=PINS["DEMO001"]))
-        live = session_manager.get_session(session.session_id)
-        record_turn(live, "What is my savings balance?")
-        run(call_tool(tools.get_account_balance, context, account_type="Savings"))
-        session_manager.destroy_session(session.session_id)
+        run(one_call(index))
 
     assert voice_call_manager.used_capacity() == before, (
         "recording business events leaked a capacity slot"
@@ -614,4 +692,428 @@ def test_recording_never_breaks_a_call_when_the_database_fails(monkeypatch):
     assert balance["success"] is True, (
         "a failure to record broke the banking answer itself"
     )
+    assert balance["available_balance"] == DEMO001_SAVINGS
+
+
+# === H. Phase 6.9.1: the mirror must not slow the audio loop ================
+
+
+def test_the_realtime_event_loop_does_not_block_on_a_slow_recorder(monkeypatch):
+    """The regression that matters most: a slow database must not stall audio.
+
+    Phase 6.9 put `recorder.record_turn` inside `turn_gate.record_decision`,
+    which `_feed_gate` calls from the realtime pump's `async for` — the same
+    loop that paces this call's RTP at one frame every 20ms. A measured 11-26ms
+    write there cost roughly a frame per caller turn.
+
+    This drives the real `_pump_events` with the **real** recorder made slow —
+    a delay in front of the genuine PostgreSQL write, not a stub standing in
+    for it. That matters: a stub proves the loop stayed free but says nothing
+    about whether the turn was still written down, and a fix that achieved
+    responsiveness by dropping the row would pass. Both halves are asserted.
+
+    A ticker co-runs on the loop. If the write happens inline the ticker stops
+    for the whole delay; handed to a worker it keeps running. The assertion is
+    on the ticker rather than on wall time, so it fails for the right reason on
+    a slow machine instead of flaking.
+    """
+    import time as clock
+
+    from app.observability import recorder as recorder_module
+    from app.realtime.realtime_manager import RealtimeConnection, RealtimeManager
+
+    DELAY = 0.4
+    real_record_turn = recorder_module.record_turn
+
+    def slow_record_turn(*args, **kwargs):
+        # Slow, then genuinely written. This is what a loaded database looks
+        # like from inside the pump.
+        clock.sleep(DELAY)
+        return real_record_turn(*args, **kwargs)
+
+    monkeypatch.setattr(recorder_module, "record_turn", slow_record_turn)
+
+    session, context = phone_call("phase691-nonblocking")
+
+    async def scenario():
+        realtime = RealtimeManager(manager=session_manager)
+        state = {"ticks": 0, "running": True}
+
+        class OneEventSession:
+            """A model session that yields one caller turn, then ends."""
+
+            def __init__(self, event):
+                self._event = event
+
+            async def __aiter__(self):
+                yield self._event
+
+        connection = RealtimeConnection(
+            banking_session_id=session.session_id,
+            realtime_session_id="REALTIME-nonblocking",
+            session=OneEventSession(
+                transcription_event("What is my savings balance?")
+            ),
+        )
+
+        async def ticker():
+            while state["running"]:
+                state["ticks"] += 1
+                await asyncio.sleep(0.01)
+
+        beat = asyncio.create_task(ticker())
+        await asyncio.sleep(0.05)
+        before = state["ticks"]
+
+        # The real production pump, not a re-implementation of it.
+        await realtime._pump_events(connection, None)
+
+        during = state["ticks"] - before
+        state["running"] = False
+        beat.cancel()
+        try:
+            await beat
+        except asyncio.CancelledError:
+            pass
+        return during
+
+    ticks_during_write = run(scenario())
+
+    # The write takes 0.4s; a 10ms ticker should manage roughly 40 turns.
+    # Blocked inline it would manage none. Ten is far below the expectation and
+    # far above what a blocked loop can produce.
+    assert ticks_during_write >= 10, (
+        f"the event loop only ran {ticks_during_write} times during a "
+        f"{DELAY}s recorder write - it was blocked, not handed off"
+    )
+
+    # And the turn was still recorded. Responsiveness bought by losing the row
+    # would be a worse bug than the one this replaced.
+    record = row(session.session_id)
+    assert record.last_intent == "OWN_ACCOUNT_ENQUIRY", record.last_intent
+    assert record.current_domain == "ACCOUNT", record.current_domain
+
+
+def test_the_scope_ruling_itself_is_still_immediate():
+    """Non-blocking must not have become non-enforcing.
+
+    The ruling has to be in force before the next tool call is admitted. If
+    deferring the *write* had deferred the *decision*, a cross-customer
+    question would be answered on the strength of the previous turn's ruling.
+    """
+    from app.realtime.realtime_manager import RealtimeManager
+    from app.realtime.turn_gate import refusal_for
+
+    session, context = phone_call("phase691-ruling")
+    run(call_tool(tools.submit_customer_id, context, spoken_customer_id="DEMO001"))
+    run(call_tool(tools.submit_pin, context, spoken_pin=PINS["DEMO001"]))
+
+    realtime = RealtimeManager(manager=session_manager)
+    realtime._feed_gate(
+        session.session_id, transcription_event(CROSS_CUSTOMER)
+    )
+
+    live = session_manager.get_session(session.session_id)
+    assert refusal_for(live, "get_account_balance") is not None, (
+        "the gate had not ruled by the time the tool would have run"
+    )
+
+
+# === I. Phase 6.9.1: one utterance, one turn row ============================
+
+
+def test_two_representations_of_one_utterance_record_one_turn():
+    """The same words arrive twice; the row is written once.
+
+    `_feed_gate` sees an utterance as a transcription event and again as a
+    history item, both carrying the same conversation item id. The ruling is
+    applied for each — it is cheap and must stay current — but only the first
+    asks to be recorded.
+    """
+    from app.realtime.realtime_manager import RealtimeManager
+
+    session, context = phone_call("phase691-dedupe")
+    realtime = RealtimeManager(manager=session_manager)
+
+    text = "What is my savings balance?"
+    first = realtime._feed_gate(session.session_id, transcription_event(text, "itm-9"))
+    second = realtime._feed_gate(session.session_id, history_event(text, "itm-9"))
+
+    assert first is not None, "the first representation recorded nothing"
+    assert second is None, "the same utterance asked to be recorded twice"
+
+
+def test_a_later_utterance_is_still_recorded():
+    """Dedupe must be per item, not per wording.
+
+    The same question asked twice in one call is two turns and must produce two
+    records — which is why the key is the conversation item id, not the words.
+    """
+    from app.realtime.realtime_manager import RealtimeManager
+
+    session, context = phone_call("phase691-repeat")
+    realtime = RealtimeManager(manager=session_manager)
+
+    text = "What is my savings balance?"
+    first = realtime._feed_gate(session.session_id, transcription_event(text, "itm-1"))
+    later = realtime._feed_gate(session.session_id, transcription_event(text, "itm-2"))
+
+    assert first is not None
+    assert later is not None, "an identical question on a later turn was dropped"
+
+
+def test_the_dedupe_set_is_scoped_to_one_call():
+    """No cross-call contamination, and nothing left behind."""
+    from app.realtime.realtime_manager import RealtimeManager
+
+    one, _ = phone_call("phase691-scope-a")
+    two, _ = phone_call("phase691-scope-b")
+    realtime = RealtimeManager(manager=session_manager)
+
+    text = "What is my savings balance?"
+    first = realtime._feed_gate(one.session_id, transcription_event(text, "shared"))
+    # Same item id, different call: must not be suppressed by the first call.
+    other = realtime._feed_gate(two.session_id, transcription_event(text, "shared"))
+
+    assert first is not None
+    assert other is not None, "one call's dedupe silenced another call's turn"
+
+    session_manager.destroy_session(one.session_id)
+    assert session_manager.get_session(one.session_id) is None
+
+
+# === J. Phase 6.9.1: scope refusals are recorded on both channels ===========
+
+
+def test_a_channel_2_cross_customer_refusal_is_recorded():
+    """The enquiry an operator most needs to see must not be the invisible one."""
+    session, context = phone_call("phase691-cross-2")
+
+    run(call_tool(tools.submit_customer_id, context, spoken_customer_id="DEMO001"))
+    run(call_tool(tools.submit_pin, context, spoken_pin=PINS["DEMO001"]))
+
+    before = row(session.session_id).tool_call_count
+    feed_turn(session.session_id, CROSS_CUSTOMER, item_id="x-1")
+    refused = run(call_tool(tools.get_account_balance, context, account_type="Savings"))
+
+    assert refused.get("success") is False
+    assert refused.get("reason") == "OUT_OF_SCOPE", refused
+
+    record = row(session.session_id)
+    assert record.tool_call_count == before + 1, (
+        "a scope refusal was not counted as an invocation"
+    )
+
+    events = [
+        e for e in tool_events(session.session_id)
+        if e.tool_name == "get_account_balance"
+    ]
+    assert len(events) == 1, f"{len(events)} rows for one refused enquiry"
+    assert events[0].status == "FAILED", events[0].status
+
+
+def test_a_channel_1_cross_customer_refusal_is_recorded(browser):
+    """Parity with the behaviour Channel 1 had before the mirror moved."""
+    session_id = browser_call(browser)
+    run_browser_tool(
+        browser, session_id, "submit_customer_id", spoken_customer_id="DEMO001"
+    )
+    run_browser_tool(browser, session_id, "submit_pin", spoken_pin=PINS["DEMO001"])
+
+    scoped = browser.post(
+        "/api/call/scope",
+        json={"session_id": session_id, "transcript": CROSS_CUSTOMER},
+    )
+    assert scoped.status_code == 200, scoped.text
+
+    before = row(session_id).tool_call_count
+    result = run_browser_tool(
+        browser, session_id, "get_account_balance", account_type="Savings"
+    )
+
+    assert result.get("success") is False
+    assert row(session_id).tool_call_count == before + 1, (
+        "Channel 1 stopped recording scope refusals"
+    )
+    events = [
+        e for e in tool_events(session_id) if e.tool_name == "get_account_balance"
+    ]
+    assert len(events) == 1
+    assert events[0].status == "FAILED"
+
+
+def test_a_refused_enquiry_records_no_customer_data():
+    """Counted, but nothing about who was asked for or how much."""
+    session, context = phone_call("phase691-refusal-privacy")
+
+    run(call_tool(tools.submit_customer_id, context, spoken_customer_id="DEMO001"))
+    run(call_tool(tools.submit_pin, context, spoken_pin=PINS["DEMO001"]))
+    feed_turn(session.session_id, CROSS_CUSTOMER, item_id="x-2")
+    run(call_tool(tools.get_account_balance, context, account_type="Savings"))
+
+    with session_scope() as db:
+        written = " ".join(
+            f"{event.tool_name} {event.status}"
+            for event in db.scalars(select(AgentToolEvent))
+        )
+    for secret in ("DEMO002", DEMO001_SAVINGS, PINS["DEMO001"], "Savings"):
+        assert secret not in written, f"{secret!r} reached agent_tool_events"
+
+
+# === K. Phase 6.9.1: the guard is diagnosable as well as silent ============
+
+
+def test_a_database_outage_is_swallowed_and_marked(caplog):
+    """Infrastructure failing must not break a call, but must be findable.
+
+    A mirror that has quietly stopped writing looks exactly like a channel that
+    was never wired up — which is the whole of Phase 6.9. So the swallow is
+    kept, and a stable marker is emitted to alert on.
+    """
+    import logging
+
+    from app.observability import business
+    from app.observability import recorder as recorder_module
+
+    def outage(*_args, **_kwargs):
+        raise OSError("connection to the database was reset")
+
+    session, context = phone_call("phase691-outage")
+
+    original = recorder_module.record_tool_call
+    recorder_module.record_tool_call = outage
+    try:
+        with caplog.at_level(logging.ERROR):
+            result = run(
+                call_tool(
+                    tools.submit_customer_id, context, spoken_customer_id="DEMO001"
+                )
+            )
+    finally:
+        recorder_module.record_tool_call = original
+
+    assert result["success"] is True, "an outage in the mirror broke the tool"
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert business.MIRROR_FAILED in logged, "no greppable marker was emitted"
+    assert "OSError" in logged, "the failure type was not reported"
+
+    # And no traceback: an outage is expected, transient, and not a defect in
+    # this module. Asserting its absence is what makes the split with the
+    # programming-error branch real rather than decorative.
+    marked = [r for r in caplog.records if business.MIRROR_FAILED in r.getMessage()]
+    assert marked and not any(r.exc_info for r in marked), (
+        "an infrastructure outage was reported with a traceback"
+    )
+
+
+def test_a_programming_error_is_swallowed_but_reported_loudly(caplog):
+    """A bug in this module must not disappear into silence.
+
+    The banking answer is still protected — that rule does not bend — but a
+    renamed attribute or a changed signature is reported with a traceback, so
+    it is found by reading a log rather than by noticing missing rows weeks
+    later.
+    """
+    import logging
+
+    from app.observability import business
+    from app.observability import recorder as recorder_module
+
+    def bug(*_args, **_kwargs):
+        raise AttributeError("'Session' object has no attribute 'renamed_field'")
+
+    session, context = phone_call("phase691-bug")
+
+    original = recorder_module.record_tool_call
+    recorder_module.record_tool_call = bug
+    try:
+        with caplog.at_level(logging.ERROR):
+            result = run(
+                call_tool(
+                    tools.submit_customer_id, context, spoken_customer_id="DEMO001"
+                )
+            )
+    finally:
+        recorder_module.record_tool_call = original
+
+    assert result["success"] is True, "a bug in the mirror broke the tool"
+
+    marked = [r for r in caplog.records if business.MIRROR_FAILED in r.getMessage()]
+    assert marked, "no greppable marker was emitted for a programming error"
+    assert any(r.exc_info for r in marked), (
+        "a programming error was reported without a traceback"
+    )
+
+
+def test_the_guard_logs_no_argument_or_result(caplog):
+    """Whatever fails, the log carries no PIN, balance or customer data.
+
+    The arguments in scope when the guard fires include a tool result — one of
+    which is a balance — and on the authentication path a spoken PIN has just
+    passed through. None of it may be formatted into the message.
+    """
+    import logging
+
+    from app.observability import recorder as recorder_module
+
+    def bug(*_args, **_kwargs):
+        raise TypeError("record_tool_call() got an unexpected keyword argument")
+
+    session, context = phone_call("phase691-guard-privacy")
+    run(call_tool(tools.submit_customer_id, context, spoken_customer_id="DEMO001"))
+
+    original = recorder_module.record_tool_call
+    recorder_module.record_tool_call = bug
+    try:
+        with caplog.at_level(logging.DEBUG):
+            run(call_tool(tools.submit_pin, context, spoken_pin=PINS["DEMO001"]))
+            live = session_manager.get_session(session.session_id)
+            feed_turn(session.session_id, "What is my savings balance?",
+                      item_id="guard-1")
+            run(call_tool(tools.get_account_balance, context, account_type="Savings"))
+    finally:
+        recorder_module.record_tool_call = original
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    for secret in (PINS["DEMO001"], DEMO001_SAVINGS, "12450", "Alex Tan"):
+        assert secret not in logged, f"{secret!r} reached a log line while failing"
+
+
+def test_a_failing_mirror_still_answers_the_banking_question(caplog):
+    """The end-to-end statement of the rule, on the enquiry path.
+
+    `test_recording_never_breaks_a_call_when_the_database_fails` covers the
+    same rule for one tool; this one proves a caller still gets their money's
+    worth with the mirror broken for the whole call.
+    """
+    import logging
+
+    from app.observability import recorder as recorder_module
+
+    def outage(*_args, **_kwargs):
+        raise RuntimeError("the database is gone")
+
+    session, context = phone_call("phase691-broken-mirror")
+    run(call_tool(tools.submit_customer_id, context, spoken_customer_id="DEMO001"))
+    run(call_tool(tools.submit_pin, context, spoken_pin=PINS["DEMO001"]))
+    feed_turn(session.session_id, "What is my savings balance?", item_id="broken-1")
+
+    original_tool = recorder_module.record_tool_call
+    original_auth = recorder_module.record_authentication
+    original_turn = recorder_module.record_turn
+    recorder_module.record_tool_call = outage
+    recorder_module.record_authentication = outage
+    recorder_module.record_turn = outage
+    try:
+        with caplog.at_level(logging.ERROR):
+            balance = run(
+                call_tool(tools.get_account_balance, context, account_type="Savings")
+            )
+    finally:
+        recorder_module.record_tool_call = original_tool
+        recorder_module.record_authentication = original_auth
+        recorder_module.record_turn = original_turn
+
+    assert balance["success"] is True, "a broken mirror cost the caller their answer"
     assert balance["available_balance"] == DEMO001_SAVINGS

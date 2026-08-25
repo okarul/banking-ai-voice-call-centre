@@ -145,16 +145,18 @@ def record_decision(session: Session | None, decision: ScopeDecision) -> None:
 
         pending_request.clear(session)
 
-    # Both channels arrive here — the browser through `/scope`, the telephone
-    # through `record_turn` above — which makes this the one place a turn's
-    # domain and intent can be written down once for either. Imported locally
-    # to keep this module's import graph free of the observability package.
+    # Deliberately **no database write here.** This function is called from
+    # `RealtimeManager._feed_gate`, which runs inside the realtime pump's
+    # `async for` — on the same event loop that paces this call's audio. A
+    # PostgreSQL write costs 11-26ms there, against a gateway sending one
+    # 160-byte frame every 20ms, so persisting inline stalled playback for
+    # roughly a frame on every caller turn.
     #
-    # The transcript is *not* passed: this records what the turn was about,
-    # never what was said. On the authentication turns that text is a PIN.
-    from app.observability import business
-
-    business.record_turn_decision(session, decision)
+    # The ruling itself stays synchronous, because scope enforcement must be
+    # in force before the next tool call is admitted. Only the mirror moves:
+    # each channel persists the returned decision from a context where
+    # blocking is safe — `/scope` on its threadpool, the telephone through
+    # `asyncio.to_thread` in the pump.
 
 
 def record_turn(session: Session | None, transcript: str) -> ScopeDecision | None:

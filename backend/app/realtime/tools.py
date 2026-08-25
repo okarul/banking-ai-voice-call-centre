@@ -132,12 +132,29 @@ async def _check_scope(context: Ctx, tool_name: str) -> dict | None:
     """
     banking = context.context
     session = await asyncio.to_thread(banking.session)
+    started = time.perf_counter()
 
     await wait_for_ruling(session)
     # Re-read: the ruling for this turn may have landed while we waited.
     session = await asyncio.to_thread(banking.session)
 
-    return refusal_for(session, tool_name)
+    refusal = refusal_for(session, tool_name)
+    if refusal is not None:
+        # Recorded here because a scope refusal returns before `_dispatch`,
+        # which is where every other invocation is counted. Left unrecorded,
+        # the one enquiry an operator most needs to see — a verified caller
+        # reaching for somebody else's money — was the only one that left no
+        # trace, on either channel. The refusal dict carries `success: False`,
+        # so it is counted as an invocation and recorded FAILED, never OK.
+        session_id, _manager = _binding(context)
+        await asyncio.to_thread(
+            business.record_tool_outcome,
+            session_id,
+            tool_name,
+            refusal,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+    return refusal
 
 
 async def _carried(context: Ctx, domain: Domain, stated: str | None) -> str | None:

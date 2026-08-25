@@ -28,7 +28,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.agents.registry import FORBIDDEN_ARGUMENTS
-from app.observability import recorder
+from app.observability import business, recorder
 from app.realtime.browser_calls import browser_call_manager, sweep_idle_calls
 from app.realtime.realtime_manager import Reason, RealtimeSessionError
 from app.realtime.turn_gate import record_decision
@@ -269,10 +269,14 @@ def check_scope(payload: ScopeRequest) -> dict:
     # server-side, before any banking data is read.
     record_decision(session, decision)
 
-    # The turn's domain and intent are written by `record_decision` above,
-    # which both channels reach — so recording them again here would give the
-    # browser two writes per turn and the telephone none.
-    #
+    # The turn's domain and intent, through the same shared mirror the
+    # telephone uses — so both channels write the identical row — but called
+    # from here rather than from inside `record_decision`. This endpoint is a
+    # sync `def`, so FastAPI runs it on a worker thread where a database write
+    # is safe; the telephone reaches `record_decision` from its audio event
+    # loop, where it is not, and persists through `to_thread` in the pump.
+    business.record_turn_decision(session, decision)
+
     # The caller's line still goes to the transcript from here, redacted
     # before it is stored, because this is the endpoint the authentication
     # turns come through and this is the browser's only path to it.

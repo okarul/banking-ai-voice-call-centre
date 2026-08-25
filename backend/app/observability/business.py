@@ -51,6 +51,15 @@ from app.sessions import session_manager as default_manager
 
 logger = logging.getLogger("app.observability.business")
 
+# One stable string to alert on. A mirror that has silently stopped writing
+# looks exactly like a channel that was never wired up, which is the whole of
+# Phase 6.9 — so it must be greppable rather than inferred from missing rows.
+MIRROR_FAILED = "OBSERVABILITY_MIRROR_FAILED"
+
+# Failures that mean this module is wrong, as opposed to its dependencies being
+# down. Reported with a traceback; everything else is treated as an outage.
+_BUG = (AttributeError, TypeError, NameError, KeyError, IndexError, ImportError)
+
 
 # How a scope category reads on an operations board. Moved here from the
 # browser router so both channels label a turn the same way; a phone call and a
@@ -97,12 +106,30 @@ def _never_fails(operation: str):
         def guarded(*args, **kwargs):
             try:
                 return function(*args, **kwargs)
-            except Exception as error:
-                # Type only. The arguments in scope here include a tool result.
+            except _BUG as error:
+                # A defect in this module, not an outage underneath it: a
+                # renamed attribute, a changed signature, a wrong type. Still
+                # swallowed — the banking answer is not the place to discover
+                # it — but reported loudly, because the failure mode otherwise
+                # is silence: every call recording nothing, for the same reason
+                # Phase 6.9 existed.
+                #
+                # The traceback carries file, line and source, never values.
+                # No argument is formatted into the message, because one of
+                # them is a tool result.
                 logger.error(
-                    "business observability %s failed: %s",
+                    "%s %s failed: %s",
+                    MIRROR_FAILED,
                     operation,
                     type(error).__name__,
+                    exc_info=True,
+                )
+                return None
+            except Exception as error:
+                # Everything else is the database or the session store being
+                # unavailable. Expected, transient, and not worth a traceback.
+                logger.error(
+                    "%s %s failed: %s", MIRROR_FAILED, operation, type(error).__name__
                 )
                 return None
 
