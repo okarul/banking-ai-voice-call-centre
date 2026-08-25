@@ -6,9 +6,13 @@ Every scenario is a permanent release gate. One command runs them all:
 python -m pytest -m customer_trust -q
 ```
 
-**Protected baseline: `818343d`.** Phase 6.10 cases are deterministically
-`PROTECTED`; their `Live` column stays `PENDING` until the Phase 6.11 UAT,
-because nothing here has been through a real telephone yet.
+**Protected baseline: `818343d`** — deployed and live-tested successfully.
+
+Phase 6.10 cases below are deterministically `PROTECTED`; their `Live` column
+stays `PENDING` until the Phase 6.11 UAT, because the Phase 6.10 behaviour —
+the three authentication sentences, the split disconnect reasons and the
+lifecycle bound — has not yet been through a real telephone. CT-D02 is the one
+exception: the live call that opened this phase is itself the evidence.
 
 All tests live in `backend/tests/test_customer_trust.py`.
 
@@ -156,6 +160,19 @@ proves the model branches on backend state rather than its own judgement.
 | CT-121 | A locked call closes even if the model never speaks | `test_ct_121_…` |
 | CT-122 | The bound never cuts off a line that does arrive | `test_ct_122_…` |
 | CT-123 | A goodbye is never given a deadline (6.7 untouched) | `test_ct_123_…` |
+| CT-124 | Normal playback closure cancels the bound | `test_ct_124_…` |
+| CT-125 | A caller hanging up cancels it | `test_ct_125_…` |
+| CT-126 | A failed closing line cancels it | `test_ct_126_…` |
+| CT-127 | It still fires when nothing else closes | `test_ct_127_…` |
+| CT-128 | A goodbye close leaves no task behind | `test_ct_128_…` |
+
+The bound must never outlive the call it protects: a task pending against a
+finished call holds the lifecycle alive for its whole timeout. CT-124–126 were
+each verified to fail without the cancellation.
+
+**Where absence of a tool call is proved:** CT-050–053 assert classification
+only. That a non-banking or unauthenticated turn cannot reach protected money
+is proved by CT-043 and the cross-customer rows, which do invoke a tool.
 
 ## Multi-turn, social, closing, failure, events
 
@@ -165,7 +182,7 @@ proves the model branches on backend state rather than its own judgement.
 | CT-031 | Domain change account → loan | `test_ct_031_…` |
 | CT-032 | Same question on two turns → two answers | `test_ct_032_…` |
 | CT-035 | Correction uses what was said last | `test_ct_035_…` |
-| CT-050/051/053 | Unsupported, non-banking, social reach no banking tool | `test_ct_050_to_053_…` |
+| CT-050/051/053 | Unsupported, non-banking, social are not classified as banking enquiries | `test_ct_050_to_053_are_not_classified_as_banking` |
 | CT-052 | Ambiguous request asks which account | `test_ct_052_…` |
 | CT-053 | Social greeting is courtesy | `test_ct_053_…` |
 | CT-060–063 | Goodbye before / during / after auth / after banking | `test_ct_060_to_063_…` |

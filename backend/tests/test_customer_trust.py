@@ -1552,8 +1552,14 @@ def test_ct_035_a_correction_uses_what_the_caller_said_last():
 # === CT-050..053: unsupported, non-banking, ambiguous, social ===============
 
 
-def test_ct_050_to_053_non_banking_turns_reach_no_banking_tool():
-    """None of these may read protected money, authenticated or not."""
+def test_ct_050_to_053_non_banking_turns_are_not_classified_as_banking():
+    """None of these is classified as a banking enquiry.
+
+    Scope of this test, stated honestly: it asserts the *classification*, not
+    the absence of a tool call. That a non-banking turn cannot reach protected
+    money is proved separately by `test_ct_043_…` and the cross-customer rows,
+    which do invoke a tool and assert the refusal.
+    """
     from app.scope import classify_scope
 
     session, context = identified("ct-050")
@@ -1833,3 +1839,148 @@ def test_ct_082_speech_started_opens_a_turn_without_persisting_one():
     assert refusal is not None and refusal["reason"] == REASON_UNCLASSIFIED, (
         "a new caller turn did not reopen the gate"
     )
+
+
+# === CT-124..127: the fallback must not outlive the call it protects =======
+#
+# The bound exists for a call the model never speaks to. Once the call has
+# closed by any other route the bound has done its job, and a task still
+# pending against a finished call holds the lifecycle alive for its whole
+# timeout. Harmless at a ceiling of five; not something to carry into Phase 7.
+
+
+def _armed_lifecycle(call_id, ended, *, deadline=5.0):
+    """A lifecycle with an authentication ending armed and a reply owed."""
+    from app.telephony.lifecycle import CallLifecycle
+
+    async def hang_up(reason):
+        ended.append(reason)
+
+    return CallLifecycle(call_id, speak=_no_speech, hang_up=hang_up), deadline
+
+
+async def _arm_auth_ending(lifecycle, deadline):
+    await lifecycle.on_assistant_audio()
+    await lifecycle.arm_goodbye(
+        EndReason.AUTH_ATTEMPTS_EXHAUSTED, deadline=deadline
+    )
+    assert lifecycle.state is CallState.CLOSING, "the ending was not armed"
+    assert lifecycle._closing_task is not None, "no fallback was armed"
+    return lifecycle._closing_task
+
+
+def test_ct_124_normal_playback_closure_cancels_the_fallback():
+    """A. The common case: the line played, so the bound is finished with."""
+
+    async def scenario():
+        ended = []
+        lifecycle, deadline = _armed_lifecycle("ct-124", ended)
+        task = await _arm_auth_ending(lifecycle, deadline)
+
+        # The closing line finishes generating, then finishes playing.
+        await lifecycle.on_generation_ended()
+        await lifecycle.on_playback_drained()
+        await asyncio.sleep(0)
+        return ended, task, lifecycle
+
+    ended, task, lifecycle = run(scenario())
+
+    assert ended == [EndReason.AUTH_ATTEMPTS_EXHAUSTED], ended
+    assert task.cancelled() or task.done(), (
+        "the fallback survived a call that closed normally"
+    )
+    assert lifecycle._closing_task is None, "the fallback handle was not released"
+
+
+def test_ct_125_a_caller_hanging_up_cancels_the_fallback():
+    """B. Nothing is waiting to be played to a caller who has gone."""
+
+    async def scenario():
+        ended = []
+        lifecycle, deadline = _armed_lifecycle("ct-125", ended)
+        task = await _arm_auth_ending(lifecycle, deadline)
+
+        await lifecycle.on_caller_disconnected()
+        await asyncio.sleep(0)
+        return ended, task, lifecycle
+
+    ended, task, lifecycle = run(scenario())
+
+    assert ended == [EndReason.CALLER_DISCONNECTED], ended
+    assert task.cancelled() or task.done()
+    assert lifecycle._closing_task is None
+
+
+def test_ct_126_a_failed_closing_line_cancels_the_fallback():
+    """C. The line could not be delivered, so nothing is owed to anyone."""
+
+    async def scenario():
+        from app.telephony.lifecycle import CallLifecycle
+
+        ended = []
+
+        async def hang_up(reason):
+            ended.append(reason)
+
+        async def broken_speech(_text):
+            raise RuntimeError("the closing line could not be delivered")
+
+        lifecycle = CallLifecycle("ct-126", speak=broken_speech, hang_up=hang_up)
+        await lifecycle.on_assistant_audio()
+        await lifecycle.arm_goodbye(
+            EndReason.AUTH_ATTEMPTS_EXHAUSTED, deadline=5.0
+        )
+        task = lifecycle._closing_task
+        assert task is not None
+
+        # The silence path is the one that speaks a line and can fail doing so.
+        await lifecycle._speak_closing_line()
+        await asyncio.sleep(0)
+        return ended, task, lifecycle
+
+    ended, task, lifecycle = run(scenario())
+
+    assert task.cancelled() or task.done(), (
+        "the fallback survived a call closed by a failed closing line"
+    )
+    assert lifecycle._closing_task is None
+
+
+def test_ct_127_the_fallback_still_fires_when_nothing_else_closes():
+    """D. The whole point. Cancelling everywhere must not disarm the bound."""
+
+    async def scenario():
+        ended = []
+        lifecycle, _ = _armed_lifecycle("ct-127", ended)
+        await _arm_auth_ending(lifecycle, 0.2)
+
+        # No generation, no playback, no disconnect. Only the bound is left.
+        await asyncio.sleep(0.45)
+        return ended, lifecycle.state
+
+    ended, state = run(scenario())
+
+    assert ended == [EndReason.AUTH_ATTEMPTS_EXHAUSTED], (
+        "the fallback was cancelled into uselessness"
+    )
+    assert state is CallState.CLOSED
+
+
+def test_ct_128_a_goodbye_close_leaves_no_task_behind_either():
+    """The goodbye path never arms a bound, so there is nothing to cancel."""
+
+    async def scenario():
+        ended = []
+        lifecycle, _ = _armed_lifecycle("ct-128", ended)
+        await lifecycle.on_assistant_audio()
+        await lifecycle.arm_goodbye()  # exactly as the goodbye path calls it
+
+        armed = lifecycle._closing_task
+        await lifecycle.on_generation_ended()
+        await lifecycle.on_playback_drained()
+        return ended, armed
+
+    ended, armed = run(scenario())
+
+    assert armed is None, "a goodbye was given a deadline it should never have"
+    assert ended == [EndReason.CALLER_GOODBYE], ended

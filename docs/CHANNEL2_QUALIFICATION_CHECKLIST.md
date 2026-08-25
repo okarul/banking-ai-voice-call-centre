@@ -3,7 +3,9 @@
 A standing project artifact, not a phase document. Every future Channel 1 or
 Channel 2 change is measured against it.
 
-**Protected baseline: `818343d`** — the commit deployed to production before Phase 6.10.
+**Protected baseline: `818343d`** — deployed to production and live-tested
+successfully. Everything below marked `Live = PROVEN` has been observed on a
+real telephone call, not merely asserted deterministically.
 
 ## Status vocabulary
 
@@ -59,22 +61,22 @@ The behaviours §S names. These were working before Phase 6.10 and must not move
 | Q-110 | Capacity cleanup | PROTECTED | PROVEN | `test_capacity.py` | `browser_calls.py` | HIGH |
 | Q-111 | DEMO001 identification | PROTECTED | PROVEN | `test_customer_trust.py::identified` | `auth/authentication.py` | HIGH |
 | Q-112 | PIN 4821 authenticates DEMO001 | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `auth/authentication.py` | HIGH |
-| Q-113 | `authenticated=true` persists | PROTECTED | PENDING | `test_telephony_business_persistence.py` | `observability/business.py` | HIGH |
-| Q-114 | `auth_status=VERIFIED` persists | PROTECTED | PENDING | `test_telephony_business_persistence.py` | `observability/business.py` | HIGH |
-| Q-115 | `customer_id=DEMO001` persists | PROTECTED | PENDING | `test_telephony_business_persistence.py` | `observability/business.py` | HIGH |
+| Q-113 | `authenticated=true` persists | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `observability/business.py` | HIGH |
+| Q-114 | `auth_status=VERIFIED` persists | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `observability/business.py` | HIGH |
+| Q-115 | `customer_id=DEMO001` persists | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `observability/business.py` | HIGH |
 | Q-116 | Savings balance executes | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `app/tools` | HIGH |
-| Q-117 | `get_account_balance` recorded once | PROTECTED | PENDING | `test_telephony_business_persistence.py` | `realtime/tools.py` | MED |
-| Q-118 | `submit_customer_id` recorded once | PROTECTED | PENDING | `test_telephony_business_persistence.py` | `realtime/tools.py` | MED |
-| Q-119 | `submit_pin` recorded once | PROTECTED | PENDING | `test_telephony_business_persistence.py` | `realtime/tools.py` | MED |
-| Q-120 | `tool_call_count` semantics | PROTECTED | PENDING | `test_telephony_business_persistence.py` | `observability/business.py` | MED |
+| Q-117 | `get_account_balance` recorded once | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `realtime/tools.py` | MED |
+| Q-118 | `submit_customer_id` recorded once | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `realtime/tools.py` | MED |
+| Q-119 | `submit_pin` recorded once | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `realtime/tools.py` | MED |
+| Q-120 | `tool_call_count` semantics | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `observability/business.py` | MED |
 | Q-121 | Channel 2 `conversation_messages` stays 0 | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | privacy contract | HIGH |
 | Q-122 | PIN absent from logs | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `redaction.py` | HIGH |
 | Q-123 | Balance absent from logs | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `redaction.py` | HIGH |
 | Q-124 | Customer name absent from logs | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `redaction.py` | HIGH |
-| Q-125 | DEMO002 balance blocked for DEMO001 | PROTECTED | PENDING | `test_customer_trust.py` (planned CT-040) | `turn_gate.py` | HIGH |
-| Q-126 | Cross-customer recorded once FAILED | PROTECTED | PENDING | `test_telephony_business_persistence.py` | `realtime/tools.py` | HIGH |
-| Q-127 | No DEMO002 data leaked | PROTECTED | PENDING | `test_telephony_business_persistence.py` | `authorization/guards.py` | HIGH |
-| Q-128 | Identity unchanged after refusal | PROTECTED | PENDING | `test_telephony_business_persistence.py` | `turn_gate.py` | HIGH |
+| Q-125 | DEMO002 balance blocked for DEMO001 | PROTECTED | PROVEN | `test_customer_trust.py::…[CT-040]` | `turn_gate.py` | HIGH |
+| Q-126 | Cross-customer recorded once FAILED | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `realtime/tools.py` | HIGH |
+| Q-127 | No DEMO002 data leaked | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `authorization/guards.py` | HIGH |
+| Q-128 | Identity unchanged after refusal | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `turn_gate.py` | HIGH |
 | Q-129 | Observability failure cannot break an answer | PROTECTED | PENDING | `test_telephony_business_persistence.py` | `observability/business.py` | HIGH |
 | Q-130 | Duplicate turn representations → one row | PROTECTED | PENDING | `test_telephony_business_persistence.py` | `realtime_manager.py` | MED |
 | Q-131 | Channel 1 single-write persistence | PROTECTED | PENDING | `test_telephony_business_persistence.py` | `routers/call.py` | HIGH |
@@ -82,10 +84,20 @@ The behaviours §S names. These were working before Phase 6.10 and must not move
 | Q-133 | Readiness healthy | PROTECTED | PROVEN | `test_telephony_production.py` | `observability/readiness.py` | MED |
 | Q-134 | Health endpoint healthy | PROTECTED | PROVEN | `test_health.py` | `main.py` | MED |
 
-`Live = PENDING` on Q-113…Q-120 and Q-125…Q-131 is deliberate: those
-behaviours ship in `818343d`, whose business-persistence changes have not yet
-been exercised by a live call. They are deterministically protected and
-awaiting the Phase 6.11 UAT.
+**Live evidence at `818343d`.** The Phase 6.9 UAT exercised the business
+persistence path on a real call and established: DEMO001 authenticated,
+`auth_status = VERIFIED`, `customer_id = DEMO001`, `submit_customer_id`,
+`submit_pin` and `get_account_balance` each recorded exactly once,
+`tool_call_count` correct, `CALLER_GOODBYE` persisted, Channel 2
+`conversation_messages` still zero, no PIN, balance or customer name in any
+log, a cross-customer DEMO002 balance request blocked and recorded once as
+`FAILED`, and the verified identity unchanged after that refusal. Those rows
+are `PROVEN`.
+
+Q-129, Q-130 and Q-131 stay `PENDING` deliberately: an observability outage, a
+duplicated turn representation and Channel 1 single-write are protected
+deterministically but were not reproduced on a live call, and a row is only
+`PROVEN` with evidence.
 
 ---
 

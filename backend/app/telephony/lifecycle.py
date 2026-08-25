@@ -216,6 +216,11 @@ class CallLifecycle:
             self.state = CallState.CLOSED
             self._closed = True
             self._cancel_silence()
+            # The normal close for an armed authentication ending, so the
+            # fallback that was bounding it has done its job and must go. It
+            # would otherwise outlive the call it was protecting, holding this
+            # lifecycle alive until its timeout for no purpose.
+            self._cancel_closing_deadline()
 
         # Outside the lock, deliberately. Hanging up runs the owner teardown,
         # which closes the bridge, which closes this lifecycle — and that needs
@@ -350,6 +355,8 @@ class CallLifecycle:
             self._closed = True
             self.state = CallState.CLOSED
             self._cancel_silence()
+            # The caller is already gone; nothing is waiting to be played.
+            self._cancel_closing_deadline()
 
         # Outside the lock, for the same reason as `on_playback_drained`.
         await self._finish(EndReason.CALLER_DISCONNECTED)
@@ -469,6 +476,7 @@ class CallLifecycle:
                     return
                 self._closed = True
                 self.state = CallState.CLOSED
+                self._cancel_closing_deadline()
             await self._finish(EndReason.CALLER_SILENT)
 
     # --- ending --------------------------------------------------------------
