@@ -55,6 +55,52 @@ def _failure(reason: str, **extra) -> dict:
     return {"success": False, "reason": reason, **extra}
 
 
+# Why authentication stopped accepting attempts. The `reason` stays
+# `AUTHENTICATION_LOCKED` for both, because the authorization guard, the
+# dashboard and twenty-two existing tests read that string and it is not free
+# to rename.
+#
+# The two states must, however, be **communicated differently**. They are
+# materially different facts for the caller: one may ring back and try again,
+# the other may not until the window expires. Telling a customer their PIN is
+# locked when it is not is a false statement about their account, and telling
+# them to ring back when they are locked wastes their time. The security
+# requirement is to avoid leaking internals — attempt counters, thresholds,
+# which half of the credential pair was wrong — not to pretend two different
+# outcomes are the same one.
+#
+#   SESSION    this call has used its three attempts. Nothing is locked
+#              anywhere else; the caller may ring back and try again.
+#   PERSISTENT five failures against this id inside the lockout window.
+#              Ringing back will not help until the window expires.
+#
+# Saying "your PIN is locked" to a caller who has merely used up one call's
+# attempts is a false statement about the state of their account, and it is the
+# kind of thing that sends a customer to a branch for no reason.
+LOCK_SCOPE_SESSION = "SESSION"
+LOCK_SCOPE_PERSISTENT = "PERSISTENT"
+
+# Where the scope is left for the rest of the call to read. On the session, so
+# the telephone lifecycle can decide how to close without a database round trip
+# on the audio event loop — the mistake Phase 6.9.1 removed and must not
+# reintroduce here.
+LOCK_SCOPE_KEY = "auth_lock_scope"
+
+
+def _remember_lock_scope(session_id, scope, manager) -> None:
+    """Record which limit stopped this caller, for the lifecycle and the agent."""
+    session = manager.get_session(session_id)
+    if session is not None:
+        session.conversation_context[LOCK_SCOPE_KEY] = scope
+
+
+def lock_scope(session) -> str | None:
+    """Which limit stopped this session, or None if it was never stopped."""
+    if session is None:
+        return None
+    return session.conversation_context.get(LOCK_SCOPE_KEY)
+
+
 def verify_customer(
     session_id: str,
     customer_id: str,
@@ -122,7 +168,16 @@ def verify_pin(
         return _failure("SESSION_NOT_FOUND", authenticated=False)
 
     if session.authentication_locked:
-        return _failure("AUTHENTICATION_LOCKED", authenticated=False)
+        # Already stopped. Which limit did it is still worth reporting, so a
+        # repeat attempt on a locked session is described the same way as the
+        # attempt that locked it rather than becoming vaguer on the second ask.
+        candidate = session.candidate_customer_id
+        persistent = candidate is not None and lockout.is_locked(candidate) is not None
+        scope = LOCK_SCOPE_PERSISTENT if persistent else LOCK_SCOPE_SESSION
+        _remember_lock_scope(session_id, scope, manager)
+        return _failure(
+            "AUTHENTICATION_LOCKED", authenticated=False, lock_scope=scope
+        )
 
     # Already verified: the PIN step is over. Re-running it could only lower
     # this session's standing — a wrong value would raise the attempt count and
@@ -142,7 +197,24 @@ def verify_pin(
     # checked against the *claimed* id, which is the only thing known at this
     # point and the only thing an attacker can iterate.
     if lockout.is_locked(candidate) is not None:
-        return _failure("AUTHENTICATION_LOCKED", authenticated=False)
+        # The session is told, not just the caller. This return used to leave
+        # `authentication_locked` False on a session whose caller was genuinely
+        # locked out, so three things then disagreed with the tool result: the
+        # telephone's own view of the call, the `auth_status` written to the
+        # dashboard (FAILED rather than LOCKED), and the invariant that the
+        # assistant may only claim a lock the backend holds. The refusal was
+        # always correct; the record of it was not.
+        manager.update_session(
+            session_id,
+            authenticated=False,
+            authentication_locked=True,
+        )
+        _remember_lock_scope(session_id, LOCK_SCOPE_PERSISTENT, manager)
+        return _failure(
+            "AUTHENTICATION_LOCKED",
+            authenticated=False,
+            lock_scope=LOCK_SCOPE_PERSISTENT,
+        )
 
     with session_scope() as db:
         customer = get_customer_by_customer_id(db, candidate)
@@ -192,8 +264,20 @@ def verify_pin(
     )
 
     if locked:
+        # Which of the two limits stopped them decides what the caller is told.
+        # Both end this call's attempts; only one is a lock on the id itself,
+        # and claiming the wrong one misinforms the customer about their own
+        # account. `persistent` wins when both are true, because it is the
+        # stronger and longer-lasting fact.
+        scope = (
+            LOCK_SCOPE_PERSISTENT if persistent.locked else LOCK_SCOPE_SESSION
+        )
+        _remember_lock_scope(session_id, scope, manager)
         return _failure(
-            "AUTHENTICATION_LOCKED", authenticated=False, attempts_remaining=0
+            "AUTHENTICATION_LOCKED",
+            authenticated=False,
+            attempts_remaining=0,
+            lock_scope=scope,
         )
 
     return _failure(

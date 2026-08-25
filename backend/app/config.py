@@ -191,6 +191,15 @@ class Settings:
         self.telephony_protocol_timeout: int = _positive_int(
             os.getenv("TELEPHONY_PROTOCOL_TIMEOUT"), default=10
         )
+        # How long a call whose authentication is over may wait for the model
+        # to speak its closing line before the bank ends the call anyway.
+        # Generous on purpose: the normal path is the line playing and the
+        # gateway acknowledging it, and a slow but working turn must never be
+        # cut off. This only catches a provider that stops responding at the
+        # exact moment the bank has already decided the call is over.
+        self.telephony_auth_close_timeout: int = _positive_int(
+            os.getenv("TELEPHONY_AUTH_CLOSE_TIMEOUT"), default=20
+        )
         # A call with no audio in either direction for this long is assumed
         # dead and cleaned up, so a provider that never sends an end event
         # cannot leak a capacity slot for ever.

@@ -40,7 +40,9 @@ import logging
 import secrets
 import time
 
+from app.config import settings
 from app.agents import intents, speech
+from app.auth import authentication
 from app.telephony import audio as codec
 from app.telephony.conversation import ConversationState
 from app.telephony.lifecycle import CallLifecycle, EndReason
@@ -386,7 +388,57 @@ class PhoneCallBridge:
         come.
         """
         await self.lifecycle.on_generation_ended()
+        await self._close_if_authentication_is_over()
         await self._request_playback_boundary()
+
+    async def _close_if_authentication_is_over(self) -> None:
+        """End the call once authentication has stopped accepting attempts.
+
+        The backend decides this, not the model. The assistant is instructed to
+        say the session will end — and live, it said exactly that while the
+        line stayed open, because nothing connected `authentication_locked` to
+        the lifecycle. A bank that announces an ending and does not deliver one
+        has told the caller something untrue about their own call.
+
+        Armed here rather than executed: this runs when the model has *finished
+        generating* its closing line, not when the caller has heard it. Closure
+        goes through the same `arm_goodbye` path a spoken goodbye uses, so the
+        line still plays out in full and the gateway still acknowledges the
+        playback boundary before anything is torn down. There is deliberately
+        no second hang-up mechanism — one way to end a call is the only way to
+        keep the ending correct.
+
+        Both limits end the call, and they end it the same way — but they are
+        **recorded differently**, because they are different facts. Three
+        failures inside this call is a caller who forgot their PIN and may ring
+        back; five against the id across calls is a lock that a redial will not
+        move. Filing the first as the second would report an ordinary forgotten
+        PIN as a security event.
+
+        The scope is read from the session, which authentication wrote when it
+        decided. No database round trip: this runs on the loop that paces the
+        caller's audio, and Phase 6.9.1 exists because of what a query here
+        costs.
+        """
+        if not self.conversation.authentication_locked:
+            return
+
+        scope = authentication.lock_scope(self.conversation._session())
+        reason = (
+            EndReason.AUTHENTICATION_LOCKED
+            if scope == authentication.LOCK_SCOPE_PERSISTENT
+            else EndReason.AUTH_ATTEMPTS_EXHAUSTED
+        )
+        logger.info(
+            "bridge[%s] authentication is over (%s); closing after the final line",
+            self.provider_call_id,
+            reason.value,
+        )
+        # Bounded, because this is the one ending whose closing line the
+        # backend has committed to without knowing the model will produce it.
+        await self.lifecycle.arm_goodbye(
+            reason, deadline=settings.telephony_auth_close_timeout
+        )
 
     async def _request_playback_boundary(self) -> None:
         """Ask the gateway to report when this turn has reached the caller.

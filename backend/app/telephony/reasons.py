@@ -80,6 +80,18 @@ APPLICATION_ERROR = "APPLICATION_ERROR"
 #: specific name.
 APPLICATION_END = "APPLICATION_END"
 
+#: This call used its three PIN attempts. The customer id is **not** locked;
+#: the caller may ring back and try again immediately. Kept apart from
+#: `AUTH_LOCKOUT` because recording it as a lockout would report an ordinary
+#: forgotten PIN as a security event, and would make an honest redial look like
+#: an attacker returning.
+AUTH_ATTEMPTS_EXHAUSTED = "AUTH_ATTEMPTS_EXHAUSTED"
+
+#: Failures against this id reached the cross-call threshold inside the
+#: lockout window. Ringing back does not help until it expires. This is the
+#: one an operator should be able to count.
+AUTH_LOCKOUT = "AUTH_LOCKOUT"
+
 
 # --- refusals at admission --------------------------------------------------
 #
@@ -112,6 +124,8 @@ FROM_END_REASON = {
     "CALLER_SILENT": CALLER_SILENT,
     "CALLER_DISCONNECTED": CALLER_HANGUP,
     "SYSTEM_ERROR": APPLICATION_ERROR,
+    "AUTH_ATTEMPTS_EXHAUSTED": AUTH_ATTEMPTS_EXHAUSTED,
+    "AUTHENTICATION_LOCKED": AUTH_LOCKOUT,
 }
 
 # Every reason this application may record, for tests and for anyone reading
@@ -135,6 +149,8 @@ ALL = (
     IDLE_TIMEOUT,
     APPLICATION_ERROR,
     APPLICATION_END,
+    AUTH_ATTEMPTS_EXHAUSTED,
+    AUTH_LOCKOUT,
     CAPACITY_REJECTED,
     REALTIME_TIMEOUT,
     MEDIA_UNAVAILABLE,

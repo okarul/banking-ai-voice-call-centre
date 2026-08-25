@@ -74,6 +74,19 @@ class EndReason(str, Enum):
     CALLER_SILENT = "CALLER_SILENT"
     CALLER_DISCONNECTED = "CALLER_DISCONNECTED"
     SYSTEM_ERROR = "SYSTEM_ERROR"
+    # Authentication stopped accepting attempts. Two different facts, kept
+    # apart end to end, because they lead a caller — and an operator reading a
+    # board — to opposite conclusions.
+    #
+    #   ATTEMPTS_EXHAUSTED  this call used its three. Nothing is locked; the
+    #                       caller may ring back immediately and succeed.
+    #   AUTHENTICATION_LOCKED  the id is locked across calls for the window.
+    #                       Ringing back will not help.
+    #
+    # Recording the first as the second would tell an operator a customer is
+    # locked out when they are not, and would make a redial look like an attack.
+    AUTH_ATTEMPTS_EXHAUSTED = "AUTH_ATTEMPTS_EXHAUSTED"
+    AUTHENTICATION_LOCKED = "AUTHENTICATION_LOCKED"
 
 
 class CallLifecycle:
@@ -118,6 +131,9 @@ class CallLifecycle:
         self._reply_complete = False
 
         self._silence_task: asyncio.Task | None = None
+        # Bounds an armed ending the model may never speak to. See
+        # `_arm_closing_deadline`.
+        self._closing_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._closed = False
 
@@ -263,7 +279,12 @@ class CallLifecycle:
             self._cancel_silence()
             logger.info("lifecycle[%s] closing: caller said goodbye", self.call_id)
 
-    async def arm_goodbye(self) -> None:
+    async def arm_goodbye(
+        self,
+        reason: EndReason = EndReason.CALLER_GOODBYE,
+        *,
+        deadline: float | None = None,
+    ) -> None:
         """The *caller* has asked to end the call. Close after the reply plays.
 
         The counterpart to `on_goodbye_spoken`, and now the primary trigger.
@@ -280,7 +301,7 @@ class CallLifecycle:
         async with self._lock:
             if self._closed or self._closing_for is not None:
                 return
-            self._closing_for = EndReason.CALLER_GOODBYE
+            self._closing_for = reason
             self._cancel_silence()
 
             if not (self._generation_ended and self._reply_complete):
@@ -288,9 +309,12 @@ class CallLifecycle:
                 # before: the caller is owed their goodbye and cutting into
                 # queued audio to deliver a hang-up would talk over it.
                 self.state = CallState.CLOSING
+                if deadline is not None:
+                    self._arm_closing_deadline(reason, deadline)
                 logger.info(
-                    "lifecycle[%s] closing armed: caller asked to end the call",
+                    "lifecycle[%s] closing armed: %s",
                     self.call_id,
+                    reason.value,
                 )
                 return
 
@@ -301,16 +325,22 @@ class CallLifecycle:
             # line the bank has finished with. Close it here instead.
             self.state = CallState.CLOSED
             self._closed = True
+            self._cancel_closing_deadline()
             logger.info(
-                "lifecycle[%s] closing: caller asked to end the call after the "
-                "reply had already played",
+                "lifecycle[%s] closing after the reply had already played: %s",
                 self.call_id,
+                reason.value,
             )
 
         # Outside the lock, for the same reason as `on_playback_drained`:
         # hanging up tears down the bridge, which closes this lifecycle, which
         # needs this lock.
-        await self._finish(EndReason.CALLER_GOODBYE)
+        #
+        # `reason`, not a hard-coded goodbye: this path is reached by every
+        # armed ending, and filing a lockout as a caller goodbye would put a
+        # customer who could not get in on the board beside customers who
+        # finished their banking.
+        await self._finish(reason)
 
     async def on_caller_disconnected(self) -> None:
         """The caller hung up. Nothing to play out; stop at once."""
@@ -325,6 +355,58 @@ class CallLifecycle:
         await self._finish(EndReason.CALLER_DISCONNECTED)
 
     # --- the silence timer ---------------------------------------------------
+
+    def _arm_closing_deadline(self, reason: EndReason, seconds: float) -> None:
+        """Close a call that is waiting for a line the model may never speak.
+
+        Every other armed ending is safe to wait on indefinitely, because the
+        caller has just spoken and a reply is certainly coming. Authentication
+        endings are not: the backend has decided the call is over, and whether
+        the model produces a closing sentence is outside this application's
+        control. A provider that stalls at that moment would leave the caller
+        holding an open line the bank has finished with, until the idle sweep
+        noticed minutes later — too weak a guarantee for a termination the bank
+        has already committed to.
+
+        So this is a bound, not a replacement. The normal path still wins: the
+        line plays, the gateway acknowledges it, and closure happens through
+        `on_playback_drained` exactly as it does for a goodbye. This only fires
+        if that never happens, and it is deliberately generous enough that a
+        slow but working turn is never cut off.
+
+        The lock must already be held.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - no loop during shutdown
+            return
+        self._closing_task = loop.create_task(
+            self._wait_for_closing(reason, seconds), name=f"closing-{self.call_id}"
+        )
+
+    async def _wait_for_closing(self, reason: EndReason, seconds: float) -> None:
+        """Close if the armed ending has not completed in time."""
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            return
+
+        async with self._lock:
+            if self._closed or self.state is not CallState.CLOSING:
+                # The line played and closure happened normally, which is the
+                # outcome this exists to make unnecessary.
+                return
+            self._closed = True
+            self.state = CallState.CLOSED
+            self._closing_task = None
+            logger.warning(
+                "lifecycle[%s] closing without a final line after %ss: %s",
+                self.call_id,
+                seconds,
+                reason.value,
+            )
+
+        await self._finish(reason)
 
     def _arm_silence(self) -> None:
         """Start waiting for the caller. The lock must already be held."""
@@ -342,6 +424,12 @@ class CallLifecycle:
         if self._silence_task is not None:
             self._silence_task.cancel()
             self._silence_task = None
+
+    def _cancel_closing_deadline(self) -> None:
+        """Stop the fallback. The lock must already be held."""
+        if self._closing_task is not None:
+            self._closing_task.cancel()
+            self._closing_task = None
 
     async def _wait_for_silence(self) -> None:
         """Ten seconds of a caller not speaking, then say so and close."""
@@ -404,6 +492,8 @@ class CallLifecycle:
             self._closed = True
             self.state = CallState.CLOSED
             self._cancel_silence()
+            # A pending fallback must not outlive the call it was bounding.
+            self._cancel_closing_deadline()
 
     @property
     def closed(self) -> bool:
