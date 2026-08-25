@@ -23,7 +23,6 @@ Two rules shape every handler here:
 
 import asyncio
 import logging
-import time
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
@@ -169,50 +168,16 @@ async def post_tool(payload: ToolRequest) -> dict:
             status_code=status.HTTP_400_BAD_REQUEST, detail="IDENTITY_NOT_ACCEPTED"
         )
 
-    started = time.perf_counter()
+    # No bookkeeping here any more. `execute_tool` reaches the same tool
+    # objects the telephone agent is given, and those now record the
+    # invocation and the resulting identity themselves — see
+    # `app.observability.business`. Recording again at this end would count
+    # every browser tool call twice and write the identity twice, which is
+    # exactly the channel-specific duplication that moving the mirror down was
+    # meant to remove.
     result = await execute_tool(payload.name, payload.session_id, payload.arguments)
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
-
-    # Operational bookkeeping only: the tool's name, whether it worked and how
-    # long it took. Its arguments are never recorded — one of them is a PIN.
-    await asyncio.to_thread(
-        recorder.record_tool_call,
-        payload.session_id,
-        payload.name,
-        status="OK" if _succeeded(result) else "FAILED",
-        duration_ms=elapsed_ms,
-    )
-    if payload.name in _AUTHENTICATION_TOOLS:
-        await asyncio.to_thread(_record_identity, payload.session_id)
 
     return {"result": result}
-
-
-def _succeeded(result) -> bool:
-    return not (isinstance(result, dict) and result.get("success") is False)
-
-
-# Tools after which the authoritative identity may have changed.
-_AUTHENTICATION_TOOLS = {"submit_customer_id", "submit_pin"}
-
-
-def _record_identity(session_id: str) -> None:
-    """Copy the *backend's* verdict on who is calling into the dashboard.
-
-    Read from the session rather than from the tool result, because the session
-    is the authority. A caller who claimed an identity but failed the PIN check
-    must never appear on the dashboard as that customer.
-    """
-    session = session_manager.get_session(session_id)
-    if session is None:
-        return
-    recorder.record_authentication(
-        session_id,
-        customer_id=session.customer_id if session.authenticated else None,
-        authenticated=bool(session.authenticated),
-        locked=bool(session.authentication_locked),
-        failed=bool(session.authentication_attempts) and not session.authenticated,
-    )
 
 
 @router.post("/end")
@@ -304,14 +269,13 @@ def check_scope(payload: ScopeRequest) -> dict:
     # server-side, before any banking data is read.
     record_decision(session, decision)
 
-    # Operational state for the dashboard, and the caller's line for the
-    # transcript — redacted before it is stored, because this is the endpoint
-    # the authentication turns come through.
-    recorder.record_turn(
-        payload.session_id,
-        domain=_dashboard_domain(decision.category.value, session.current_domain),
-        intent=decision.category.value,
-    )
+    # The turn's domain and intent are written by `record_decision` above,
+    # which both channels reach — so recording them again here would give the
+    # browser two writes per turn and the telephone none.
+    #
+    # The caller's line still goes to the transcript from here, redacted
+    # before it is stored, because this is the endpoint the authentication
+    # turns come through and this is the browser's only path to it.
     recorder.record_message(
         payload.session_id, role="CUSTOMER", content=payload.transcript
     )
@@ -324,29 +288,6 @@ def check_scope(payload: ScopeRequest) -> dict:
         decision.allowed,
     )
     return decision.to_dict()
-
-
-# How a scope category reads on an operations board.
-_DASHBOARD_DOMAINS = {
-    "AUTHENTICATION": "AUTHENTICATION",
-    "OWN_ACCOUNT_ENQUIRY": "ACCOUNT",
-    "OWN_TRANSACTION_ENQUIRY": "ACCOUNT",
-    "OWN_LOAN_ENQUIRY": "LOAN",
-    "SOCIAL": "CLOSING",
-}
-
-
-def _dashboard_domain(category: str, current: str | None) -> str:
-    """The domain column's value for this turn.
-
-    Anything refused shows as GENERAL/SCOPE rather than as the banking domain
-    it was pretending to be — an operator watching the board should see that a
-    turn was turned away, not that a loan was discussed.
-    """
-    mapped = _DASHBOARD_DOMAINS.get(category)
-    if mapped:
-        return mapped
-    return "GENERAL/SCOPE" if category else (current or "AUTHENTICATION")
 
 
 @router.get("/active")

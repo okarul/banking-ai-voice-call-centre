@@ -28,6 +28,7 @@ the assistant sound like it is stuttering.
 """
 
 import asyncio
+import time
 
 from agents import RunContextWrapper, function_tool
 
@@ -36,6 +37,7 @@ from app.agents.intents import Domain
 from app.agents.registry import dispatch
 from app.agents.selection import carry_type
 from app.auth import authentication
+from app.observability import business
 from app.realtime.context import BankingRealtimeContext
 from app.realtime.turn_gate import refusal_for, wait_for_ruling
 
@@ -61,8 +63,21 @@ async def _dispatch(context: Ctx, tool_name: str, arguments: dict) -> dict:
     `app.pending_request`.
     """
     session_id, manager = _binding(context)
+    started = time.perf_counter()
     result = await asyncio.to_thread(
         dispatch, tool_name, session_id, arguments, manager=manager
+    )
+    # Recorded here rather than in either channel's caller: both the browser
+    # route and the telephone agent reach this function, and mirroring it in
+    # one of them was what left the telephone unobserved. Name, outcome and
+    # duration only — never the arguments (one is a PIN) and never the result
+    # (one is a balance).
+    await asyncio.to_thread(
+        business.record_tool_outcome,
+        session_id,
+        tool_name,
+        result,
+        duration_ms=int((time.perf_counter() - started) * 1000),
     )
 
     if not isinstance(result, dict):
@@ -87,6 +102,25 @@ async def _dispatch(context: Ctx, tool_name: str, arguments: dict) -> dict:
         pending_request.clear(session, manager=manager)
 
     return result
+
+
+async def _mirror(session_id, manager, tool_name, result, started) -> None:
+    """Record one authentication tool: the invocation, then the verdict.
+
+    Separate from `_dispatch` because the authentication tools do not go
+    through the Phase 8 registry — they call the deterministic verifiers
+    directly — and they are also the only tools that can change who the caller
+    is, which is a second thing worth writing down.
+    """
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    await asyncio.to_thread(
+        business.record_tool_outcome,
+        session_id,
+        tool_name,
+        result,
+        duration_ms=duration_ms,
+    )
+    await asyncio.to_thread(business.record_identity, session_id, manager=manager)
 
 
 async def _check_scope(context: Ctx, tool_name: str) -> dict | None:
@@ -130,12 +164,18 @@ async def submit_customer_id(context: Ctx, spoken_customer_id: str) -> dict:
         spoken_customer_id: The customer ID exactly as the caller said it.
     """
     session_id, manager = _binding(context)
-    return await asyncio.to_thread(
+    started = time.perf_counter()
+    result = await asyncio.to_thread(
         authentication.submit_customer_id,
         session_id,
         spoken_customer_id,
         manager=manager,
     )
+    # The authentication tools do not pass through `_dispatch`, so they mirror
+    # themselves. Identity is re-read from the session afterwards rather than
+    # taken from `result`: a claim is not a verification.
+    await _mirror(session_id, manager, "submit_customer_id", result, started)
+    return result
 
 
 @function_tool
@@ -151,9 +191,11 @@ async def submit_pin(context: Ctx, spoken_pin: str) -> dict:
     """
     session_id, manager = _binding(context)
     # The spoken value is passed straight through and kept in no local state.
+    started = time.perf_counter()
     result = await asyncio.to_thread(
         authentication.submit_pin, session_id, spoken_pin, manager=manager
     )
+    await _mirror(session_id, manager, "submit_pin", result, started)
 
     # Verified — so if they told us what they wanted before we knew who they
     # were, hand that back now and let the caller be answered rather than
@@ -180,10 +222,21 @@ async def get_authentication_status(context: Ctx) -> dict:
     PIN and no banking values.
     """
     session_id, manager = _binding(context)
+    started = time.perf_counter()
     status = await asyncio.to_thread(
         authentication.authentication_status, session_id, manager=manager
     )
-    return status or SESSION_GONE
+    result = status or SESSION_GONE
+    # Counted like any other tool — an operator reading the board should see
+    # that the agent asked — but it changes nothing, so no identity is written.
+    await asyncio.to_thread(
+        business.record_tool_outcome,
+        session_id,
+        "get_authentication_status",
+        result,
+        duration_ms=int((time.perf_counter() - started) * 1000),
+    )
+    return result
 
 
 # --- account enquiries ------------------------------------------------------

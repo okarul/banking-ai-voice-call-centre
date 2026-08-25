@@ -1,0 +1,183 @@
+"""One place where a business event becomes a database row, for both channels.
+
+Until Phase 6.9 this lived in `app/routers/call.py`. That worked for exactly as
+long as every call was a browser call, because the browser round-trips each
+tool through `POST /api/call/tool` and the endpoint mirrored the outcome on the
+way past. The telephone does not: the Agents SDK runs the same tool objects
+inside this process, so the router is never visited and nothing was written
+down. A live call therefore came back `authenticated = false`,
+`auth_status = PENDING`, `tool_call_count = 0` — for a call whose in-memory
+session had authenticated perfectly well.
+
+The mistake was where the mirror was attached, not what it did. Observability
+was bolted to a *transport* when the thing worth observing is a *business
+operation*. So it moves down to the boundary both channels genuinely share:
+
+    browser  -> POST /api/call/tool -> webrtc.execute_tool ─┐
+                                                            ├─> the same
+    phone    -> Agents SDK ─────────────────────────────────┘   @function_tool
+                                                                objects
+                                                                     |
+                                                                     v
+                                                         these functions
+                                                                     |
+                                                                     v
+                                                            one recorder call
+
+`webrtc.TOOLS_BY_NAME` is built from `BANKING_TOOLS`, the very list handed to
+the telephone agent, so both channels invoke the identical tool objects. That
+is what makes a single mirror possible and what makes a second one a
+duplicate: the browser route's own recording was removed in the same change
+that added this, because leaving it would have counted every browser tool
+twice.
+
+Nothing here decides anything. It reads the verdict the banking session
+already reached and writes it down. In particular `record_identity` reads
+`session.authenticated` rather than a tool's return value, so a caller who
+claimed an identity but failed the PIN can never be persisted as that customer.
+
+**What is never written.** No tool arguments — one of them is a PIN. No tool
+results — one of them is a balance. No transcript. Only the name of the tool,
+whether it worked, and how long it took.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from app.observability import recorder
+from app.sessions import SessionManager
+from app.sessions import session_manager as default_manager
+
+logger = logging.getLogger("app.observability.business")
+
+
+# How a scope category reads on an operations board. Moved here from the
+# browser router so both channels label a turn the same way; a phone call and a
+# browser call asking the same question must not show different domains.
+_DASHBOARD_DOMAINS = {
+    "AUTHENTICATION": "AUTHENTICATION",
+    "OWN_ACCOUNT_ENQUIRY": "ACCOUNT",
+    "OWN_TRANSACTION_ENQUIRY": "ACCOUNT",
+    "OWN_LOAN_ENQUIRY": "LOAN",
+    "SOCIAL": "CLOSING",
+}
+
+# Tools after which the authoritative identity may have changed.
+AUTHENTICATION_TOOLS = {"submit_customer_id", "submit_pin"}
+
+
+def dashboard_domain(category: str, current: str | None) -> str:
+    """The domain column's value for this turn.
+
+    Anything refused shows as GENERAL/SCOPE rather than as the banking domain
+    it was pretending to be — an operator watching the board should see that a
+    turn was turned away, not that a loan was discussed.
+    """
+    mapped = _DASHBOARD_DOMAINS.get(category)
+    if mapped:
+        return mapped
+    return "GENERAL/SCOPE" if category else (current or "AUTHENTICATION")
+
+
+def _never_fails(operation: str):
+    """Decorator: log and swallow. Observability never breaks a call.
+
+    The same guarantee `recorder._safe` gives, restated one layer up and for a
+    sharper reason. These functions are called from inside a live call's tool
+    path, between the banking work finishing and its answer being returned. An
+    exception escaping here would turn a correct balance into a failed tool —
+    an observability outage presenting to the customer as a banking outage.
+
+    `recorder` guards its own writes, so this covers what is left: reading the
+    session, mapping a category, and the thread hop itself.
+    """
+
+    def wrap(function):
+        def guarded(*args, **kwargs):
+            try:
+                return function(*args, **kwargs)
+            except Exception as error:
+                # Type only. The arguments in scope here include a tool result.
+                logger.error(
+                    "business observability %s failed: %s",
+                    operation,
+                    type(error).__name__,
+                )
+                return None
+
+        guarded.__name__ = function.__name__
+        guarded.__doc__ = function.__doc__
+        return guarded
+
+    return wrap
+
+
+def succeeded(result) -> bool:
+    """Whether a tool result represents success, by the existing convention."""
+    return not (isinstance(result, dict) and result.get("success") is False)
+
+
+@_never_fails("record_tool_outcome")
+def record_tool_outcome(
+    session_id: str,
+    tool_name: str,
+    result,
+    *,
+    duration_ms: int | None = None,
+) -> None:
+    """Count one banking tool, exactly once, for whichever channel ran it.
+
+    A refused tool is still an invocation and is still counted — an operator
+    needs to see that the caller asked — but it is recorded as `FAILED`, so a
+    refusal can never be read off the board as an answered enquiry.
+    """
+    recorder.record_tool_call(
+        session_id,
+        tool_name,
+        status="OK" if succeeded(result) else "FAILED",
+        duration_ms=duration_ms,
+    )
+
+
+@_never_fails("record_identity")
+def record_identity(
+    session_id: str, *, manager: SessionManager = default_manager
+) -> None:
+    """Copy the *backend's* verdict on who is calling into the dashboard.
+
+    Read from the session rather than from the tool result, because the session
+    is the authority. A caller who merely claimed an identity has not
+    established one, and the dashboard must not show an unverified claim as
+    though it were a customer.
+    """
+    session = manager.get_session(session_id)
+    if session is None:
+        return
+    recorder.record_authentication(
+        session_id,
+        customer_id=session.customer_id if session.authenticated else None,
+        authenticated=bool(session.authenticated),
+        locked=bool(session.authentication_locked),
+        failed=bool(session.authentication_attempts) and not session.authenticated,
+    )
+
+
+@_never_fails("record_turn_decision")
+def record_turn_decision(session, decision) -> None:
+    """Persist what this turn was about, for whichever channel classified it.
+
+    Hung off the scope ruling rather than off a tool call, because a turn has a
+    domain whether or not it reaches a tool: a refused cross-customer question
+    runs no tool at all and is exactly the turn an operator most wants to see.
+    """
+    if session is None or decision is None:
+        return
+    category = getattr(getattr(decision, "category", None), "value", None)
+    if not category:
+        return
+    recorder.record_turn(
+        session.session_id,
+        domain=dashboard_domain(category, session.current_domain),
+        intent=category,
+    )

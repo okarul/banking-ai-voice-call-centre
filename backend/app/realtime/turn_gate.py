@@ -145,6 +145,17 @@ def record_decision(session: Session | None, decision: ScopeDecision) -> None:
 
         pending_request.clear(session)
 
+    # Both channels arrive here — the browser through `/scope`, the telephone
+    # through `record_turn` above — which makes this the one place a turn's
+    # domain and intent can be written down once for either. Imported locally
+    # to keep this module's import graph free of the observability package.
+    #
+    # The transcript is *not* passed: this records what the turn was about,
+    # never what was said. On the authentication turns that text is a PIN.
+    from app.observability import business
+
+    business.record_turn_decision(session, decision)
+
 
 def record_turn(session: Session | None, transcript: str) -> ScopeDecision | None:
     """Classify one caller utterance and store the ruling.
