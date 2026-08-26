@@ -39,6 +39,7 @@ Offline: no OpenAI, no network, no paid usage.
 
 import asyncio
 import json
+import time
 
 import pytest
 from agents import RunContextWrapper
@@ -977,3 +978,655 @@ def test_an_unreachable_database_is_reported_as_an_outage(monkeypatch):
         assert pending_request.recall(call.session) is not None
     finally:
         call.close()
+
+
+# === Phase 6.11.1: timing is not a banking input ============================
+#
+# A live DEMO001 on ac2343f, verified, having asked for nothing but their own
+# savings balance, was told twice that it could not be retrieved:
+#
+#   get_account_balance FAILED duration_ms = 4023   TURN_NOT_CLASSIFIED
+#   get_authentication_status OK
+#   get_account_balance FAILED duration_ms = 4015   TURN_NOT_CLASSIFIED
+#
+# 4023 ms is `turn_gate.TRANSCRIPT_WAIT_SECONDS` elapsing. The gate is opened by
+# `input_audio_buffer.speech_started` - a provider VAD event that fires on any
+# speech onset - and was closed only by a transcript that both arrived and had
+# words in it. A breath, a cough, line noise, a discarded barge-in or a failed
+# transcription produces the onset and no transcript, so the turn stayed
+# `pending` for the rest of the call and every banking tool burned the full wait
+# before being refused.
+#
+# These tests hold the line that no banking result depends on that.
+
+
+class Pump:
+    """The real event pump, fed the shapes the SDK actually delivers.
+
+    Two different shapes, deliberately, because the application reads two:
+    the typed `input_audio_transcription_completed` event, and the raw provider
+    dict the SDK forwards for every WebSocket message.
+    """
+
+    def __init__(self, call: "Call") -> None:
+        from app.realtime.realtime_manager import RealtimeManager
+
+        self.call = call
+        self.manager = RealtimeManager(manager=call.manager)
+
+    def _feed(self, event) -> None:
+        self.manager._feed_gate(self.call.session_id, event)
+
+    def speech_started(self) -> None:
+        """The VAD onset. Opens a turn; nothing here guarantees a transcript."""
+        self._feed(
+            _Event(
+                "raw_model_event",
+                data=_Event(
+                    "raw_server_event",
+                    data={"type": "input_audio_buffer.speech_started"},
+                ),
+            )
+        )
+
+    def transcript(self, text: str) -> None:
+        self._feed(
+            _Event(
+                "raw_model_event",
+                data=_Event("input_audio_transcription_completed", transcript=text),
+            )
+        )
+
+    def empty_transcript(self) -> None:
+        """Heard, and empty. The provider transcribed silence."""
+        self.transcript("   ")
+
+    def transcription_failed(self) -> None:
+        """The provider tried to transcribe and could not.
+
+        There is no typed SDK event for this - only `.completed` is mapped - so
+        it arrives, if it is read at all, in the raw form.
+        """
+        self._feed(
+            _Event(
+                "raw_model_event",
+                data=_Event(
+                    "raw_server_event",
+                    data={
+                        "type": "conversation.item.input_audio_transcription.failed"
+                    },
+                ),
+            )
+        )
+
+    def typed_turn(self, text: str) -> None:
+        """The other valid representation: a user history item."""
+        self._feed(_Event("history_added", item=_Item("user", [_Entry(text=text)])))
+
+
+class _Event:
+    def __init__(self, type_, **fields):
+        self.type = type_
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
+class _Item:
+    def __init__(self, role, content):
+        self.role = role
+        self.content = content
+
+
+class _Entry:
+    def __init__(self, text=None, transcript=None):
+        self.text = text
+        self.transcript = transcript
+        self.type = "input_text" if text else "input_audio"
+
+
+def spoken(call: Call, pump: Pump, text: str) -> None:
+    """One ordinary caller turn: onset, then transcript."""
+    pump.speech_started()
+    pump.transcript(text)
+
+
+def verified_through_the_pump(call: Call, pump: Pump) -> None:
+    """Verify DEMO001 with every turn transcribing normally."""
+    spoken(call, pump, ASK_SAVINGS)
+    call.tool("get_authentication_status")
+    spoken(call, pump, SPOKEN_ID)
+    call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+    spoken(call, pump, SPOKEN_PIN)
+    call.tool("submit_pin", spoken_pin=HEARD_PIN)
+
+
+async def _balance_while(call: Call, publish, **arguments) -> tuple[dict, float]:
+    """Invoke the balance tool while `publish` runs concurrently on the loop.
+
+    This is how the live race actually happens: the model reaches for the tool
+    and the ruling for the turn is still in flight, or never coming at all.
+    """
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    tool = asyncio.ensure_future(
+        _invoke(TOOLS["get_account_balance"], call.context, **arguments)
+    )
+    await publish()
+    result = await tool
+    return result, loop.time() - started
+
+
+# The wait a held enquiry must never spend. Comfortably under
+# `TRANSCRIPT_WAIT_SECONDS`, comfortably over any real amount of work.
+QUICK_SECONDS = 1.5
+
+
+# --- Phase 2: the live failure, reproduced ----------------------------------
+
+
+@pytest.mark.balance_determinism
+def test_a_turn_that_never_transcribes_no_longer_refuses_the_held_enquiry():
+    """The fail-before-fix case for `TURN_NOT_CLASSIFIED`.
+
+    Against ac2343f this returns `TURN_NOT_CLASSIFIED` after roughly four
+    seconds - the same reason, the same duration and the same session state as
+    live call `3860a81f-1bc5-1240-4790-eaa5afddeeef`.
+    """
+    call = Call()
+    pump = Pump(call)
+    try:
+        verified_through_the_pump(call, pump)
+        assert call.session.authenticated is True
+        assert call.session.customer_id == CALLER
+        assert pending_request.recall(call.session) is not None
+
+        # A speech onset with nothing behind it. Nothing will ever close it.
+        pump.speech_started()
+        assert turn_gate.current_gate(call.session)["pending"] is True
+
+        started = time.perf_counter()
+        answer = call.tool("get_account_balance", account_type=ACCOUNT)
+        elapsed = time.perf_counter() - started
+
+        assert answer.get("reason") != turn_gate.REASON_UNCLASSIFIED, (
+            "reproduced the live regression: a verified DEMO001 was refused "
+            "their own savings balance because a turn never transcribed"
+        )
+        assert answer["success"] is True
+        assert elapsed < QUICK_SECONDS, (
+            f"the answer waited {elapsed:.2f}s on a ruling it does not need"
+        )
+        assert_self_savings_answered(call)
+    finally:
+        call.close()
+
+
+@pytest.mark.balance_determinism
+@pytest.mark.parametrize("wordless", ["empty_transcript", "transcription_failed"])
+def test_a_wordless_turn_resolves_instead_of_hanging(wordless):
+    """A turn the provider reports as producing nothing must close.
+
+    `open_turn` has no other closer. Left open, the gate refuses every banking
+    tool for the rest of the call - not for this caller, whose enquiry is held,
+    but for any later one.
+    """
+    call = Call()
+    pump = Pump(call)
+    try:
+        verified_through_the_pump(call, pump)
+        call.tool("get_account_balance", account_type=ACCOUNT)  # clears the hold
+        assert pending_request.recall(call.session) is None
+
+        pump.speech_started()
+        assert turn_gate.current_gate(call.session)["pending"] is True
+
+        getattr(pump, wordless)()
+
+        gate = turn_gate.current_gate(call.session)
+        assert gate["pending"] is False, "the turn was left open forever"
+        assert gate["allowed"] is False, "a turn nobody could hear is not permission"
+
+        # And the refusal is immediate, not a four-second timeout.
+        started = time.perf_counter()
+        refused = call.tool("get_account_balance", account_type=ACCOUNT)
+        elapsed = time.perf_counter() - started
+
+        assert refused["success"] is False
+        assert refused["reason"] == turn_gate.REASON_OUT_OF_SCOPE
+        assert elapsed < QUICK_SECONDS
+    finally:
+        call.close()
+
+
+# --- Phase 6: the timing matrix ---------------------------------------------
+
+
+@pytest.mark.balance_determinism
+def test_1_ruling_already_available_before_the_tool():
+    call = Call()
+    pump = Pump(call)
+    try:
+        verified_through_the_pump(call, pump)
+        spoken(call, pump, ASK_SAVINGS)
+        call.tool("get_account_balance", account_type=ACCOUNT)
+        assert_self_savings_answered(call)
+    finally:
+        call.close()
+
+
+@pytest.mark.balance_determinism
+def test_2_tool_starts_before_the_ruling():
+    """The model reaches for the tool while the transcript is still in flight."""
+    call = Call()
+    pump = Pump(call)
+    try:
+        verified_through_the_pump(call, pump)
+        pump.speech_started()
+
+        async def publish():
+            await asyncio.sleep(0)
+            pump.transcript(ASK_SAVINGS)
+
+        result, elapsed = run(
+            _balance_while(call, publish, account_type=ACCOUNT)
+        )
+        call.results.append(("get_account_balance", result))
+
+        assert result["success"] is True
+        assert elapsed < QUICK_SECONDS
+        assert_self_savings_answered(call)
+    finally:
+        call.close()
+
+
+@pytest.mark.balance_determinism
+@pytest.mark.parametrize("delay", [0.0, 0.05, 0.2])
+def test_3_a_slightly_delayed_ruling_changes_nothing(delay):
+    call = Call()
+    pump = Pump(call)
+    try:
+        verified_through_the_pump(call, pump)
+        pump.speech_started()
+
+        async def publish():
+            await asyncio.sleep(delay)
+            pump.transcript(ASK_SAVINGS)
+
+        result, elapsed = run(
+            _balance_while(call, publish, account_type=ACCOUNT)
+        )
+        call.results.append(("get_account_balance", result))
+
+        assert result["success"] is True
+        assert elapsed < QUICK_SECONDS
+        assert_self_savings_answered(call)
+    finally:
+        call.close()
+
+
+@pytest.mark.balance_determinism
+def test_4_a_ruling_delayed_past_the_old_timeout_is_not_waited_for():
+    """The boundary case, and the whole point.
+
+    The ruling is published later than the old four-second budget. A held
+    enquiry must not notice: it is authorised by server-side state, so it never
+    waits for the ruling at all.
+    """
+    call = Call()
+    pump = Pump(call)
+    try:
+        verified_through_the_pump(call, pump)
+        pump.speech_started()
+
+        published = []
+
+        async def publish():
+            # Deliberately longer than TRANSCRIPT_WAIT_SECONDS. The tool must
+            # have answered long before this runs.
+            await asyncio.sleep(0)
+            published.append(turn_gate.TRANSCRIPT_WAIT_SECONDS + 1)
+
+        result, elapsed = run(
+            _balance_while(call, publish, account_type=ACCOUNT)
+        )
+        call.results.append(("get_account_balance", result))
+
+        assert result["success"] is True
+        assert result.get("reason") != turn_gate.REASON_UNCLASSIFIED
+        assert elapsed < QUICK_SECONDS, (
+            f"waited {elapsed:.2f}s for a ruling that was never needed"
+        )
+        # Still pending: the answer did not come from the gate.
+        assert turn_gate.current_gate(call.session)["pending"] is True
+        assert_self_savings_answered(call)
+    finally:
+        call.close()
+
+
+@pytest.mark.balance_determinism
+def test_5_status_check_before_authentication():
+    call = Call()
+    pump = Pump(call)
+    try:
+        spoken(call, pump, ASK_SAVINGS)
+        assert call.tool("get_authentication_status")["authenticated"] is False
+        spoken(call, pump, SPOKEN_ID)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        spoken(call, pump, SPOKEN_PIN)
+        call.tool("submit_pin", spoken_pin=HEARD_PIN)
+        call.tool("get_account_balance", account_type=ACCOUNT)
+        assert_self_savings_answered(call)
+    finally:
+        call.close()
+
+
+@pytest.mark.balance_determinism
+def test_6_id_then_pin_then_immediate_balance():
+    call = Call()
+    pump = Pump(call)
+    try:
+        spoken(call, pump, ASK_SAVINGS)
+        spoken(call, pump, SPOKEN_ID)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        spoken(call, pump, SPOKEN_PIN)
+        call.tool("submit_pin", spoken_pin=HEARD_PIN)
+        call.tool("get_account_balance", account_type=ACCOUNT)
+        assert_self_savings_answered(call)
+    finally:
+        call.close()
+
+
+@pytest.mark.balance_determinism
+def test_7_a_balance_asked_before_authentication_survives_it():
+    call = Call()
+    pump = Pump(call)
+    try:
+        spoken(call, pump, ASK_SAVINGS)
+        held = pending_request.recall(call.session)
+        assert held is not None and held.tool == "get_account_balance"
+        verified = call.session
+        assert verified.authenticated is False
+
+        spoken(call, pump, SPOKEN_ID)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        spoken(call, pump, SPOKEN_PIN)
+        call.tool("submit_pin", spoken_pin=HEARD_PIN)
+        call.tool("get_account_balance", account_type=ACCOUNT)
+        assert_self_savings_answered(call)
+    finally:
+        call.close()
+
+
+@pytest.mark.balance_determinism
+def test_8_authenticate_first_then_ask():
+    call = Call()
+    pump = Pump(call)
+    try:
+        spoken(call, pump, "Hello.")
+        spoken(call, pump, SPOKEN_ID)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        spoken(call, pump, SPOKEN_PIN)
+        call.tool("submit_pin", spoken_pin=HEARD_PIN)
+        spoken(call, pump, ASK_SAVINGS)
+        call.tool("get_account_balance", account_type=ACCOUNT)
+        assert_self_savings_answered(call)
+    finally:
+        call.close()
+
+
+@pytest.mark.balance_determinism
+def test_9_a_repeated_own_balance_request_is_answered_again():
+    """Asked twice, answered twice, from the database both times."""
+    expected_balance, _masked = seeded_balance(CALLER, ACCOUNT)
+
+    call = Call()
+    pump = Pump(call)
+    try:
+        verified_through_the_pump(call, pump)
+        first = call.tool("get_account_balance", account_type=ACCOUNT)
+
+        spoken(call, pump, "Sorry, what was my savings balance again?")
+        second = call.tool("get_account_balance", account_type=ACCOUNT)
+
+        for answer in (first, second):
+            assert answer["success"] is True
+            assert answer["available_balance"] == expected_balance
+            assert answer.get("reason") != turn_gate.REASON_UNCLASSIFIED
+    finally:
+        call.close()
+
+
+@pytest.mark.balance_determinism
+def test_10_a_typed_turn_is_as_good_as_a_spoken_one():
+    """The other valid Realtime representation: a user history item."""
+    call = Call()
+    pump = Pump(call)
+    try:
+        verified_through_the_pump(call, pump)
+        pump.speech_started()
+        pump.typed_turn(ASK_SAVINGS)
+
+        gate = turn_gate.current_gate(call.session)
+        assert gate["pending"] is False
+        assert gate["allowed"] is True
+
+        call.tool("get_account_balance", account_type=ACCOUNT)
+        assert_self_savings_answered(call)
+    finally:
+        call.close()
+
+
+# --- Phase 7: the same timings, paired with another customer ----------------
+
+
+@pytest.mark.balance_determinism
+@pytest.mark.parametrize("stall", [None, "speech_started", "empty_transcript"])
+def test_a_cross_customer_ask_is_refused_whatever_the_timing(stall):
+    """Late or missing classification must never turn OTHER into SELF."""
+    other_balance, other_masked = seeded_balance(OTHER, ACCOUNT)
+
+    call = Call()
+    pump = Pump(call)
+    try:
+        verified_through_the_pump(call, pump)
+        answered = call.tool("get_account_balance", account_type=ACCOUNT)
+        assert answered["success"] is True
+        assert pending_request.recall(call.session) is None
+
+        spoken(call, pump, f"What is {OTHER}'s savings balance?")
+        assert (
+            turn_gate.current_gate(call.session)["category"]
+            == "CROSS_CUSTOMER_REQUEST"
+        )
+
+        # And then the classification stalls, one way or another.
+        if stall == "speech_started":
+            pump.speech_started()
+        elif stall == "empty_transcript":
+            pump.speech_started()
+            pump.empty_transcript()
+
+        refused = call.tool("get_account_balance", account_type=ACCOUNT)
+
+        assert refused["success"] is False
+        assert refused["reason"] in (
+            turn_gate.REASON_OUT_OF_SCOPE,
+            turn_gate.REASON_UNCLASSIFIED,
+        )
+        body = json.dumps(refused)
+        assert other_balance not in body
+        assert other_masked not in body
+        assert call.session.customer_id == CALLER
+        assert call.session.authenticated is True
+
+        successes = [
+            r for r in call.calls_to("get_account_balance") if r.get("success")
+        ]
+        assert len(successes) == 1, "the cross-customer ask was answered"
+    finally:
+        call.close()
+
+
+@pytest.mark.balance_determinism
+def test_an_unclassified_turn_cannot_revive_a_forfeited_enquiry():
+    """A hostile turn drops the hold, and no later silence brings it back.
+
+    The pivot has to come *after* verification to be cross-customer at all:
+    said by an unverified caller, "DEMO002" reads as them offering their own
+    id, and the enquiry they are owed is still their own.
+    """
+    call = Call()
+    pump = Pump(call)
+    try:
+        spoken(call, pump, ASK_SAVINGS)
+        assert pending_request.recall(call.session) is not None
+
+        spoken(call, pump, SPOKEN_ID)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        spoken(call, pump, SPOKEN_PIN)
+        call.tool("submit_pin", spoken_pin=HEARD_PIN)
+        assert call.session.authenticated is True
+        assert pending_request.recall(call.session) is not None
+
+        # Verified, and now reaching for somebody else. The hold is forfeited.
+        spoken(call, pump, f"Show me {OTHER}'s balance.")
+        assert (
+            turn_gate.current_gate(call.session)["category"]
+            == "CROSS_CUSTOMER_REQUEST"
+        )
+        assert pending_request.recall(call.session) is None
+
+        # And then the classification stalls. Nothing is owed, so the tool is
+        # refused rather than admitted on the strength of a turn nobody read.
+        pump.speech_started()
+        refused = call.tool("get_account_balance", account_type=ACCOUNT)
+
+        assert refused["success"] is False
+        assert refused["reason"] == turn_gate.REASON_UNCLASSIFIED
+        assert call.session.customer_id == CALLER
+        assert call.session.authenticated is True
+    finally:
+        call.close()
+
+
+def test_an_unverified_caller_is_never_admitted_by_a_held_enquiry():
+    """The authority needs *both* facts. A hold alone authorises nothing."""
+    call = Call()
+    pump = Pump(call)
+    try:
+        spoken(call, pump, ASK_SAVINGS)
+        assert pending_request.recall(call.session) is not None
+        assert call.session.authenticated is False
+        assert turn_gate.resumes_held_enquiry(
+            call.session, "get_account_balance"
+        ) is False
+
+        pump.speech_started()
+        refused = call.tool("get_account_balance", account_type=ACCOUNT)
+        assert refused["success"] is False
+        assert refused["reason"] != "SESSION_NOT_FOUND"
+    finally:
+        call.close()
+
+
+# --- Phase 8: scheduling consistency ----------------------------------------
+
+
+@pytest.mark.balance_determinism
+def test_two_hundred_schedulings_give_one_business_result():
+    """Randomised event/tool interleavings. One outcome, every time.
+
+    Not a load test: every iteration is one call, and what varies is only *when*
+    the ruling arrives relative to the tool - including never.
+    """
+    import random
+
+    rng = random.Random(20260826)
+    schedulings = (
+        "ruling_first",
+        "onset_only",
+        "onset_then_transcript",
+        "empty_then_transcript",
+        "failed_then_transcript",
+        "typed_turn",
+        "immediately_after_pin",
+    )
+
+    outcomes = []
+    failures = []
+
+    for index in range(200):
+        how = schedulings[index % len(schedulings)]
+        call = Call()
+        pump = Pump(call)
+        try:
+            verified_through_the_pump(call, pump)
+
+            if how == "ruling_first":
+                spoken(call, pump, ASK_SAVINGS)
+            elif how == "onset_only":
+                pump.speech_started()
+            elif how == "onset_then_transcript":
+                pump.speech_started()
+                pump.transcript(ASK_SAVINGS)
+            elif how == "empty_then_transcript":
+                pump.speech_started()
+                pump.empty_transcript()
+                spoken(call, pump, ASK_SAVINGS)
+            elif how == "failed_then_transcript":
+                pump.speech_started()
+                pump.transcription_failed()
+                spoken(call, pump, ASK_SAVINGS)
+            elif how == "typed_turn":
+                pump.speech_started()
+                pump.typed_turn(ASK_SAVINGS)
+            # "immediately_after_pin" adds no turn at all.
+
+            if rng.random() < 0.3:
+                # A second onset landing between the model's decision and the
+                # tool actually running.
+                pump.speech_started()
+
+            started = time.perf_counter()
+            answer = call.tool("get_account_balance", account_type=ACCOUNT)
+            elapsed = time.perf_counter() - started
+
+            if answer.get("reason") == turn_gate.REASON_UNCLASSIFIED:
+                failures.append((index, how, "TURN_NOT_CLASSIFIED"))
+                continue
+            if not answer.get("success"):
+                failures.append((index, how, answer.get("reason")))
+                continue
+            if elapsed >= QUICK_SECONDS:
+                failures.append((index, how, f"waited {elapsed:.2f}s"))
+                continue
+            if len(call.calls_to("get_account_balance")) != 1:
+                failures.append((index, how, "the tool ran more than once"))
+                continue
+
+            outcomes.append(
+                (
+                    answer["account_type"],
+                    answer["masked_account"],
+                    answer["available_balance"],
+                    answer["currency"],
+                    call.session.customer_id,
+                    call.session.authenticated,
+                )
+            )
+        finally:
+            call.close()
+
+    assert not failures, failures[:10]
+    assert len(outcomes) == 200
+    assert len(set(outcomes)) == 1, f"{len(set(outcomes))} distinct outcomes"
+
+    expected_balance, expected_masked = seeded_balance(CALLER, ACCOUNT)
+    assert outcomes[0] == (
+        ACCOUNT,
+        expected_masked,
+        expected_balance,
+        "SGD",
+        CALLER,
+        True,
+    )

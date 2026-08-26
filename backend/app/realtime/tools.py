@@ -42,7 +42,11 @@ from app.auth import authentication
 from app.database.connection import DatabaseNotConfiguredError
 from app.observability import business
 from app.realtime.context import BankingRealtimeContext
-from app.realtime.turn_gate import refusal_for, wait_for_ruling
+from app.realtime.turn_gate import (
+    refusal_for,
+    resumes_held_enquiry,
+    wait_for_ruling,
+)
 from app.sessions import SessionNotFoundError
 
 logger = logging.getLogger("app.realtime.tools")
@@ -232,9 +236,15 @@ async def _check_scope(context: Ctx, tool_name: str) -> dict | None:
     session = await asyncio.to_thread(banking.session)
     started = time.perf_counter()
 
-    await wait_for_ruling(session)
-    # Re-read: the ruling for this turn may have landed while we waited.
-    session = await asyncio.to_thread(banking.session)
+    # An enquiry the bank already owes a verified caller is authorised by
+    # server-side state alone, so waiting for this turn's ruling could not
+    # change the answer — and waiting for a ruling that never comes is exactly
+    # how a verified DEMO001 was told their own balance was unavailable, four
+    # seconds after asking for it. See `turn_gate.resumes_held_enquiry`.
+    if not resumes_held_enquiry(session, tool_name):
+        await wait_for_ruling(session)
+        # Re-read: the ruling for this turn may have landed while we waited.
+        session = await asyncio.to_thread(banking.session)
 
     refusal = refusal_for(session, tool_name)
     if refusal is not None:

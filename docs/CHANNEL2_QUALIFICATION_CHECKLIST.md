@@ -314,14 +314,117 @@ No sleep was lengthened to make any of these pass.
 
 ---
 
+## Q-500 - timing is not a banking input (Phase 6.11.1)
+
+`ac2343f` removed the *ordering* dependency. Live testing then showed a second,
+independent dependency underneath it: **timing**. Same customer, same PIN, same
+database, same tool order - and two different answers, decided by whether a
+microphone burst happened to transcribe.
+
+**Live history for `get_account_balance`, DEMO001 Savings.** Recorded as
+observed. Nothing here is rewritten to look better than it was.
+
+| Baseline | Live outcome | Evidence |
+|---|---|---|
+| `818343d` | **PROVEN** - balance answered correctly on a real call | Phase 6.9 UAT |
+| `67c3c71` | **FAILED** - `OUT_OF_SCOPE`, `duration_ms = 0`, no database lookup | calls `26faddf0-...`, `730747e1-...` |
+| `ac2343f` | **LIVE INTERMITTENT** - one PASS `0a39cc5f-1bc4-1240-4790-eaa5afddeeef`; one FAIL `3860a81f-1bc5-1240-4790-eaa5afddeeef` (`get_account_balance` FAILED twice, `TURN_NOT_CLASSIFIED`, ~4 s each); one subsequent PASS `7d221518-1bc5-1240-4790-eaa5afddeeef` (`duration_ms = 5`) | live call records |
+| this fix | **PENDING** live re-proof | `test_balance_determinism.py` |
+
+`ac2343f` is **not** marked PROVEN. It is `LIVE INTERMITTENT`: it fixed the
+ordering defect and left the timing defect standing.
+
+### D-5 - a turn that never transcribed refused the caller's own question
+
+`app/realtime/tools.py::_check_scope` awaited
+`turn_gate.wait_for_ruling(session)` with `timeout = TRANSCRIPT_WAIT_SECONDS =
+4.0`, polling `TurnGate.pending` every 50 ms. The two ends of that flag were not
+symmetric:
+
+* **opened** by `open_turn()`, driven from `RealtimeManager._feed_gate` on the
+  raw provider event `input_audio_buffer.speech_started` - a VAD onset, emitted
+  for *any* speech-shaped sound, and forwarded by the SDK for every WebSocket
+  message (`openai_realtime.py:1315`);
+* **closed** only by `record_decision()`, reachable only through
+  `record_turn()`, which was called from two places both conditional on a
+  non-empty transcript, and which itself returned early on an empty one. The
+  only typed transcript event the SDK emits is
+  `input_audio_transcription_completed`, mapped solely from
+  `conversation.item.input_audio_transcription.completed`
+  (`openai_realtime.py:1499-1513`). There is no typed event for
+  `...transcription.failed` at all.
+
+A breath, a cough, a burst of line noise, a barge-in the provider discards, or a
+transcription that fails therefore opened a turn that **nothing could ever
+close** - no other writer, no timer, no fallback. Every later banking tool spent
+the full 4.0 s and `refusal_for()` returned `TURN_NOT_CLASSIFIED` at its *first*
+branch, which sat above the held-enquiry exemption. The server knew the caller
+was DEMO001, knew a Savings balance was owed to them, and refused it anyway
+because a sound had not turned into words.
+
+That is `duration_ms = 4023` and `4015` in the failing live call, against
+`duration_ms = 5` in the successful one.
+
+**Fixed** by making the authority independent of the ruling rather than by
+waiting longer:
+
+* `turn_gate.resumes_held_enquiry()` - two server-side facts (verified caller +
+  a held enquiry naming *this* tool) authorise the lookup on their own. Checked
+  **before** the gate in `refusal_for`, and used in `_check_scope` to skip a
+  wait whose answer could not change the outcome.
+* `turn_gate.record_unintelligible_turn()` - a turn the provider reports as
+  producing nothing now *resolves* as not-allowed instead of staying open, on
+  both an empty transcript and a raw `...transcription.failed`.
+
+No timeout was raised, no retry added, no sleep introduced, no prompt or model
+changed.
+
+### Every path that can still return `TURN_NOT_CLASSIFIED`
+
+One, at `turn_gate.py::refusal_for`, reached only when the gate is pending
+**and** no held enquiry is owed to a verified caller.
+
+| Path | Classification |
+|---|---|
+| verified caller, held enquiry naming this tool | **impossible by construction** - the invariant is encoded, and the wait is skipped |
+| turn genuinely unclassified, nothing owed | **legitimate safety refusal** - fail-closed, unchanged policy |
+| turn left open by a wordless onset the provider reported | **race, now closed** - resolved by `record_unintelligible_turn` |
+| timeout fallback | retained, but can no longer decide a server-known SELF request |
+
+| ID | Scenario | Det. | Live | Test | Crit. |
+|---|---|---|---|---|---|
+| TN-001 | A turn that never transcribes no longer refuses the held enquiry (fail-before-fix) | PROTECTED | - | `test_a_turn_that_never_transcribes_no_longer_refuses_the_held_enquiry` | HIGH |
+| TN-002 | An empty transcript resolves the turn instead of hanging | PROTECTED | PENDING | `test_a_wordless_turn_resolves_instead_of_hanging[empty_transcript]` | HIGH |
+| TN-003 | A failed transcription resolves the turn instead of hanging | PROTECTED | PENDING | `test_a_wordless_turn_resolves_instead_of_hanging[transcription_failed]` | HIGH |
+| TN-004 | Ruling already available before the tool | PROTECTED | PENDING | `test_1_ruling_already_available_before_the_tool` | MED |
+| TN-005 | Tool starts before the ruling | PROTECTED | PENDING | `test_2_tool_starts_before_the_ruling` | HIGH |
+| TN-006 | A slightly delayed ruling changes nothing | PROTECTED | PENDING | `test_3_a_slightly_delayed_ruling_changes_nothing` | HIGH |
+| TN-007 | A ruling delayed past the old timeout is not waited for | PROTECTED | PENDING | `test_4_a_ruling_delayed_past_the_old_timeout_is_not_waited_for` | HIGH |
+| TN-008 | Status check before authentication | PROTECTED | PENDING | `test_5_status_check_before_authentication` | MED |
+| TN-009 | Id, PIN, then an immediate balance | PROTECTED | PENDING | `test_6_id_then_pin_then_immediate_balance` | HIGH |
+| TN-010 | A balance asked before authentication survives it | PROTECTED | PENDING | `test_7_a_balance_asked_before_authentication_survives_it` | HIGH |
+| TN-011 | Authenticate first, then ask | PROTECTED | PENDING | `test_8_authenticate_first_then_ask` | MED |
+| TN-012 | A repeated own balance request is answered again | PROTECTED | PENDING | `test_9_a_repeated_own_balance_request_is_answered_again` | MED |
+| TN-013 | A typed turn is as good as a spoken one | PROTECTED | PENDING | `test_10_a_typed_turn_is_as_good_as_a_spoken_one` | MED |
+| TN-014 | A cross-customer ask is refused whatever the timing | PROTECTED | PENDING | `test_a_cross_customer_ask_is_refused_whatever_the_timing` | HIGH |
+| TN-015 | An unclassified turn cannot revive a forfeited enquiry | PROTECTED | PENDING | `test_an_unclassified_turn_cannot_revive_a_forfeited_enquiry` | HIGH |
+| TN-016 | An unverified caller is never admitted by a held enquiry | PROTECTED | PENDING | `test_an_unverified_caller_is_never_admitted_by_a_held_enquiry` | HIGH |
+| TN-017 | 200 randomised schedulings, one business result | PROTECTED | PENDING | `test_two_hundred_schedulings_give_one_business_result` | HIGH |
+
+Every Q-500 row is `PENDING` live. Each becomes `PROVEN` at the next UAT and not
+before.
+
+---
+
 ## Open defects
 
 | ID | Defect | Evidence | Status |
 |---|---|---|---|
 | **D-1** | Announced termination did not terminate. | fixed by `bridge._close_if_authentication_is_over`; guarded by `test_d1_*` | **CLOSED** |
 | **D-2** | A persistently-locked caller had `session.authentication_locked == False`. | fixed in `verify_pin`; guarded by CT-D03, CT-106, CT-107 | **CLOSED** |
-| **D-3** | A verified DEMO001 was refused their own savings balance, intermittently, decided by which tool the model called first. Live calls `26faddf0-...` and `730747e1-...` on `67c3c71`: `get_account_balance` FAILED, `duration_ms = 0`, no database lookup reached. | fixed by `turn_gate._hold_unverified_enquiry`; guarded by BD-001 to BD-016 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-3** | A verified DEMO001 was refused their own savings balance, intermittently, decided by which tool the model called first. Live calls `26faddf0-...` and `730747e1-...` on `67c3c71`: `get_account_balance` FAILED, `duration_ms = 0`, no database lookup reached. | fixed by `turn_gate._hold_unverified_enquiry`; guarded by BD-001 to BD-022 | **CLOSED - the ordering defect did not recur live on `ac2343f`; see D-5 for the timing defect underneath it** |
 | **D-4** | A hang-up could cancel its own cleanup: `tear_down` aborted after the bridge left `phone_call_registry` and before `voice_call_manager.close()`, stranding an open provider session and its capacity slot with no path to reclaim either - on `REALTIME_MAX_ACTIVE_SESSIONS = 1`, one dropped socket from refusing every later caller. | traced in a failing run (`tear_down RAISED CancelledError`); fixed by `service._uninterruptible` and `service.end_media_call`; guarded by TD-001 to TD-005 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-5** | A caller turn that never transcribed left the scope gate open for the rest of the call, so a verified DEMO001 with a held Savings enquiry was refused `TURN_NOT_CLASSIFIED` after the full 4.0 s wait. The gate was opened by a VAD onset and closed only by a transcript with words in it - not the same guarantee. | live call `3860a81f-1bc5-1240-4790-eaa5afddeeef` (FAILED twice, ~4 s each); reproduced offline at 4061 ms; fixed by `turn_gate.resumes_held_enquiry` and `turn_gate.record_unintelligible_turn`; guarded by TN-001 to TN-017 | **CLOSED deterministically - PENDING live re-proof** |
 
 ## Open decision
 

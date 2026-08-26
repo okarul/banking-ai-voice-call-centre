@@ -37,7 +37,7 @@ import time
 from dataclasses import dataclass, field
 
 from app.agents.intents import TOOL_BY_INTENT
-from app.scope import ScopeCategory, ScopeDecision, classify_scope
+from app.scope import SPEECH, ScopeCategory, ScopeDecision, classify_scope
 from app.sessions import Session
 
 # The tools that read protected customer money. Authentication tools are not
@@ -238,6 +238,74 @@ def record_turn(session: Session | None, transcript: str) -> ScopeDecision | Non
     return decision
 
 
+def resumes_held_enquiry(session: Session | None, tool_name: str) -> bool:
+    """Whether this tool is finishing an enquiry the bank already owes the caller.
+
+    Two facts, both established server-side and neither obtainable by the model:
+
+    * the caller has passed the deterministic PIN check, and
+    * an enquiry is being held that names **this** tool.
+
+    Together they authorise the lookup on their own, without reference to how
+    the current turn was classified — or to whether it has been classified at
+    all. That independence is the point.
+
+    **Why it must not wait for a ruling.** The gate is opened by
+    `input_audio_buffer.speech_started`, a provider VAD event that fires on any
+    speech onset. It is closed only by a transcript that both arrives and has
+    words in it. Those are not the same guarantee: a breath, a cough, a burst of
+    line noise, a barge-in the provider discards, or a transcription that fails
+    all produce the onset and no transcript. The turn then stays `pending` for
+    the rest of the call, and every banking tool spends the full
+    `TRANSCRIPT_WAIT_SECONDS` before being refused `TURN_NOT_CLASSIFIED` — which
+    is what a live DEMO001 was told, twice, four seconds apart, having been
+    verified and having asked for nothing but their own savings balance.
+
+    A bank's answer to its own verified customer's own question cannot depend on
+    whether a microphone burst happened to transcribe. So it no longer does.
+
+    **This is not a way past the gate.** The held enquiry was itself classified
+    in scope on the turn it was made; it names one tool and no customer; it is
+    dropped the moment a classified turn goes cross-customer or hostile; it is
+    cleared as soon as it has been answered; and the tool it admits still reads
+    `session.customer_id` and still passes every authorization guard. Nothing
+    here can return another customer's data, because nothing here chooses whose
+    data is read.
+    """
+    if session is None or not session.authenticated:
+        return False
+
+    from app import pending_request
+
+    held = pending_request.recall(session)
+    return held is not None and held.tool == tool_name
+
+
+def record_unintelligible_turn(session: Session | None) -> None:
+    """Resolve a caller turn that produced no words.
+
+    `open_turn` is driven by a VAD onset; the ruling that closes it is driven by
+    a transcript. When the provider reports that a turn produced nothing — an
+    empty transcript, or a transcription that failed — nothing used to close the
+    turn at all, and the gate stayed `pending` for the rest of the call.
+
+    Resolved as not-allowed rather than allowed: a turn nobody could hear is not
+    permission for anything, and the strict reading of the data policy has not
+    changed. What changes is that the refusal is now immediate and correct
+    rather than a four-second wait ending in a timeout. The held enquiry
+    survives, so a caller whose question the bank already owes still gets it.
+    """
+    if session is None:
+        return
+    record_decision(
+        session,
+        ScopeDecision(
+            category=ScopeCategory.NON_BANKING_REQUEST,
+            speech=SPEECH[ScopeCategory.NON_BANKING_REQUEST],
+        ),
+    )
+
+
 def refusal_for(session: Session | None, tool_name: str) -> dict | None:
     """The refusal this tool must return instead of running, or None to proceed.
 
@@ -245,6 +313,11 @@ def refusal_for(session: Session | None, tool_name: str) -> dict | None:
     turn may still be unclassified.
     """
     if tool_name not in BANKING_DATA_TOOLS:
+        return None
+
+    # The authoritative server-side answer, consulted **before** the turn
+    # ruling and independent of it. See `resumes_held_enquiry`.
+    if resumes_held_enquiry(session, tool_name):
         return None
 
     gate = _gate(session)
@@ -263,24 +336,6 @@ def refusal_for(session: Session | None, tool_name: str) -> dict | None:
         }
 
     if gate.allowed:
-        return None
-
-    # One narrow exemption: finishing an enquiry the caller already made.
-    #
-    # A caller who asks for their balance before verifying is asked for their
-    # ID and PIN. Those turns are not banking enquiries — a bare "4821" reads as
-    # NON_BANKING_REQUEST — so the gate would refuse the very lookup the caller
-    # rang about, immediately after verifying them for it.
-    #
-    # This is not a way past the gate. The held enquiry was itself allowed
-    # through the gate on the turn it was made, it names one specific tool, it
-    # carries no identity, and it is dropped the moment the caller turns to
-    # anything cross-customer or hostile (see `record_decision`). The tool still
-    # reads `session.customer_id` and still passes every authorization guard.
-    from app import pending_request
-
-    held = pending_request.recall(session)
-    if held is not None and held.tool == tool_name:
         return None
 
     return {

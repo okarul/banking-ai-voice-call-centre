@@ -31,7 +31,11 @@ from typing import Any, Awaitable, Callable
 from app.realtime.context import BankingRealtimeContext
 from app.realtime.events import log_event
 from app.observability import business
-from app.realtime.turn_gate import open_turn, record_turn
+from app.realtime.turn_gate import (
+    open_turn,
+    record_turn,
+    record_unintelligible_turn,
+)
 from app.sessions import SessionManager, SessionNotFoundError
 from app.sessions import session_manager as default_manager
 
@@ -594,14 +598,30 @@ class RealtimeManager:
                 raw_type = getattr(data, "type", None)
                 if raw_type == "input_audio_transcription_completed":
                     text = getattr(data, "transcript", "") or ""
+                    if not text.strip():
+                        # Heard, and empty. Resolve the turn rather than leaving
+                        # it open: `open_turn` has no other closer, so a turn
+                        # left pending here stays pending for the whole call.
+                        record_unintelligible_turn(session)
+                        return None
                     decision = record_turn(session, text)
                     return self._turn_to_record(session, data, text, decision)
+
                 inner = getattr(data, "data", None)
-                if (
-                    isinstance(inner, dict)
-                    and inner.get("type") == "input_audio_buffer.speech_started"
-                ):
+                if not isinstance(inner, dict):
+                    return None
+
+                raw_kind = inner.get("type")
+                if raw_kind == "input_audio_buffer.speech_started":
                     open_turn(session)
+                elif raw_kind == (
+                    "conversation.item.input_audio_transcription.failed"
+                ):
+                    # The provider tried to transcribe and could not. There is
+                    # no typed SDK event for this — only `.completed` is mapped
+                    # — so without reading the raw form the turn this opened is
+                    # never closed by anything.
+                    record_unintelligible_turn(session)
                 return None
 
             if kind == "history_added":
