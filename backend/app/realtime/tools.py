@@ -174,12 +174,18 @@ async def _dispatch(context: Ctx, tool_name: str, arguments: dict) -> dict:
     # one of them was what left the telephone unobserved. Name, outcome and
     # duration only — never the arguments (one is a PIN) and never the result
     # (one is a balance).
+    session = await asyncio.to_thread(context.context.session)
     await asyncio.to_thread(
         business.record_tool_outcome,
         session_id,
         tool_name,
         result,
         duration_ms=int((time.perf_counter() - started) * 1000),
+        # Sanitised on the way in, by name: `app.observability.trace` keeps a
+        # value only for the account and loan selections, so the two spoken
+        # credentials cannot be written down even from here.
+        arguments=arguments,
+        session=session,
     )
 
     if not isinstance(result, dict):
@@ -215,12 +221,17 @@ async def _mirror(session_id, manager, tool_name, result, started) -> None:
     is, which is a second thing worth writing down.
     """
     duration_ms = int((time.perf_counter() - started) * 1000)
+    session = await asyncio.to_thread(manager.get_session, session_id)
     await asyncio.to_thread(
         business.record_tool_outcome,
         session_id,
         tool_name,
         result,
         duration_ms=duration_ms,
+        # Deliberately no arguments: on these two tools they are the spoken
+        # credential itself, and the allowlist that would drop them is not the
+        # only thing that should stop them being passed.
+        session=session,
     )
     await asyncio.to_thread(business.record_identity, session_id, manager=manager)
 
@@ -261,6 +272,7 @@ async def _check_scope(context: Ctx, tool_name: str) -> dict | None:
             tool_name,
             refusal,
             duration_ms=int((time.perf_counter() - started) * 1000),
+            session=session,
         )
     return refusal
 
@@ -382,12 +394,14 @@ async def get_authentication_status(context: Ctx) -> dict:
     result = status or SESSION_GONE
     # Counted like any other tool — an operator reading the board should see
     # that the agent asked — but it changes nothing, so no identity is written.
+    session = await asyncio.to_thread(manager.get_session, session_id)
     await asyncio.to_thread(
         business.record_tool_outcome,
         session_id,
         "get_authentication_status",
         result,
         duration_ms=int((time.perf_counter() - started) * 1000),
+        session=session,
     )
     return result
 

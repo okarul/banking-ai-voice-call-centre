@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import logging
 
-from app.observability import recorder
+from app.observability import recorder, trace
 from app.sessions import SessionManager
 from app.sessions import session_manager as default_manager
 
@@ -181,6 +181,8 @@ def record_tool_outcome(
     result,
     *,
     duration_ms: int | None = None,
+    arguments: dict | None = None,
+    session=None,
 ) -> None:
     """Count one banking tool, exactly once, for whichever channel ran it.
 
@@ -200,11 +202,32 @@ def record_tool_outcome(
     if reason is not None:
         logger.warning("%s tool=%s reason=%s", TOOL_FAILED, tool_name, reason)
 
+    status = "OK" if succeeded(result) else "FAILED"
     recorder.record_tool_call(
         session_id,
         tool_name,
-        status="OK" if succeeded(result) else "FAILED",
+        status=status,
         duration_ms=duration_ms,
+    )
+
+    # The same invocation, told as a story rather than counted. Hung off this
+    # function rather than off a second call site, so a tool can never be
+    # counted once and traced twice - `tool_call_count` still comes from
+    # `record_tool_call` alone and is unaffected by anything below.
+    trace.record(
+        session_id,
+        trace.TraceEvent(
+            kind=trace.KIND_TOOL,
+            speaker=trace.SPEAKER_SYSTEM,
+            tool_name=tool_name,
+            tool_arguments=trace.sanitize_arguments(arguments),
+            tool_status=status,
+            failure_reason=reason,
+            duration_ms=duration_ms,
+            auth_status=trace.auth_status(session),
+            customer_ref=trace.customer_ref(session),
+        ),
+        session=session,
     )
 
 
@@ -230,9 +253,22 @@ def record_identity(
         failed=bool(session.authentication_attempts) and not session.authenticated,
     )
 
+    # The transition, in the trace, so a replay shows *when* the caller became
+    # verified rather than only that they ended up so.
+    trace.record(
+        session_id,
+        trace.TraceEvent(
+            kind=trace.KIND_AUTH,
+            speaker=trace.SPEAKER_SYSTEM,
+            auth_status=trace.auth_status(session),
+            customer_ref=trace.customer_ref(session),
+        ),
+        session=session,
+    )
+
 
 @_never_fails("record_turn_decision")
-def record_turn_decision(session, decision) -> None:
+def record_turn_decision(session, decision, transcript: str | None = None) -> None:
     """Persist what this turn was about, for whichever channel classified it.
 
     Hung off the scope ruling rather than off a tool call, because a turn has a
@@ -248,4 +284,33 @@ def record_turn_decision(session, decision) -> None:
         session.session_id,
         domain=dashboard_domain(category, session.current_domain),
         intent=category,
+    )
+
+    # And the same turn as a trace event: what was said (only if utterances are
+    # switched on, and only redacted), what it was understood to be, what the
+    # gate ruled, and what the caller is still owed.
+    from app import pending_request
+
+    held = pending_request.recall(session)
+    trace.record(
+        session.session_id,
+        trace.TraceEvent(
+            kind=trace.KIND_TURN,
+            speaker=trace.SPEAKER_CUSTOMER,
+            turn=trace.open_turn(session),
+            utterance=trace.utterance_for(
+                transcript, speaker=trace.SPEAKER_CUSTOMER
+            ),
+            domain=getattr(getattr(decision, "domain", None), "value", None),
+            intent=getattr(getattr(decision, "intent", None), "value", None),
+            scope_category=category,
+            scope_allowed=bool(getattr(decision, "allowed", False)),
+            pending_operation=held.tool if held else None,
+            account_type=held.account_type if held else None,
+            loan_type=held.loan_type if held else None,
+            auth_status=trace.auth_status(session),
+            customer_ref=trace.customer_ref(session),
+            event_type="caller_turn",
+        ),
+        session=session,
     )

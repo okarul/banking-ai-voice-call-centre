@@ -71,6 +71,7 @@ The behaviours §S names. These were working before Phase 6.10 and must not move
 | Q-119 | `submit_pin` recorded once | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `realtime/tools.py` | MED |
 | Q-120 | `tool_call_count` semantics | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `observability/business.py` | MED |
 | Q-121 | Channel 2 `conversation_messages` stays 0 | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | privacy contract | HIGH |
+| Q-121a | Channel 2 stores no spoken word **by default** (Phase 6.12: conditional on `TELEPHONY_TRACE_UTTERANCES`, off unless an operator opts in) | PROTECTED | PENDING | `test_by_default_no_spoken_word_is_stored_at_all` | privacy contract | HIGH |
 | Q-122 | PIN absent from logs | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `redaction.py` | HIGH |
 | Q-123 | Balance absent from logs | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `redaction.py` | HIGH |
 | Q-124 | Customer name absent from logs | PROTECTED | PROVEN | `test_telephony_business_persistence.py` | `redaction.py` | HIGH |
@@ -413,6 +414,114 @@ One, at `turn_gate.py::refusal_for`, reached only when the gate is pending
 
 Every Q-500 row is `PENDING` live. Each becomes `PROVEN` at the next UAT and not
 before.
+
+---
+
+## Q-600 - the conversation trace (Phase 6.12)
+
+Phase 6.11.1 was diagnosed from production log lines pieced together by hand.
+`agent_sessions` could say a call ended `PROVIDER_ENDED` with six tool calls;
+`agent_tool_events` could say `get_account_balance` failed twice taking four
+seconds each. Neither could say *why*, and the four seconds was the whole
+answer. This is that missing context, kept on purpose.
+
+### The decision that had to be made first
+
+Channel 2 has never stored a spoken word - **Q-121**, `PROTECTED` and `PROVEN`,
+guarded by `test_channel_2_stores_no_transcript` and written as *"Whatever else
+changes, spoken words must not start being kept."* Phase 6.12 asks for a
+per-turn "redacted customer utterance". Those cannot both be unconditionally
+true, and checklist Rule 6 requires a deliberate behaviour change to be
+reviewed and recorded rather than absorbed.
+
+**Decided: config-gated, default off.** Requested by the operator, 2026-08-26.
+
+* The trace always records what the backend **decided** - scope ruling, held
+  enquiry, authentication state, tool, reason, duration, ordering, ending. None
+  of that is speech - but it is **off by default** all the same, for cost
+  rather than privacy: each traced event is a database write of roughly 35 ms,
+  and a call makes one per turn, per tool and per authentication change. That
+  was enough to delay assistant audio and fail a gateway isolation test. A
+  diagnostic may not tax the calls it exists to diagnose, so `TRACE_ENABLED`
+  defaults to false and a UAT switches it on.
+* Utterances are recorded **only** when `TELEPHONY_TRACE_UTTERANCES` is set,
+  which is off by default. Q-121 therefore remains literally and materially
+  true on an unconfigured deployment, and a UAT box opts in deliberately.
+* When it is on, an utterance is stored only in the redacted form the browser
+  transcript already uses: a PIN turn is `[PIN REDACTED]`, an id turn is
+  `[Customer ID provided]`, never digits.
+
+**Q-121 is therefore not superseded.** It is now conditional, and the condition
+defaults to its favour. `test_by_default_no_spoken_word_is_stored_at_all` is
+the standing proof.
+
+### Architecture
+
+One new append-only table, `call_trace_events`, and **no new event sources**.
+Every trace event is hung off a funnel that already existed, so nothing is
+counted twice and `tool_call_count` is untouched:
+
+| What | Existing funnel reused | Event |
+|---|---|---|
+| caller turn + scope ruling | `business.record_turn_decision` | `TURN` / CUSTOMER |
+| tool invocation + outcome | `business.record_tool_outcome` | `TOOL` |
+| authentication transition | `business.record_identity` | `AUTH` |
+| the agent's own words | `bridge._on_history_item` | `TURN` / AGENT |
+| the ending | `service._release_everything` | `LIFECYCLE` |
+
+Ordering is by `sequence`, not by clock: two events can share a timestamp, and
+a replay that puts a tool result before its own call is worse than none.
+Duplicate suppression is a unique index on `(session_pk, idempotency_key)`, so
+a retried provider event or a second representation of one utterance is a
+no-op rather than a second row.
+
+### Privacy
+
+* Tool arguments are sanitised by **allowlist** (`account_type`, `loan_type`,
+  `limit`). `spoken_pin` and `spoken_customer_id` are not on it and cannot be,
+  so a credential cannot reach the table even from a future call site nobody
+  reviewed. Non-allowlisted names keep the name and lose the value.
+* Utterances pass through `redact_transcript` before storage, never after.
+* `customer_ref` is only ever the identity the PIN check established - a claim
+  is not an identity, and a trace that recorded claims would lie about who was
+  on the call.
+* A backend failure reaches the trace as a **reason code**, never a statement:
+  no SQL, no host, no parameters.
+* No model reasoning, no chain of thought. Observable decisions and state only.
+
+### Retention
+
+`TRACE_RETENTION_DAYS`, default **14**, enforced by `trace.purge_expired()` on
+the same sweep that reclaims idle calls - no timer to supervise. There is no
+unlimited setting: `_positive_int` refuses zero.
+
+| ID | Scenario | Det. | Live | Test | Crit. |
+|---|---|---|---|---|---|
+| TR-001 | A happy-path balance call reads end to end | PROTECTED | PENDING | `test_a_happy_path_balance_call_reads_end_to_end` | HIGH |
+| TR-002 | The Phase 6.11.1 path is visible in one line | PROTECTED | PENDING | `test_the_turn_not_classified_path_is_visible` | HIGH |
+| TR-003 | A cross-customer refusal names itself, and leaks no other id | PROTECTED | PENDING | `test_a_cross_customer_refusal_names_itself` | HIGH |
+| TR-004 | An authentication retry shows both attempts | PROTECTED | PENDING | `test_an_authentication_retry_shows_both_attempts` | MED |
+| TR-005 | Session exhaustion and lockout are distinguishable | PROTECTED | PENDING | `test_session_exhaustion_and_lockout_are_distinguishable` | HIGH |
+| TR-006 | An unsupported request is recorded as refused | PROTECTED | PENDING | `test_an_unsupported_banking_request_is_recorded_as_refused` | MED |
+| TR-007 | Every ending reaches the trace, exactly once | PROTECTED | PENDING | `test_every_ending_reaches_the_trace` | HIGH |
+| TR-008 | A wordless turn does not invent an utterance | PROTECTED | PENDING | `test_a_wordless_turn_does_not_invent_an_utterance` | HIGH |
+| TR-009 | A tool failure records its reason | PROTECTED | PENDING | `test_a_tool_failure_records_its_reason` | MED |
+| TR-010 | The trace does not inflate the existing counters | PROTECTED | PENDING | `test_the_trace_does_not_inflate_the_existing_counters` | HIGH |
+| TR-011 | A repeated event representation is traced once | PROTECTED | PENDING | `test_a_repeated_event_representation_is_traced_once` | HIGH |
+| TR-012 | The ending cannot be written twice | PROTECTED | PENDING | `test_the_ending_cannot_be_written_twice` | HIGH |
+| TR-013 | A trace outage does not break the call | PROTECTED | PENDING | `test_a_trace_outage_does_not_break_the_call` | HIGH |
+| TR-014 | Tracing can be turned off entirely | PROTECTED | PENDING | `test_tracing_can_be_turned_off_entirely` | MED |
+| TR-015 | Six sensitive shapes never reach rows, API or logs | PROTECTED | PENDING | `test_a_sensitive_utterance_never_reaches_the_trace` | HIGH |
+| TR-016 | A spoken PIN is never stored even as a tool argument | PROTECTED | PENDING | `test_a_spoken_pin_is_never_stored_even_as_a_tool_argument` | HIGH |
+| TR-017 | A database failure is a reason, not a statement | PROTECTED | PENDING | `test_a_database_failure_reaches_the_trace_as_a_reason_not_a_statement` | HIGH |
+| TR-018 | By default no spoken word is stored at all (Q-121) | PROTECTED | PENDING | `test_by_default_no_spoken_word_is_stored_at_all` | HIGH |
+| TR-019 | The balance itself is never stored | PROTECTED | PENDING | `test_the_balance_itself_is_never_stored` | HIGH |
+| TR-020 | The endpoint replays one call in order | PROTECTED | PENDING | `test_the_endpoint_replays_one_call_in_order` | MED |
+| TR-021 | Expired traces are purged | PROTECTED | PENDING | `test_expired_traces_are_purged` | MED |
+| TR-022 | Retention is bounded by configuration | PROTECTED | PENDING | `test_retention_is_bounded_by_configuration` | MED |
+
+Every Q-600 row is `PENDING` live: the trace exists to be read during the next
+UAT, and it has not been read during one yet.
 
 ---
 

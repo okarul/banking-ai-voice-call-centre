@@ -280,6 +280,25 @@ async def sweep_idle_calls() -> int:
         )
         await tear_down(bridge.provider_call_id, bridge.banking_session_id)
         closed += 1
+
+    # Retention rides this sweep, so there is no timer to supervise - but only
+    # once the sweep has finished deciding. Awaiting anything before the loop
+    # hands the event loop to whatever else is ending a call, and this function
+    # would then report reclaiming nothing because somebody else got there
+    # first. What it reclaimed is settled above; the purge cannot change it.
+    from app.observability import trace
+
+    try:
+        await asyncio.to_thread(trace.purge_expired)
+    except Exception as error:
+        # Guarded here as well as inside `purge_expired`. This runs on the
+        # admission path - `_register_incoming` sweeps before it admits - so an
+        # exception escaping housekeeping would refuse an incoming call. Two
+        # guards, because the cost of the second is a try block and the cost of
+        # not having it is a caller hearing an engaged tone.
+        logger.error(
+            "telephony trace retention failed: %s", type(error).__name__
+        )
     return closed
 
 
@@ -542,6 +561,34 @@ async def _release_and_record(
         logger.error("telephony call record not closed: %s", type(error).__name__)
 
 
+def _trace_ending(banking_session_id: str, provider_call_id: str) -> None:
+    """Write the last line of the replay: how this call ended.
+
+    Recorded *before* the session is destroyed, so the trace event still gets
+    its place in the call's own sequence rather than having to be numbered
+    from a read afterwards.
+    """
+    from app.observability import trace
+
+    session = session_manager.get_session(banking_session_id)
+    trace.record(
+        banking_session_id,
+        trace.TraceEvent(
+            kind=trace.KIND_LIFECYCLE,
+            speaker=trace.SPEAKER_SYSTEM,
+            # Deliberately not passed: every ending records its own reason
+            # before converging here, and the trace reports what the bank
+            # actually wrote down rather than what this path assumed.
+            auth_status=trace.auth_status(session),
+            customer_ref=trace.customer_ref(session),
+            event_type="call_ended",
+            # One ending per call, however many paths converge on it.
+            idempotency_key=f"ended:{provider_call_id}",
+        ),
+        session=session,
+    )
+
+
 async def _release_everything(
     provider_call_id: str, banking_session_id: str
 ) -> None:
@@ -553,6 +600,8 @@ async def _release_everything(
     provider session and its capacity slot. A bridge that cannot close is not a
     reason to keep paying for a model session nobody is listening to.
     """
+    await asyncio.to_thread(_trace_ending, banking_session_id, provider_call_id)
+
     bridge = await _released("bridge", phone_call_registry.remove(provider_call_id))
     if bridge is not None:
         await _released("media", bridge.close())

@@ -665,7 +665,10 @@ class RealtimeManager:
         if item_id in seen:
             return None
         seen.add(item_id)
-        return session, decision
+        # The words travel with the ruling, for the trace. Whether they are
+        # written down at all is `app.observability.trace`'s decision, not
+        # this layer's - it only stops them being unavailable.
+        return session, decision, text
 
     async def _shutdown(self, connection: RealtimeConnection) -> None:
         """Release provider resources for one call, tolerating failures."""

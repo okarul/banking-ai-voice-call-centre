@@ -587,8 +587,51 @@ class PhoneCallBridge:
             return
         self._on_history_item(getattr(item, "role", None), text)
 
+    def _trace_agent_turn(self, text: str) -> None:
+        """Write down what the bank said, for the replay.
+
+        The caller's side is traced from the scope ruling, which is the same
+        funnel on both channels. The assistant has no such funnel, and this is
+        the one place a completed assistant turn arrives already deduplicated.
+
+        The greeting cue is excluded. It is a synthetic user turn this module
+        injects to make the agent speak first (see `GREETING_CUE`), and a trace
+        that showed it as something a caller said would be a trace that
+        invents a customer utterance.
+
+        Scheduled, never awaited: this runs on the audio event loop, and the
+        write goes to PostgreSQL.
+        """
+        if not text or text.strip() == GREETING_CUE:
+            return
+
+        from app.observability import trace
+
+        session = self.conversation._session()
+
+        async def record_agent_turn() -> None:
+            await asyncio.to_thread(
+                trace.record,
+                self.banking_session_id,
+                trace.TraceEvent(
+                    kind=trace.KIND_TURN,
+                    speaker=trace.SPEAKER_AGENT,
+                    utterance=trace.utterance_for(
+                        text, speaker=trace.SPEAKER_AGENT
+                    ),
+                    auth_status=trace.auth_status(session),
+                    customer_ref=trace.customer_ref(session),
+                    event_type="agent_turn",
+                ),
+                session=session,
+            )
+
+        self._schedule(record_agent_turn())
+
     def _on_history_item(self, role, text: str) -> None:
         """One completed turn, from whichever history event delivered it."""
+        if role == "assistant":
+            self._trace_agent_turn(text)
         if role == "user":
             self._on_caller_text(text)
             return

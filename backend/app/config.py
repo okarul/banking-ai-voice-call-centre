@@ -215,6 +215,43 @@ class Settings:
             os.getenv("TELEPHONY_AUDIO_QUEUE_FRAMES"), default=200
         )
 
+        # --- Phase 6.12: the per-turn conversation trace -------------------
+        #
+        # A live call is diagnosed from what the backend *decided*, turn by
+        # turn: which scope ruling, which held request, which tool, which
+        # reason, how long. None of that is speech.
+        #
+        # **Off by default, and the reason is cost rather than privacy.** Each
+        # traced event is a database write - a connection checkout, an insert
+        # and a commit, around 35 ms - and a call produces one per turn, per
+        # tool and per authentication change. Measured against the media path
+        # that is enough to matter: with several calls in flight it delayed
+        # assistant audio far enough to fail a gateway isolation test that
+        # passes without it. A diagnostic may not tax the calls it exists to
+        # diagnose, so it is switched on for the UAT that needs it and left off
+        # everywhere else.
+        self.trace_enabled: bool = _flag(os.getenv("TRACE_ENABLED"), False)
+
+        # Speech is a separate decision, and a stricter one.
+        #
+        # Channel 2 has never stored a spoken word (checklist Q-121), and that
+        # stays true unless an operator deliberately turns it on for a UAT.
+        # When they do, utterances are stored only in the redacted form the
+        # transcript rules already produce - a PIN turn is "[PIN REDACTED]",
+        # never digits. Default off, because a privacy posture should have to
+        # be chosen rather than inherited.
+        self.telephony_trace_utterances: bool = _flag(
+            os.getenv("TELEPHONY_TRACE_UTTERANCES"), False
+        )
+
+        # How long a trace is kept. Bounded on purpose: a trace exists to
+        # diagnose a call that has just happened, not to become a second
+        # transcript archive. Purged on the same sweep that reclaims idle
+        # calls, so no cron is needed and no unbounded table can grow.
+        self.trace_retention_days: int = _positive_int(
+            os.getenv("TRACE_RETENTION_DAYS"), default=14
+        )
+
         # Synthetic data only. This is a demonstration bank; turning it off
         # would imply a real banking connector, and there is none.
         self.demo_mode: bool = _flag(os.getenv("DEMO_MODE"), True)

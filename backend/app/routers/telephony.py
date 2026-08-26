@@ -33,6 +33,7 @@ import logging
 from fastapi import (
     APIRouter,
     Header,
+    HTTPException,
     Request,
     Response,
     WebSocket,
@@ -42,6 +43,7 @@ from fastapi import (
 from pydantic import ValidationError
 
 from app.config import settings
+from app.observability import trace
 from app.observability.events import AuditEvent, safe_event
 from app.telephony import service
 from app.telephony.bridge import phone_call_registry
@@ -313,3 +315,24 @@ async def media_socket(websocket: WebSocket, provider_call_id: str) -> None:
         # being cancelled. `end_media_call` runs both to completion regardless:
         # a cancellation here stops the waiting, never the cleanup.
         await service.end_media_call(provider_call_id, bridge.banking_session_id)
+
+
+@router.get("/calls/{provider_call_id}/trace")
+def call_trace(provider_call_id: str) -> dict:
+    """Replay one telephone call, in order, for a live UAT.
+
+    Read-only, and privacy-safe by construction rather than by filtering here:
+    nothing sensitive is in `call_trace_events` to begin with. Tool arguments
+    were sanitised by allowlist before they were written, utterances are absent
+    unless an operator turned them on and redacted when they are, and the
+    customer reference is only ever the identity the PIN check established.
+
+    A synchronous `def`, so FastAPI runs it on a worker thread where a database
+    read is safe — the same reason `/scope` is one.
+    """
+    replay = trace.for_call(provider_call_id)
+    if replay is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="No such call."
+        )
+    return replay

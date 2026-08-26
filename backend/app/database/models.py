@@ -7,7 +7,7 @@ Money is stored as NUMERIC (never floating point).
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 # Money: up to 13 digits before the decimal point, 2 after.
@@ -252,6 +252,101 @@ class AgentToolEvent(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<AgentToolEvent {self.agent_session_id} {self.tool_name}>"
+
+
+class CallTraceEvent(Base):
+    """One observable thing that happened on a call, in order.
+
+    The diagnostic record a live UAT needs, and deliberately not a transcript.
+    What is kept is what the **backend decided** - which scope ruling, which
+    held enquiry, which tool, which reason, how long - because that is what
+    tells you why a call went the way it did. Speech is the one field that is
+    not decision metadata, and it is the one field that is off by default
+    (`TELEPHONY_TRACE_UTTERANCES`); when it is on, it holds only the redacted
+    form the transcript rules already produce.
+
+    Append-only. Nothing here is ever updated, so a trace cannot be rewritten
+    after the fact - which is most of what makes it worth reading.
+
+    Ordering is by `sequence`, not by clock. Two events can share a timestamp
+    to the microsecond, and a replay that reorders a tool call and its own
+    result is worse than no replay at all.
+
+    `idempotency_key` is what stops one event becoming two. The same utterance
+    reaches the application in more than one representation, and a retried
+    provider event is ordinary; a key that names the event rather than its
+    arrival makes the second write a no-op instead of a duplicate row.
+    """
+
+    __tablename__ = "call_trace_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_pk: Mapped[int] = mapped_column(
+        ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True
+    )
+    agent_session_id: Mapped[str] = mapped_column(String(20), index=True)
+    # Null for a browser call, which has no provider. Indexed because the read
+    # path is "show me this telephone call".
+    provider_call_id: Mapped[str | None] = mapped_column(
+        String(64), index=True, nullable=True
+    )
+
+    # Replay order within one call, and the caller turn it belongs to.
+    sequence: Mapped[int] = mapped_column(Integer)
+    turn: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    # TURN / TOOL / AUTH / LIFECYCLE.
+    kind: Mapped[str] = mapped_column(String(20))
+    # CUSTOMER / AGENT / SYSTEM.
+    speaker: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # Redacted, and only when the operator has turned utterances on.
+    utterance: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # What the backend understood and decided.
+    domain: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    intent: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    scope_category: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    scope_allowed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    refusal_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+    # The enquiry being held across authentication, if any.
+    pending_operation: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    account_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    loan_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
+    # Who the backend believes is calling. Never a claim - only what the
+    # deterministic PIN check established.
+    auth_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    customer_ref: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    # The tool, and what it did. Arguments are sanitised before they arrive.
+    tool_name: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    tool_arguments: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    tool_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Where in the realtime event stream this came from, and how a call ended.
+    event_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    disconnect_reason: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
+    __table_args__ = (
+        # Replay: every event for one call, in order, from one index.
+        Index("ix_call_trace_events_session_sequence", "session_pk", "sequence"),
+        # Duplicate suppression: the second write of the same event loses.
+        Index(
+            "uq_call_trace_events_idempotency",
+            "session_pk",
+            "idempotency_key",
+            unique=True,
+        ),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<CallTraceEvent {self.agent_session_id} {self.kind}>"
 
 
 class CustomerAuthLock(Base):
