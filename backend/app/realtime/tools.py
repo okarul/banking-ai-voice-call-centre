@@ -28,23 +28,121 @@ the assistant sound like it is stuttering.
 """
 
 import asyncio
+import logging
 import time
 
 from agents import RunContextWrapper, function_tool
+from sqlalchemy.exc import SQLAlchemyError
 
 from app import pending_request
 from app.agents.intents import Domain
 from app.agents.registry import dispatch
 from app.agents.selection import carry_type
 from app.auth import authentication
+from app.database.connection import DatabaseNotConfiguredError
 from app.observability import business
 from app.realtime.context import BankingRealtimeContext
 from app.realtime.turn_gate import refusal_for, wait_for_ruling
+from app.sessions import SessionNotFoundError
+
+logger = logging.getLogger("app.realtime.tools")
 
 Ctx = RunContextWrapper[BankingRealtimeContext]
 
 # Returned when the call is no longer attached to a live banking session.
 SESSION_GONE = {"success": False, "reason": "SESSION_NOT_FOUND"}
+
+# Failures the banking tools cannot report for themselves, because they arrive
+# as exceptions rather than as results.
+DATABASE_UNAVAILABLE = "DATABASE_UNAVAILABLE"
+INTERNAL_TOOL_ERROR = "INTERNAL_TOOL_ERROR"
+
+# The bank's records are unreachable: not configured, or PostgreSQL is down,
+# refusing connections, or timing out. An operational fact about the estate,
+# expected and transient, and nothing to do with this caller.
+_RECORDS_UNREACHABLE = (DatabaseNotConfiguredError, SQLAlchemyError)
+
+
+def _run_tool(tool_name: str, session_id: str, arguments: dict, manager) -> dict:
+    """Run one registered tool, reporting a failure instead of raising.
+
+    **Why this boundary exists at all.** Left to propagate, an exception out of
+    a `@function_tool` body is caught by the Agents SDK
+    (`agents.tool._FailureHandlingFunctionToolInvoker.__call__`), which hands it
+    to `default_tool_error_function` and returns the result *to the model* as:
+
+        "An error occurred while running the tool. Please try again. Error:
+         {str(error)}"
+
+    For the exception this path is most likely to see, `str(error)` is not a
+    generic phrase. A SQLAlchemy `OperationalError` renders as the failing
+    statement, its bound parameters and the database host:
+
+        (builtins.Exception) connection to server at "127.0.0.1", port 5435
+        failed: password authentication failed for user "postgres"
+        [SQL: SELECT customers.pin_hash FROM customers WHERE ...]
+        [parameters: {'id': 'DEMO001'}]
+
+    Handing that to a language model on a live telephone call, under
+    instructions to report what tools return, is an information-disclosure path
+    into the audio. Two further things happen on that route, both bad: the
+    invocation never reaches `business.record_tool_outcome`, so the operations
+    board shows no tool event, no FAILED and no count for an enquiry the caller
+    definitely made; and nothing is logged above debug, so the outage leaves no
+    trace anywhere.
+
+    So every exit from here is a structured result. `success` is `False` on all
+    of them — this boundary can report a failure, and can never invent one that
+    succeeded.
+
+    **What is caught, and why.** The two operational cases are named, because
+    they are facts about the estate rather than defects and neither deserves a
+    traceback:
+
+    * `SessionNotFoundError` — the call ended while the lookup was in flight.
+      Reported as `SESSION_NOT_FOUND`, the reason this application already uses
+      for a call that is no longer there.
+    * `DatabaseNotConfiguredError`, `SQLAlchemyError` — the bank's records are
+      unreachable. Reported as `DATABASE_UNAVAILABLE`.
+
+    Everything else is a defect in the tool layer and is *unexpected by
+    definition*, which is exactly why the last clause is broad: the set of ways
+    Python code can be wrong is not enumerable, and a defect that escaped this
+    function would take the SDK route above — telling the model, telling nobody
+    else. It is classified `INTERNAL_TOOL_ERROR` and logged at ERROR with a
+    traceback, so it is louder here than it was before, not quieter. The
+    traceback is scrubbed by `app.redaction.RedactingFilter` before any handler
+    formats it.
+
+    `asyncio.CancelledError` derives from `BaseException` and is deliberately
+    not caught, so a call being torn down still cancels rather than being
+    recorded as a banking failure.
+
+    Runs on a worker thread, via `asyncio.to_thread` in `_dispatch`.
+    """
+    try:
+        return dispatch(tool_name, session_id, arguments, manager=manager)
+    except SessionNotFoundError:
+        # Not an error condition: the caller hung up mid-enquiry.
+        logger.info("tool %s ran against a call that had ended", tool_name)
+        return dict(SESSION_GONE)
+    except _RECORDS_UNREACHABLE as error:
+        # Expected and transient. Only the type name is logged: `str(error)`
+        # for a SQLAlchemy failure carries the statement and its parameters.
+        logger.error(
+            "tool %s could not reach the database: %s",
+            tool_name,
+            type(error).__name__,
+        )
+        return {"success": False, "reason": DATABASE_UNAVAILABLE}
+    except Exception as error:
+        # A defect. Reported with a traceback, which carries file, line and
+        # source — never an argument (one is a PIN) and never a result (one is
+        # a balance). See the class list above for why this clause is broad.
+        logger.error(
+            "tool %s failed: %s", tool_name, type(error).__name__, exc_info=True
+        )
+        return {"success": False, "reason": INTERNAL_TOOL_ERROR}
 
 
 def _binding(context: Ctx) -> tuple[str, object]:
@@ -65,7 +163,7 @@ async def _dispatch(context: Ctx, tool_name: str, arguments: dict) -> dict:
     session_id, manager = _binding(context)
     started = time.perf_counter()
     result = await asyncio.to_thread(
-        dispatch, tool_name, session_id, arguments, manager=manager
+        _run_tool, tool_name, session_id, arguments, manager
     )
     # Recorded here rather than in either channel's caller: both the browser
     # route and the telephone agent reach this function, and mirroring it in
@@ -157,13 +255,41 @@ async def _check_scope(context: Ctx, tool_name: str) -> dict | None:
     return refusal
 
 
-async def _carried(context: Ctx, domain: Domain, stated: str | None) -> str | None:
-    """Fill in the account or loan already being discussed, if unsaid."""
+async def _carried(
+    context: Ctx, domain: Domain, stated: str | None, tool_name: str
+) -> str | None:
+    """Which account or loan this enquiry is about, when the model said none.
+
+    Three sources, in order, and the caller's own words win outright:
+
+    1. what the model passed, which is what the caller just said;
+    2. the account or loan this call is already discussing;
+    3. the account or loan named in the enquiry being held for this same tool.
+
+    The third is what makes a resumed enquiry answer the question that was
+    actually asked. "What is my savings balance?" is classified before the
+    caller is verified, and "Savings" is recorded on the held enquiry. Several
+    turns later the model resumes it — and if it omits `account_type`, the
+    caller is asked which account they meant, having already said. The server
+    heard them; they do not need to be asked twice.
+
+    Read from a fixed vocabulary and scoped to the one tool the held enquiry
+    names, so it can never redirect a different enquiry, and it carries no
+    identity.
+    """
     banking = context.context
     session = await asyncio.to_thread(banking.session)
     if session is None:
         return stated
-    return carry_type(session, domain, stated)
+
+    carried = carry_type(session, domain, stated)
+    if carried is not None:
+        return carried
+
+    held = pending_request.recall(session)
+    if held is None or held.tool != tool_name:
+        return None
+    return held.account_type if domain is Domain.ACCOUNT else held.loan_type
 
 
 # --- authentication ---------------------------------------------------------
@@ -271,7 +397,9 @@ async def get_account_balance(context: Ctx, account_type: str | None = None) -> 
     refusal = await _check_scope(context, "get_account_balance")
     if refusal is not None:
         return refusal
-    account_type = await _carried(context, Domain.ACCOUNT, account_type)
+    account_type = await _carried(
+        context, Domain.ACCOUNT, account_type, "get_account_balance"
+    )
     return await _dispatch(
         context, "get_account_balance", {"account_type": account_type}
     )
@@ -287,7 +415,9 @@ async def get_account_details(context: Ctx, account_type: str | None = None) -> 
     refusal = await _check_scope(context, "get_account_details")
     if refusal is not None:
         return refusal
-    account_type = await _carried(context, Domain.ACCOUNT, account_type)
+    account_type = await _carried(
+        context, Domain.ACCOUNT, account_type, "get_account_details"
+    )
     return await _dispatch(
         context, "get_account_details", {"account_type": account_type}
     )
@@ -310,7 +440,9 @@ async def get_recent_transactions(
     refusal = await _check_scope(context, "get_recent_transactions")
     if refusal is not None:
         return refusal
-    account_type = await _carried(context, Domain.ACCOUNT, account_type)
+    account_type = await _carried(
+        context, Domain.ACCOUNT, account_type, "get_recent_transactions"
+    )
     arguments: dict = {"account_type": account_type}
     if limit is not None:
         arguments["limit"] = limit
@@ -331,7 +463,7 @@ async def get_loan_balance(context: Ctx, loan_type: str | None = None) -> dict:
     refusal = await _check_scope(context, "get_loan_balance")
     if refusal is not None:
         return refusal
-    loan_type = await _carried(context, Domain.LOAN, loan_type)
+    loan_type = await _carried(context, Domain.LOAN, loan_type, "get_loan_balance")
     return await _dispatch(context, "get_loan_balance", {"loan_type": loan_type})
 
 
@@ -345,7 +477,7 @@ async def get_loan_details(context: Ctx, loan_type: str | None = None) -> dict:
     refusal = await _check_scope(context, "get_loan_details")
     if refusal is not None:
         return refusal
-    loan_type = await _carried(context, Domain.LOAN, loan_type)
+    loan_type = await _carried(context, Domain.LOAN, loan_type, "get_loan_details")
     return await _dispatch(context, "get_loan_details", {"loan_type": loan_type})
 
 
@@ -360,7 +492,7 @@ async def get_next_instalment(context: Ctx, loan_type: str | None = None) -> dic
     refusal = await _check_scope(context, "get_next_instalment")
     if refusal is not None:
         return refusal
-    loan_type = await _carried(context, Domain.LOAN, loan_type)
+    loan_type = await _carried(context, Domain.LOAN, loan_type, "get_next_instalment")
     return await _dispatch(context, "get_next_instalment", {"loan_type": loan_type})
 
 

@@ -108,6 +108,12 @@ def _live_secrets() -> tuple[str, ...]:
     )
 
 
+# Renders a traceback exactly as the standard library would, so a record
+# carrying `exc_info` can be scrubbed before any handler formats it. Held at
+# module level because building one per record is pure waste.
+_EXCEPTION_RENDERER = logging.Formatter()
+
+
 class RedactingFilter(logging.Filter):
     """A logging filter that scrubs every record before it is emitted.
 
@@ -116,6 +122,20 @@ class RedactingFilter(logging.Filter):
     output. It rewrites the formatted message and drops the original arguments,
     because leaving them in place would let a handler re-expand the unredacted
     values.
+
+    **Tracebacks are rendered here rather than left to the handler.** A filter
+    runs before formatting, so `record.exc_text` is still empty at this point
+    and scrubbing it alone scrubbed nothing: every `exc_info=True` call site in
+    this application was emitting an unredacted traceback. That matters because
+    the last line of a traceback is `str(exception)`, and the exceptions most
+    likely to be logged are the ones that carry the most: a SQLAlchemy
+    `OperationalError` renders the failing statement, its bound parameters and
+    the database host, and a connection error renders the URL.
+
+    So the traceback is rendered with the standard formatter, scrubbed, and
+    cached on `record.exc_text`. `logging.Formatter.format` uses that cache
+    verbatim when it is already set, which is what makes the scrubbed version
+    the one that reaches the handler.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -129,6 +149,13 @@ class RedactingFilter(logging.Filter):
         if cleaned != message or record.args:
             record.msg = cleaned
             record.args = ()
+
+        if not record.exc_text and record.exc_info:
+            try:
+                record.exc_text = _EXCEPTION_RENDERER.formatException(record.exc_info)
+            except Exception:
+                # An exception whose own repr fails must not lose the record.
+                record.exc_text = None
 
         if record.exc_text:
             record.exc_text = redact(record.exc_text)

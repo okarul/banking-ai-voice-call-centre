@@ -145,6 +145,35 @@ def succeeded(result) -> bool:
     return not (isinstance(result, dict) and result.get("success") is False)
 
 
+# One stable string to grep a failed banking enquiry by, alongside MIRROR_FAILED
+# for a failed recording of one. Different things, and an operator chasing a
+# customer complaint needs to tell them apart.
+TOOL_FAILED = "BANKING_TOOL_FAILED"
+
+# A scope refusal reports `OUT_OF_SCOPE` and puts *why* in `category`, so the
+# reason on its own cannot distinguish "asked about the weather" from "asked
+# about another customer's money". For an operations record they are not
+# remotely the same event.
+_SCOPE_REASON = "OUT_OF_SCOPE"
+
+
+def failure_reason(result) -> str | None:
+    """The most specific reason a tool failed, or None if it did not.
+
+    Never the customer-facing sentence, and never a value: a reason code is a
+    fixed string from a known set, so it is safe to log where a balance, an
+    account number or a spoken PIN would not be.
+    """
+    if not isinstance(result, dict) or result.get("success") is not False:
+        return None
+
+    reason = result.get("reason")
+    if reason == _SCOPE_REASON:
+        # CROSS_CUSTOMER_REQUEST, SECURITY_OR_PROMPT_ATTACK, and the rest.
+        return result.get("category") or reason
+    return reason or "UNKNOWN"
+
+
 @_never_fails("record_tool_outcome")
 def record_tool_outcome(
     session_id: str,
@@ -158,7 +187,19 @@ def record_tool_outcome(
     A refused tool is still an invocation and is still counted — an operator
     needs to see that the caller asked — but it is recorded as `FAILED`, so a
     refusal can never be read off the board as an answered enquiry.
+
+    `agent_tool_events` has no column for *why* it failed, and adding one is a
+    schema change this fix does not need. The reason is therefore kept in the
+    log, where it is just as greppable and costs nothing: the row says an
+    enquiry failed, the log line says whether the caller was unverified, asked
+    about somebody else, named an account they do not hold, or found the bank's
+    records unreachable. Collapsing those four into one silent FAILED is what
+    made an intermittent live regression so slow to place.
     """
+    reason = failure_reason(result)
+    if reason is not None:
+        logger.warning("%s tool=%s reason=%s", TOOL_FAILED, tool_name, reason)
+
     recorder.record_tool_call(
         session_id,
         tool_name,

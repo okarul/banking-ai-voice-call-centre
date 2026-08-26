@@ -447,6 +447,12 @@ async def _register_incoming(payload: InboundCallEvent) -> EventResult:
     )
 
 
+# Teardowns still running. A task referenced by nothing can be collected
+# mid-release, which would reintroduce exactly the leak below by a second
+# route, so each one is held until it finishes.
+_releasing: set[asyncio.Task] = set()
+
+
 async def tear_down(provider_call_id: str, banking_session_id: str) -> None:
     """Release everything one call holds, in any state, more than once safely.
 
@@ -455,21 +461,125 @@ async def tear_down(provider_call_id: str, banking_session_id: str) -> None:
     event, the model session drops, a timeout fires — and every one of them has
     to converge here rather than each releasing a different subset.
 
+    **Shielded, because the thing that ends a call also cancels the task that
+    has to clean up after it.** This runs from a `finally` in the media socket
+    route, and from bridge tasks that a closing call is itself cancelling. A
+    cancellation delivered while this coroutine is between two of its own
+    `await`s used to abort it part-way through — reliably after the bridge had
+    been taken out of the registry and reliably before the model session was
+    closed. What that left behind was the worst possible half:
+
+    * the provider session stayed open, billing and holding a connection;
+    * its capacity slot was never returned, so `used_capacity()` never came
+      back down;
+    * and the idle sweep could not reclaim either, because the sweep walks
+      `phone_call_registry` and the bridge was already gone from it.
+
+    On a deployment with `REALTIME_MAX_ACTIVE_SESSIONS = 1` that is one dropped
+    socket away from every subsequent caller being told the bank is full, until
+    the process is restarted.
+
+    So the release runs as its own task and this call merely *waits* for it.
+    Cancelling the waiter — which is what a hang-up does — stops the waiting,
+    not the releasing. Nothing here awaits the caller's task in turn, so a
+    bridge closing its own pumps still completes: the pump's wait is cancelled,
+    the release carries on.
+
     Deliberately *not* released: the persistent PIN lockout. That is customer
     security state and outlives the call by design. Clearing it on hang-up
     would make hanging up the way to reset it, which is the exact loop the
     lockout was built to close.
     """
-    bridge = await phone_call_registry.remove(provider_call_id)
+    await _uninterruptible(
+        _release_everything(provider_call_id, banking_session_id)
+    )
+
+
+async def end_media_call(provider_call_id: str, banking_session_id: str) -> None:
+    """The media socket route's whole cleanup, as one indivisible thing.
+
+    Called from that route's `finally`, which is reached exactly when the
+    caller has gone — and often while the route's own task is being cancelled
+    for the same reason. Releasing the call and recording that it ended are two
+    steps of one ending, so they are shielded together: shielding only the
+    first left a released call whose row stayed `ACTIVE` with no `ended_at`,
+    which is a live call on the operations board and a finished one everywhere
+    else.
+    """
+    await _uninterruptible(
+        _release_and_record(provider_call_id, banking_session_id)
+    )
+
+
+async def _uninterruptible(work) -> None:
+    """Run `work` to completion, whatever happens to the caller waiting on it.
+
+    The work becomes its own task, so cancelling the waiter stops the waiting
+    rather than the work. The task is held in `_releasing` because a task
+    referenced by nothing can be collected mid-flight, which would reintroduce
+    the same leak by a second route.
+    """
+    task = asyncio.ensure_future(work)
+    _releasing.add(task)
+    task.add_done_callback(_releasing.discard)
+    await asyncio.shield(task)
+
+
+async def _release_and_record(
+    provider_call_id: str, banking_session_id: str
+) -> None:
+    """Release the call, then write down that the caller hung up."""
+    await _release_everything(provider_call_id, banking_session_id)
+    try:
+        # Only recorded if nothing else closed this call first — the update
+        # moves the row `WHERE ended_at IS NULL`. So a goodbye, a silence close
+        # or a failure keeps its own reason, and a socket closing is read as a
+        # caller hang-up only when it genuinely was one.
+        recorder.close_phone_call(provider_call_id, reason=reasons.CALLER_HANGUP)
+    except Exception as error:
+        # The call is released either way, and an observability failure must
+        # not replace whatever actually ended it.
+        logger.error("telephony call record not closed: %s", type(error).__name__)
+
+
+async def _release_everything(
+    provider_call_id: str, banking_session_id: str
+) -> None:
+    """Hand back every resource one call holds. Never raises.
+
+    Each release is attempted independently. They were a straight sequence, and
+    a straight sequence has the same shape of fault as the cancellation above:
+    one step failing strands every step after it, and the ones after it are the
+    provider session and its capacity slot. A bridge that cannot close is not a
+    reason to keep paying for a model session nobody is listening to.
+    """
+    bridge = await _released("bridge", phone_call_registry.remove(provider_call_id))
     if bridge is not None:
-        await bridge.close()
+        await _released("media", bridge.close())
 
     # `close` returns the capacity slot and returns False when there was
     # nothing to close, so arriving here twice cannot release two slots. The
     # `release` is for a call that failed before it became a connection.
-    await voice_call_manager.close(banking_session_id)
-    await voice_call_manager.release(banking_session_id)
+    await _released("realtime", voice_call_manager.close(banking_session_id))
+    await _released("reservation", voice_call_manager.release(banking_session_id))
     session_manager.destroy_session(banking_session_id)
+
+
+async def _released(what: str, release):
+    """Await one release step, reporting a failure instead of propagating it.
+
+    `CancelledError` derives from `BaseException` and is deliberately not
+    caught: this runs inside the shielded task, so the only cancellation that
+    can reach it is the loop shutting down, and that is not a moment to keep
+    going.
+    """
+    try:
+        return await release
+    except Exception as error:
+        logger.error(
+            "telephony %s not released: %s", what, type(error).__name__
+        )
+        return None
 
 
 async def _end_call(payload: InboundCallEvent) -> EventResult:

@@ -22,6 +22,7 @@ These tests are the two fixes, and the paths that must keep working around them.
 """
 
 import asyncio
+import contextlib
 
 import pytest
 from sqlalchemy import delete
@@ -347,3 +348,266 @@ def test_two_calls_cannot_close_one_anothers_socket():
     assert first_closed == 1
     assert second_closed == 0, "one call closed another's media socket"
     assert second_attached is True
+
+
+# === 13-16: the hang-up that cancels its own cleanup =========================
+#
+# Phase 6.11. `service.tear_down` is called from a `finally` in the media
+# socket route, and from bridge tasks that a closing call is itself cancelling.
+# A cancellation arriving while it was between two of its own `await`s aborted
+# it part-way — reliably after the bridge had left the registry, and reliably
+# before the model session was closed. The provider session stayed open, its
+# capacity slot was never returned, and the idle sweep could reclaim neither,
+# because the sweep walks the registry the bridge had already left.
+#
+# Found as an intermittent failure in `test_telephony_media_socket.py`, where a
+# capacity assertion would occasionally see a slot that never came back.
+
+
+class _CountingRealtime:
+    """The capacity bookkeeping `tear_down` has to reach, and nothing else."""
+
+    def __init__(self) -> None:
+        self.open_calls: set[str] = set()
+        self.reservations: set[str] = set()
+        # Long enough that a cancellation lands *inside* the close rather than
+        # around it. Deterministic: the test cancels while this is being
+        # awaited, which is exactly where the live cancellation landed.
+        self.close_delay = 0.05
+
+    def used_capacity(self) -> int:
+        return len(self.open_calls) + len(self.reservations)
+
+    async def start(self, session_id: str) -> None:
+        self.open_calls.add(session_id)
+
+    async def close(self, session_id: str) -> bool:
+        await asyncio.sleep(self.close_delay)
+        present = session_id in self.open_calls
+        self.open_calls.discard(session_id)
+        return present
+
+    async def release(self, session_id: str) -> None:
+        self.reservations.discard(session_id)
+
+    async def send_audio(self, session_id, audio):
+        pass
+
+    async def send_message(self, session_id, text):
+        pass
+
+
+class _SlowClosingTransport(LoopbackMediaTransport):
+    """A transport whose close takes long enough to be interrupted."""
+
+    async def on_call_ended(self) -> None:
+        await asyncio.sleep(0.05)
+        await super().on_call_ended()
+
+
+def _wired(monkeypatch, call_id, *, transport=None):
+    """One registered call, with the service pointed at a countable manager."""
+    from app.telephony import service
+    from app.telephony.bridge import phone_call_registry
+
+    realtime = _CountingRealtime()
+    monkeypatch.setattr(service, "voice_call_manager", realtime)
+
+    session = session_manager.create_session()
+    bridge = PhoneCallBridge(
+        provider_call_id=call_id,
+        banking_session_id=session.session_id,
+        transport=transport or _SlowClosingTransport(),
+        realtime_manager=realtime,
+        outbound_max_frames=200,
+    )
+    return service, phone_call_registry, realtime, bridge, session.session_id
+
+
+async def _settled(predicate, *, timeout: float = 5.0) -> None:
+    """Wait on the loop for a condition. Bounded, so a leak still fails."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate() and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+
+
+def test_a_hang_up_that_cancels_the_cleanup_still_releases_the_call(monkeypatch):
+    """The fail-before-fix case, with no timing assumption in it.
+
+    The caller goes away, the route's `finally` starts the teardown, and the
+    route's own task is cancelled while that teardown is in flight. That is the
+    ordinary shape of a hang-up, not an exotic one, and everything the call
+    holds must still be handed back.
+    """
+
+    async def scenario():
+        service, registry, realtime, bridge, session_id = _wired(
+            monkeypatch, "hangup-cancelled"
+        )
+        await registry.register(bridge)
+        await realtime.start(session_id)
+        assert realtime.used_capacity() == 1
+
+        route = asyncio.ensure_future(
+            service.tear_down("hangup-cancelled", session_id)
+        )
+        await asyncio.sleep(0)  # let it reach its first await
+        route.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await route
+
+        # The waiting stopped. The releasing did not.
+        await _settled(lambda: realtime.used_capacity() == 0)
+        return realtime.used_capacity(), registry.active_count(), bridge.closed
+
+    capacity, bridges, closed = run(scenario())
+
+    assert capacity == 0, "the capacity slot was stranded by the cancellation"
+    assert bridges == 0
+    assert closed is True, "the bridge was left half-closed"
+
+
+def test_a_step_that_fails_does_not_strand_the_steps_after_it(monkeypatch):
+    """One release failing must not keep a provider session open.
+
+    The same shape of fault as the cancellation, reached from a different
+    direction: the releases were a straight sequence, so the first failure
+    stranded every step after it - and what comes after is the model session
+    and its capacity slot. A bridge that cannot close is not a reason to keep
+    paying for a call nobody is listening to.
+    """
+
+    async def scenario():
+        service, registry, realtime, bridge, session_id = _wired(
+            monkeypatch, "wedged"
+        )
+
+        async def wedged():
+            raise RuntimeError("bridge is wedged")
+
+        monkeypatch.setattr(bridge, "close", wedged)
+        await registry.register(bridge)
+        await realtime.start(session_id)
+
+        await service.tear_down("wedged", session_id)
+        await _settled(lambda: not service._releasing)
+        return realtime.used_capacity(), registry.active_count()
+
+    capacity, bridges = run(scenario())
+
+    assert capacity == 0, "a wedged bridge stranded the capacity slot"
+    assert bridges == 0
+
+
+def test_a_cancelled_cleanup_is_still_only_one_cleanup(monkeypatch):
+    """Shielding must not turn one ending into two releases."""
+
+    async def scenario():
+        service, registry, realtime, bridge, session_id = _wired(
+            monkeypatch, "twice-cancelled"
+        )
+        await registry.register(bridge)
+        await realtime.start(session_id)
+        realtime.reservations.add(session_id)
+
+        first = asyncio.ensure_future(
+            service.tear_down("twice-cancelled", session_id)
+        )
+        await asyncio.sleep(0)
+        first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
+
+        # The provider's own end event, arriving at the same moment.
+        await service.tear_down("twice-cancelled", session_id)
+        await _settled(lambda: not service._releasing)
+
+        return realtime.used_capacity(), registry.active_count()
+
+    capacity, bridges = run(scenario())
+
+    assert capacity == 0
+    assert bridges == 0
+
+
+def test_the_release_task_is_held_until_it_finishes(monkeypatch):
+    """A task referenced by nothing can be collected mid-release."""
+    import gc
+
+    from app.telephony import service
+
+    async def scenario():
+        _service, registry, realtime, bridge, session_id = _wired(monkeypatch, "held")
+        await registry.register(bridge)
+        await realtime.start(session_id)
+
+        route = asyncio.ensure_future(service.tear_down("held", session_id))
+        await asyncio.sleep(0)
+        route.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await route
+
+        held = len(service._releasing)
+        gc.collect()
+        still_held = len(service._releasing)
+
+        await _settled(lambda: not service._releasing)
+        return held, still_held, len(service._releasing), realtime.used_capacity()
+
+    held, still_held, after, capacity = run(scenario())
+
+    assert held == 1, "the in-flight release was not held anywhere"
+    assert still_held == 1, "a collection could have taken the release with it"
+    assert after == 0, "the release was never discarded when it finished"
+    assert capacity == 0
+
+
+def test_a_cancelled_hang_up_still_records_the_ending(monkeypatch):
+    """Releasing the call and writing down that it ended are one ending.
+
+    Shielding only the release left the other half exposed: the call was freed
+    and its row stayed `ACTIVE` with no `ended_at` — a live call on the
+    operations board and a finished one everywhere else, for a caller who had
+    simply hung up.
+    """
+    from sqlalchemy import select
+
+    from app.observability import recorder
+    from app.telephony import reasons
+
+    async def scenario():
+        service, registry, realtime, bridge, session_id = _wired(
+            monkeypatch, "record-cancelled"
+        )
+        recorder.claim_phone_call(
+            session_id,
+            provider_call_id="record-cancelled",
+            provider_event_id="evt-record-cancelled",
+        )
+        await registry.register(bridge)
+        await realtime.start(session_id)
+
+        route = asyncio.ensure_future(
+            service.end_media_call("record-cancelled", session_id)
+        )
+        await asyncio.sleep(0)
+        route.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await route
+
+        await _settled(lambda: not service._releasing)
+        return realtime.used_capacity()
+
+    capacity = run(scenario())
+
+    assert capacity == 0
+    with session_scope() as db:
+        row = db.scalars(
+            select(AgentSession).where(
+                AgentSession.provider_call_id == "record-cancelled"
+            )
+        ).one()
+    assert row.status == "COMPLETED", "a hang-up left the call showing as live"
+    assert row.ended_at is not None
+    assert row.disconnect_reason == reasons.CALLER_HANGUP

@@ -67,6 +67,19 @@ DOMAIN_BY_INTENT = {
     Intent.UNKNOWN: Domain.UNKNOWN,
 }
 
+# Which tool answers which enquiry. One map, read by every path that has to name
+# an enquiry: the Phase 8 supervisor, and the Phase 11 scope gate when it holds
+# an enquiry made before the caller was verified. Two copies of this map is how
+# the two channels came to resume a held enquiry differently.
+TOOL_BY_INTENT = {
+    Intent.ACCOUNT_BALANCE: "get_account_balance",
+    Intent.ACCOUNT_DETAILS: "get_account_details",
+    Intent.RECENT_TRANSACTIONS: "get_recent_transactions",
+    Intent.LOAN_BALANCE: "get_loan_balance",
+    Intent.LOAN_DETAILS: "get_loan_details",
+    Intent.NEXT_INSTALMENT: "get_next_instalment",
+}
+
 # Only these combinations are answerable. A pair that is absent — asking for
 # transactions on a loan, or an instalment on a savings account — resolves to
 # UNKNOWN rather than being bent into the nearest available answer.

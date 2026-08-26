@@ -242,6 +242,14 @@ class ScopeDecision:
     domain: Domain = Domain.UNKNOWN
     # True when a supported request arrived with out-of-scope content attached.
     mixed: bool = False
+    # Which account or loan the caller named, if they named one. Carried so the
+    # ruling describes the whole enquiry and not just its shape: a turn
+    # classified before the caller was verified is the only deterministic record
+    # that "savings" was said, and the lookup that finally answers it happens
+    # several turns later. Drawn from the same deterministic classifier the
+    # tools use, and from a fixed vocabulary — never free text.
+    account_type: str | None = None
+    loan_type: str | None = None
 
     @property
     def allowed(self) -> bool:
@@ -256,6 +264,8 @@ class ScopeDecision:
             "intent": self.intent.value,
             "domain": self.domain.value,
             "mixed": self.mixed,
+            "account_type": self.account_type,
+            "loan_type": self.loan_type,
             "speech": self.speech,
         }
 
@@ -332,6 +342,8 @@ def classify_scope(
                 speech=NOT_AUTHENTICATED_SPEECH,
                 intent=classification.intent,
                 domain=classification.domain,
+                account_type=classification.account_type,
+                loan_type=classification.loan_type,
             )
 
         if classification.intent is Intent.RECENT_TRANSACTIONS:
@@ -349,6 +361,8 @@ def classify_scope(
             intent=classification.intent,
             domain=classification.domain,
             mixed=mixed,
+            account_type=classification.account_type,
+            loan_type=classification.loan_type,
         )
 
     # 5. Banking, but not something offered here.

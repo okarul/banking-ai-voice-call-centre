@@ -14,6 +14,7 @@ Every customer and PIN here is synthetic seed data. Time is passed in, never
 slept for.
 """
 
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -222,6 +223,14 @@ def test_the_lock_applies_to_a_phone_session(monkeypatch):
     monkeypatch.setattr(settings, "telephony_enabled", True)
     monkeypatch.setattr(settings, "telephony_webhook_secret", webhook.TEST_SECRET)
     monkeypatch.setattr(settings, "realtime_max_active_sessions", 0)
+    # No gateway ever attaches audio in this test, and production gives a call
+    # `telephony_media_connect_timeout` seconds to do so before giving it up -
+    # which destroys the banking session this test is about. That is correct
+    # behaviour racing a test's own runtime: whether the assertion below ran
+    # before or after the fifteen-second budget depended on how fast the
+    # machine was that day. The budget is pinned out of reach instead, so the
+    # test measures the lockout rather than the clock.
+    monkeypatch.setattr(settings, "telephony_media_connect_timeout", 3600)
     # The lockout is a property of this bank, not of the model provider. Stub
     # the connector so the assertion does not depend on an external service.
     monkeypatch.setattr(
@@ -239,11 +248,26 @@ def test_the_lock_applies_to_a_phone_session(monkeypatch):
         session_manager.destroy_session(session_id)
 
     # ...and the telephone caller arrives already locked.
-    body = webhook.event_body(call_id="call-lockout", event_id="evt-lockout")
+    #
+    # A call id of its own, per run. A provider call is claimed once and for
+    # all - a second event naming it is a retry, and the backend is right to
+    # answer DUPLICATE and create nothing. This file wipes no rows, so a fixed
+    # id made the *second* run of this test a duplicate of the first: no phone
+    # session was created, and the test read the previous run's finished call
+    # instead. It passed only when some unrelated file had happened to clear
+    # `agent_sessions` first, which is not a thing to depend on.
+    call_id = f"call-lockout-{uuid.uuid4()}"
+    body = webhook.event_body(call_id=call_id, event_id=f"evt-{call_id}")
     client.post(
         webhook.ENDPOINT, content=body, headers=webhook.signed_headers(body)
     )
-    phone_session_id = webhook.phone_rows()[0].banking_session_id
+    # This call's row, named rather than assumed to be the first one: rows are
+    # ordered by id, so `[0]` is the oldest phone call in the database.
+    phone_session_id = next(
+        row.banking_session_id
+        for row in webhook.phone_rows()
+        if row.provider_call_id == call_id
+    )
 
     submit_customer_id(phone_session_id, CUSTOMER)
     result = submit_pin(phone_session_id, REAL_PIN)

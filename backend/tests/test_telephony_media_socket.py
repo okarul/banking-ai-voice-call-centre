@@ -203,6 +203,22 @@ def until(predicate, *, timeout: float = 10.0) -> bool:
     return predicate()
 
 
+def ended_row(call_id: str):
+    """This call's record once it has been closed, or None while it has not.
+
+    Named rather than "the only row": the ending is written after the call is
+    released, so a test that has waited for the release has not yet waited for
+    this.
+    """
+    with session_scope() as db:
+        row = db.scalars(
+            select(AgentSession).where(AgentSession.provider_call_id == call_id)
+        ).one_or_none()
+        if row is None or row.ended_at is None:
+            return None
+        return row
+
+
 def frame(seed: int = 1) -> bytes:
     pcm = array.array("h", [seed * 700] * codec.ULAW_FRAME_BYTES).tobytes()
     return codec.pcm16_to_ulaw(pcm)
@@ -274,7 +290,12 @@ def test_two_calls_each_get_their_own_socket_and_audio(client, sessions):
         with media(client, "call-y") as socket_y:
             socket_x.send_bytes(frame(1))
             socket_y.send_bytes(frame(2))
-            until(lambda: all(session.audio_chunks for session in sessions[:2]))
+            # Both model sessions, not "however many exist so far": `all()` over
+            # a list that has not filled up yet is vacuously true.
+            assert until(
+                lambda: len(sessions) >= 2
+                and all(session.audio_chunks for session in sessions[:2])
+            ), "the caller audio never reached both model sessions"
 
             # Checked while both are live: closing either socket ends its call,
             # so after the `with` blocks the registry is legitimately empty.
@@ -293,8 +314,19 @@ def test_two_calls_each_get_their_own_socket_and_audio(client, sessions):
     assert sessions[1].audio_chunks[0] == codec.telephony_to_model(frame(2))
 
     # Both sockets closed, so both calls released everything they held.
-    assert phone_call_registry.active_count() == 0
-    assert voice_call_manager.used_capacity() == 0
+    #
+    # Waited for, not sampled. Teardown takes the bridge out of the registry
+    # first - it has to, or a socket could attach to a call being released -
+    # and hands the capacity slot back a moment later. Reading both in the same
+    # breath therefore catches a correct teardown mid-stride perhaps once in
+    # fifty runs, which is indistinguishable from the leak this file exists to
+    # catch. The wait is bounded, so a real leak still fails.
+    assert until(lambda: phone_call_registry.active_count() == 0), (
+        "a bridge outlived its socket"
+    )
+    assert until(lambda: voice_call_manager.used_capacity() == 0), (
+        "a capacity slot was never returned"
+    )
 
 
 def test_a_text_message_on_the_media_socket_is_ignored(client, sessions):
@@ -323,14 +355,22 @@ def test_the_caller_going_away_releases_the_call(client, sessions):
     with media(client, "call-bye"):
         pass
 
-    until(lambda: voice_call_manager.used_capacity() == 0)
+    # Two waits, because a hang-up is two things: the call is released, and
+    # then the ending is written down. Waiting only for the slot to come back
+    # read the row in the gap between them and found it still `ACTIVE` - about
+    # once in fifty runs, which is exactly often enough to be mistaken for
+    # noise and exactly rare enough to be waved through.
+    assert until(lambda: voice_call_manager.used_capacity() == 0), (
+        "the capacity slot was never returned"
+    )
+    assert until(lambda: ended_row("call-bye") is not None), (
+        "the ending was never recorded"
+    )
 
-    assert voice_call_manager.used_capacity() == 0
     assert phone_call_registry.active_count() == 0
     assert sessions[0].closed is True
 
-    with session_scope() as db:
-        row = db.scalars(select(AgentSession)).one()
+    row = ended_row("call-bye")
     assert row.status == "COMPLETED"
     assert row.ended_at is not None
 

@@ -36,6 +36,7 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 
+from app.agents.intents import TOOL_BY_INTENT
 from app.scope import ScopeCategory, ScopeDecision, classify_scope
 from app.sessions import Session
 
@@ -144,6 +145,8 @@ def record_decision(session: Session | None, decision: ScopeDecision) -> None:
         from app import pending_request
 
         pending_request.clear(session)
+    else:
+        _hold_unverified_enquiry(session, decision)
 
     # Deliberately **no database write here.** This function is called from
     # `RealtimeManager._feed_gate`, which runs inside the realtime pump's
@@ -157,6 +160,63 @@ def record_decision(session: Session | None, decision: ScopeDecision) -> None:
     # each channel persists the returned decision from a context where
     # blocking is safe — `/scope` on its threadpool, the telephone through
     # `asyncio.to_thread` in the pump.
+
+
+def _hold_unverified_enquiry(session: Session, decision: ScopeDecision) -> None:
+    """Hold the enquiry an unverified caller just made, from the ruling itself.
+
+    This is the deterministic half of the Phase 11 resume exemption, and the
+    reason a live call can no longer answer the same question two different
+    ways.
+
+    The enquiry used to be remembered only as a *side effect of the model
+    reaching for a tool too early*: a banking tool that failed
+    `NOT_AUTHENTICATED` recorded what had been asked on its way out. That works
+    when the model calls `get_account_balance` before verifying. It does not
+    work when the model does what its own instructions ask and calls
+    `get_authentication_status` first — a valid ordering that reaches no banking
+    tool at all, so nothing was ever held. Verification then finished on a turn
+    whose transcript is a spoken PIN, which classifies as NON_BANKING_REQUEST,
+    and the very lookup the caller rang about was refused `OUT_OF_SCOPE` with
+    the database never touched. Same caller, same PIN, same question, same
+    database — two different answers, decided by which tool the model happened
+    to reach for first.
+
+    So the enquiry is taken from the caller's own classified turn instead. The
+    caller said what they wanted; the server heard it, classified it in plain
+    Python, and now writes it down. Whether the model then calls a tool, calls a
+    different tool, or calls none at all cannot change it.
+
+    Nothing here relaxes the gate:
+
+    * It runs only while nobody is verified. `pending_request.remember` re-checks
+      that, so a verified caller can never accumulate a held enquiry.
+    * It records only a tool name and an account or loan type, both from a fixed
+      vocabulary. No identity, no PIN, nothing the caller said.
+    * The turn it is drawn from was itself in scope — a hostile or
+      cross-customer turn takes the branch above and clears the hold instead.
+    * The tool that eventually resumes still reads `session.customer_id` and
+      still passes every authorization guard.
+    """
+    if session.authenticated:
+        return
+
+    tool = TOOL_BY_INTENT.get(decision.intent)
+    if tool is None:
+        # The turn named no specific enquiry — a greeting, a bare id, a PIN, or
+        # a balance question with no account or loan named. Nothing to hold, and
+        # deliberately nothing cleared: the enquiry held from an earlier turn is
+        # what the authentication turns exist to get back to.
+        return
+
+    from app import pending_request
+
+    pending_request.remember(
+        session,
+        tool=tool,
+        account_type=decision.account_type,
+        loan_type=decision.loan_type,
+    )
 
 
 def record_turn(session: Session | None, transcript: str) -> ScopeDecision | None:

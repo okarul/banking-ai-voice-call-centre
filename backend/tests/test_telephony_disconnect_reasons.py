@@ -279,12 +279,23 @@ def live_call(client, captured, call_id: str):
 
 
 def settle(call_id: str) -> None:
-    """Wait for the route's `finally` to have run and the slot to come back."""
+    """Wait for the ending to be complete: released *and* written down.
+
+    Three things, because the ending is three things, and waiting for two of
+    them is what made this helper lie. Releasing the call happens strictly
+    before recording why it ended - so a test that waited only for the registry
+    and the capacity slot could read the row in the window between them and see
+    a call that was already over still sitting there `ACTIVE`, with no reason
+    and no `ended_at`. Every caller of this asserts on that reason next.
+    """
     assert until(lambda: phone_call_registry.get(call_id) is None), (
         "the call never left the registry"
     )
     assert until(lambda: voice_call_manager.used_capacity() == 0), (
         "the capacity slot was never returned"
+    )
+    assert until(lambda: row(call_id).ended_at is not None), (
+        "the ending was never recorded"
     )
 
 

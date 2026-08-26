@@ -42,11 +42,9 @@ from fastapi import (
 from pydantic import ValidationError
 
 from app.config import settings
-from app.observability import recorder
 from app.observability.events import AuditEvent, safe_event
 from app.telephony import service
 from app.telephony.bridge import phone_call_registry
-from app.telephony import reasons
 from app.telephony.channels import Channel
 from app.telephony.media import (
     PLAYBACK_DRAINED,
@@ -309,19 +307,9 @@ async def media_socket(websocket: WebSocket, provider_call_id: str) -> None:
     finally:
         # The caller has gone. Converge on the one cleanup path, which is
         # idempotent, so an end event arriving at the same moment is harmless.
-        await service.tear_down(provider_call_id, bridge.banking_session_id)
-        try:
-            # Only recorded if nothing else closed this call first — the update
-            # moves the row `WHERE ended_at IS NULL`. So a goodbye, a silence
-            # close or a failure keeps its own reason, and a socket closing is
-            # read as a caller hang-up only when it genuinely was one.
-            recorder.close_phone_call(
-                provider_call_id, reason=reasons.CALLER_HANGUP
-            )
-        except Exception as error:
-            # This runs in a `finally`. An observability failure here would
-            # replace whatever actually ended the call, and the call is already
-            # released either way.
-            logger.error(
-                "telephony call record not closed: %s", type(error).__name__
-            )
+        #
+        # Releasing the call and recording that it ended are one ending, not
+        # two, and this `finally` is frequently reached *because* this task is
+        # being cancelled. `end_media_call` runs both to completion regardless:
+        # a cancellation here stops the waiting, never the cleanup.
+        await service.end_media_call(provider_call_id, bridge.banking_session_id)

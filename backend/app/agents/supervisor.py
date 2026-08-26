@@ -28,6 +28,7 @@ from app.agents.intents import (
     DOMAIN_BY_INTENT,
     INTENT_BY_DOMAIN_ACTION,
     THANKS,
+    TOOL_BY_INTENT,
     Action,
     Classification,
     Domain,
@@ -45,16 +46,10 @@ from app.sessions import session_manager as default_manager
 
 AGENT_NAME = "supervisor"
 
-# Which tool answers which enquiry. Used to describe a held request in the same
-# vocabulary the voice path uses, so both resume the same way.
-TOOL_BY_INTENT = {
-    Intent.ACCOUNT_BALANCE: "get_account_balance",
-    Intent.ACCOUNT_DETAILS: "get_account_details",
-    Intent.RECENT_TRANSACTIONS: "get_recent_transactions",
-    Intent.LOAN_BALANCE: "get_loan_balance",
-    Intent.LOAN_DETAILS: "get_loan_details",
-    Intent.NEXT_INSTALMENT: "get_next_instalment",
-}
+# `TOOL_BY_INTENT` — which tool answers which enquiry — is imported from
+# `app.agents.intents` rather than restated here. The voice path holds an
+# unverified caller's enquiry by the same names, and two copies of that map is
+# how the two channels came to resume a held enquiry differently.
 
 PENDING_INTENT_KEY = "pending_intent"
 PENDING_ACTION_KEY = "pending_action"
