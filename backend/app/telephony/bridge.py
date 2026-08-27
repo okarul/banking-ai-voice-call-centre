@@ -390,9 +390,13 @@ class PhoneCallBridge:
         to retry from, and the call waits for an acknowledgement that cannot
         come.
         """
-        # The model has stopped producing this turn, so the sentence it was
-        # streaming is complete and may be written down.
-        self._flush_agent_turn()
+        # A backstop, not the signal. A message that told us it was completed
+        # has already been written; one that never carries a status - an older
+        # transport, a loopback in a test - is written here, because otherwise
+        # nothing would ever write it.
+        held = self._agent_turn
+        if held is not None and held.get("status") is None:
+            self._flush_agent_turn()
         await self.lifecycle.on_generation_ended()
         await self._close_if_authentication_is_over()
         await self._request_playback_boundary()
@@ -571,7 +575,12 @@ class PhoneCallBridge:
             if key in self._seen_history:
                 continue
             self._seen_history.add(key)
-            self._on_history_item(role, text, getattr(item, "item_id", None))
+            self._on_history_item(
+                role,
+                text,
+                getattr(item, "item_id", None),
+                getattr(item, "status", None),
+            )
 
     def _on_history(self, item) -> None:
         """Read each completed turn, and decide whether the call is ending.
@@ -592,10 +601,13 @@ class PhoneCallBridge:
         if not text:
             return
         self._on_history_item(
-            getattr(item, "role", None), text, getattr(item, "item_id", None)
+            getattr(item, "role", None),
+            text,
+            getattr(item, "item_id", None),
+            getattr(item, "status", None),
         )
 
-    def _note_agent_text(self, item_id, text: str) -> None:
+    def _note_agent_text(self, item_id, text: str, status=None) -> None:
         """Hold the newest text for the assistant turn being spoken.
 
         The model streams a sentence in growing pieces, and the snapshot
@@ -633,11 +645,23 @@ class PhoneCallBridge:
         if held is not None and held["item_id"] == item_id:
             if len(text) > len(held["text"]):
                 held["text"] = text
-            return
+            if status is not None:
+                held["status"] = status
+        else:
+            # A different turn. Whatever was being held is finished.
+            self._flush_agent_turn()
+            self._agent_turn = {
+                "item_id": item_id,
+                "text": text,
+                "status": status,
+            }
 
-        # A different turn. Whatever was being held is finished.
-        self._flush_agent_turn()
-        self._agent_turn = {"item_id": item_id, "text": text}
+        # The provider says this message is finished, so it will not grow
+        # again. This is the signal to write it - not the end of generation,
+        # which arrives while the transcript is still being filled in and left
+        # the live trace holding "Thank you for calling ABC".
+        if self._agent_turn["status"] == "completed":
+            self._flush_agent_turn()
 
     def _flush_agent_turn(self) -> None:
         """Write the held assistant turn, if there is one. Never twice."""
@@ -687,10 +711,10 @@ class PhoneCallBridge:
 
         self._schedule(record_agent_turn())
 
-    def _on_history_item(self, role, text: str, item_id=None) -> None:
+    def _on_history_item(self, role, text: str, item_id=None, status=None) -> None:
         """One completed turn, from whichever history event delivered it."""
         if role == "assistant":
-            self._note_agent_text(item_id, text)
+            self._note_agent_text(item_id, text, status)
         if role == "user":
             self._on_caller_text(text)
             return

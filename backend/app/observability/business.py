@@ -269,7 +269,9 @@ def record_identity(
 
 
 @_never_fails("record_turn_decision")
-def record_turn_decision(session, decision, transcript: str | None = None) -> None:
+def record_turn_decision(
+    session, decision, transcript: str | None = None, reserved: dict | None = None
+) -> None:
     """Persist what this turn was about, for whichever channel classified it.
 
     Hung off the scope ruling rather than off a tool call, because a turn has a
@@ -303,15 +305,23 @@ def record_turn_decision(session, decision, transcript: str | None = None) -> No
     held = pending_request.recall(session)
     # What the turn *was*, told apart from what the gate *ruled*. See
     # `trace.describe_turn`: the ruling is kept exactly as made.
-    described = trace.describe_turn(session, decision, transcript)
+    expected = reserved["expected"] if reserved else ...
+    described = trace.describe_turn(session, decision, transcript, expected)
     trace.record(
         session.session_id,
         trace.TraceEvent(
             kind=trace.KIND_TURN,
             speaker=trace.SPEAKER_CUSTOMER,
             turn=trace.open_turn(session),
+            # The session and the ruling travel with the words, so a credential
+            # the bank is expecting is replaced before anything is written -
+            # whatever language it was transcribed into.
             utterance=trace.utterance_for(
-                transcript, speaker=trace.SPEAKER_CUSTOMER
+                transcript,
+                speaker=trace.SPEAKER_CUSTOMER,
+                session=session,
+                decision=decision,
+                expected=expected,
             ),
             domain=described["domain"],
             intent=described["intent"],
@@ -325,4 +335,5 @@ def record_turn_decision(session, decision, transcript: str | None = None) -> No
             event_type=described["event_type"],
         ),
         session=session,
+        sequence=reserved["sequence"] if reserved else None,
     )

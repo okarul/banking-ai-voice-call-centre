@@ -1489,3 +1489,460 @@ def test_the_summary_reports_a_refusal_without_hiding_it(traced):
         assert summary["refusal_reasons"] == ["CROSS_CUSTOMER_REQUEST"]
     finally:
         call.close()
+
+
+# === Phase 6.12.3: a credential is what the bank is waiting for ============
+#
+# Live call `7d67837b-1c7f-1240-4790-eaa5afddeeef` passed on every banking
+# measure - DEMO001 verified, `get_account_balance` OK in 11 ms, SGD 12,450.75
+# spoken correctly, CALLER_GOODBYE - and its trace contained the caller's PIN
+# in clear:
+#
+#     customer utterance: "فور ایٹ ٹو ون"      (four eight two one, Urdu script)
+#     submit_pin        : OK, on the same turn
+#
+# The authentication path understood it. `looks_like_pin` did not: it knows
+# Latin digits and English number words, saw neither, and `redact_transcript`
+# returned the line verbatim. No amount of extra number words fixes that - a
+# PIN can arrive in any language, any script, mis-transcribed, or as digits.
+#
+# The only thing that reliably identifies a credential is that the bank asked
+# for one and has not had it yet. That is what these tests pin.
+
+PIN_UTTERANCES = {
+    "urdu_script": "فور ایٹ ٹو ون",
+    "hindi_script": "चार आठ दो एक",
+    "tamil_script": "நான்கு எட்டு இரண்டு ஒன்று",
+    "arabic_digits": "٤٨٢١",
+    "latin_digits": "4821",
+    "spoken_english": "four eight two one",
+    "punctuated": "4-8-2-1.",
+    "garbled_asr": "for ate to won",
+    "unexpected_language": "vier acht zwei eins",
+    "spaced_digits": "4 8 2 1",
+}
+
+
+@pytest.mark.trace
+@pytest.mark.parametrize("shape", sorted(PIN_UTTERANCES))
+def test_a_pin_is_redacted_whatever_language_it_arrives_in(traced, shape, caplog):
+    """The fail-before-fix case, in ten shapes.
+
+    Before the fix only the Latin ones were caught. The live call arrived in
+    the first of these and was stored word for word.
+    """
+    spoken = PIN_UTTERANCES[shape]
+
+    call = Call()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            call.says(ASK_SAVINGS)
+            call.says(SPOKEN_ID)
+            call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+            # The bank is now waiting for a PIN. Whatever arrives is a PIN.
+            call.says(spoken)
+
+            turn = call.events(trace.KIND_TURN)[-1]
+            assert turn["utterance"] == "[PIN REDACTED]", (
+                f"{shape} was stored as {turn['utterance']!r}"
+            )
+            assert turn["intent"] == trace.INTENT_PIN_INPUT
+            assert turn["event_type"] == trace.EVENT_AUTH_INPUT
+            assert turn["domain"] == trace.DOMAIN_AUTHENTICATION
+
+        # Nowhere at all: not the rows, not the replay, not the logs.
+        assert spoken not in stored_blob(), f"{shape} reached the trace table"
+        assert spoken not in json.dumps(call.replay(), ensure_ascii=False), (
+            f"{shape} reached the API"
+        )
+        logged = " ".join(record.getMessage() for record in caplog.records)
+        assert spoken not in logged, f"{shape} reached the logs"
+
+        with session_scope() as db:
+            events = json.dumps(
+                [(e.tool_name, e.status) for e in db.scalars(select(AgentToolEvent))]
+            )
+        assert spoken not in events
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_the_credential_rule_reads_state_not_words(traced):
+    """Stated directly, because it is the whole of the fix."""
+    from app.observability import trace as trace_module
+
+    call = Call()
+    try:
+        session = call.session
+        # Nobody has identified themselves: no credential is expected.
+        assert trace_module.expected_credential(session, None) is None
+
+        call.says(SPOKEN_ID)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        # Now one is, and it stays expected until the PIN is accepted.
+        assert (
+            trace_module.expected_credential(call.session, None)
+            == trace_module.CREDENTIAL_PIN
+        )
+
+        call.says(SPOKEN_PIN)
+        call.tool("submit_pin", spoken_pin=HEARD_PIN)
+        assert call.session.authenticated is True
+        assert trace_module.expected_credential(call.session, None) is None
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_a_banking_question_asked_mid_verification_is_not_swallowed(traced):
+    """Over-redaction has a limit: a question the caller plainly asked.
+
+    Four digits cannot become a balance enquiry - a supported intent needs an
+    action word and a domain - so nothing credential-shaped leaves by this
+    door.
+    """
+    call = Call()
+    try:
+        call.says(SPOKEN_ID)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        call.says(ASK_SAVINGS)
+
+        turn = call.events(trace.KIND_TURN)[-1]
+        assert turn["utterance"] == ASK_SAVINGS
+        assert turn["intent"] == "ACCOUNT_BALANCE"
+        assert turn["event_type"] == trace.EVENT_CALLER_TURN
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_a_customer_id_turn_is_masked_from_state_too(traced):
+    """The bank is holding an enquiry it cannot answer: this turn is the id."""
+    call = Call()
+    try:
+        call.says(ASK_SAVINGS)
+        # The bank has asked who is calling. Whatever comes back is the answer,
+        # in whatever script it was transcribed into.
+        call.says("ڈیمو زیرو زیرو ون")
+
+        turn = call.events(trace.KIND_TURN)[-1]
+        assert turn["utterance"] == "[Customer ID provided]"
+        assert turn["intent"] == trace.INTENT_CUSTOMER_ID_INPUT
+        assert turn["event_type"] == trace.EVENT_AUTH_INPUT
+        assert turn["domain"] == trace.DOMAIN_AUTHENTICATION
+    finally:
+        call.close()
+
+
+# --- E/F: the caller comes before the tool they caused ----------------------
+
+
+@pytest.mark.trace
+def test_an_auth_turn_is_recorded_before_the_tool_it_causes(traced):
+    """The live trace read backwards: tool, auth, then the words that caused them.
+
+    A caller turn is ruled synchronously in the event pump, before the model can
+    reach for anything; its row is written later, on a worker thread. The replay
+    position is now taken when the turn is ruled, so the order is the order it
+    happened in.
+    """
+    call = Call()
+    try:
+        call.says(ASK_SAVINGS)
+        call.says(SPOKEN_ID)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        call.says(SPOKEN_PIN)
+        call.tool("submit_pin", spoken_pin=HEARD_PIN)
+        call.ends()
+
+        story = [
+            (e["kind"], e.get("intent") or e.get("tool_name") or e.get("auth_status"))
+            for e in call.replay()["events"]
+        ]
+
+        def position(kind, name):
+            return next(
+                i for i, (k, n) in enumerate(story) if k == kind and n == name
+            )
+
+        # customer id spoken -> submit_customer_id -> auth transition
+        assert (
+            position(trace.KIND_TURN, trace.INTENT_CUSTOMER_ID_INPUT)
+            < position(trace.KIND_TOOL, "submit_customer_id")
+        ), story
+        assert (
+            position(trace.KIND_TOOL, "submit_customer_id")
+            < position(trace.KIND_AUTH, "PENDING")
+        ), story
+
+        # PIN spoken -> submit_pin -> VERIFIED
+        assert (
+            position(trace.KIND_TURN, trace.INTENT_PIN_INPUT)
+            < position(trace.KIND_TOOL, "submit_pin")
+        ), story
+        assert (
+            position(trace.KIND_TOOL, "submit_pin")
+            < position(trace.KIND_AUTH, "VERIFIED")
+        ), story
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_replay_order_is_still_strictly_increasing(traced):
+    """Reserving a position early must not collide with anything written later."""
+    call = Call()
+    try:
+        call.says(ASK_SAVINGS)
+        call.verify()
+        call.tool("get_account_balance", account_type="Savings")
+        call.says("Goodbye.")
+        call.ends()
+
+        sequences = [e["sequence"] for e in call.replay()["events"]]
+        assert sequences == sorted(sequences)
+        assert len(sequences) == len(set(sequences)), "two events share a position"
+    finally:
+        call.close()
+
+
+# --- G/H/I: one completed sentence per response -----------------------------
+
+
+@pytest.mark.trace
+def test_a_completed_message_is_written_as_soon_as_it_is_complete(bridge_call):
+    """The provider says when a message is finished. That is the signal.
+
+    Generation end is not: it arrives while the transcript is still being
+    filled in, which is how the live trace ended up holding
+    "Thank you for calling ABC".
+    """
+    bridge, call_id, _manager, _banking = bridge_call
+    final = "Let's look at that together and I'll share what's available."
+
+    drive_with_status(
+        bridge,
+        [
+            ("Let's look at that together", "in_progress"),
+            (final, "completed"),
+        ],
+    )
+
+    written = agent_events(call_id)
+    assert len(written) == 1, f"one response became {len(written)} rows"
+    assert written[0]["utterance"] == final
+
+
+@pytest.mark.trace
+def test_the_closing_sentence_is_never_truncated(bridge_call):
+    """The live goodbye was stored as "Thank you for calling ABC"."""
+    bridge, call_id, _manager, _banking = bridge_call
+    final = "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodbye."
+
+    drive_with_status(
+        bridge,
+        [
+            ("Thank you for calling ABC", "in_progress"),
+            ("Thank you for calling ABC Demo Bank. Have a", "in_progress"),
+            (final, "completed"),
+        ],
+    )
+
+    written = agent_events(call_id)
+    assert len(written) == 1
+    assert written[0]["utterance"] == final
+
+
+@pytest.mark.trace
+def test_generation_end_does_not_write_an_unfinished_message(bridge_call):
+    """The old flush point, proved harmless: an in-progress message waits."""
+    bridge, call_id, _manager, _banking = bridge_call
+
+    async def scenario():
+        bridge._on_history_item(
+            "assistant", "Thanks, I'll confirm that and then share", "i1", "in_progress"
+        )
+        # Generation end arrives while the transcript is still filling in.
+        await bridge._generation_finished()
+        assert agent_events(call_id) == [], "an unfinished message was written"
+
+        bridge._on_history_item(
+            "assistant",
+            "Thanks, I'll confirm that and then share your balance.",
+            "i1",
+            "completed",
+        )
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = agent_events(call_id)
+    assert len(written) == 1
+    assert written[0]["utterance"].endswith("your balance.")
+
+
+@pytest.mark.trace
+def test_a_message_that_never_reports_a_status_is_still_written(bridge_call):
+    """A transport that says nothing must not lose the turn entirely."""
+    bridge, call_id, _manager, _banking = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "A complete sentence.", "i1", None)
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = agent_events(call_id)
+    assert len(written) == 1
+    assert written[0]["utterance"] == "A complete sentence."
+
+
+@pytest.mark.trace
+def test_two_completed_responses_are_two_rows_and_no_more(bridge_call):
+    bridge, call_id, _manager, _banking = bridge_call
+
+    drive_with_status(
+        bridge,
+        [
+            ("First answer", "in_progress"),
+            ("First answer, complete.", "completed"),
+        ],
+    )
+    drive_with_status(
+        bridge,
+        [
+            ("Second answer", "in_progress"),
+            ("Second answer, complete.", "completed"),
+        ],
+        item_id="i2",
+    )
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == ["First answer, complete.", "Second answer, complete."]
+
+
+def drive_with_status(bridge, steps, item_id: str = "i1") -> None:
+    """Feed assistant snapshots with their completion status, in one loop."""
+
+    async def scenario():
+        for text, status in steps:
+            bridge._on_history_item("assistant", text, item_id, status)
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.trace
+def test_the_turn_keeps_its_place_when_the_tool_runs_first(traced):
+    """The live ordering defect, reproduced the way it actually happens.
+
+    The pump rules a caller turn synchronously and then hands the *write* to a
+    worker thread. The model, meanwhile, is already calling the tool that turn
+    asked for. So the write can land after the tool - which is why the live
+    replay read
+
+        submit_customer_id  TOOL
+        AUTH
+        CUSTOMER_ID_INPUT   TURN
+
+    `Call.says` writes synchronously and cannot show this; here the two are
+    deliberately interleaved the way the event loop interleaves them.
+    """
+    call = Call()
+    try:
+        call.says(ASK_SAVINGS)
+
+        # The pump rules the turn...
+        ruled = call.pump._feed_gate(
+            call.session_id,
+            _Event(
+                "raw_model_event",
+                data=_Event(
+                    "input_audio_transcription_completed",
+                    transcript=SPOKEN_ID,
+                    item_id="id-turn",
+                ),
+            ),
+        )
+        assert ruled is not None
+
+        # ...the model calls the tool before the write reaches the database...
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+
+        # ...and only then is the turn written down.
+        business.record_turn_decision(*ruled)
+
+        story = [
+            (e["kind"], e.get("intent") or e.get("tool_name"))
+            for e in call.replay()["events"]
+        ]
+        turn_at = next(
+            i
+            for i, (k, n) in enumerate(story)
+            if k == trace.KIND_TURN and n == trace.INTENT_CUSTOMER_ID_INPUT
+        )
+        tool_at = next(
+            i
+            for i, (k, n) in enumerate(story)
+            if k == trace.KIND_TOOL and n == "submit_customer_id"
+        )
+        assert turn_at < tool_at, (
+            f"the caller's words were recorded after the tool they caused: {story}"
+        )
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_a_pin_written_down_after_it_was_accepted_is_still_redacted(traced):
+    """The subtlest form of the live leak, and the one a fix can reintroduce.
+
+    The pump rules the PIN turn, the model calls `submit_pin`, the PIN is
+    accepted, the session becomes authenticated - and only then does the write
+    reach the database. A redaction rule that asks "is a credential expected?"
+    at *write* time answers no, because the PIN has just been accepted, and
+    stores the caller's PIN in clear. The expectation is frozen when the turn
+    is ruled, which is the only moment it is true.
+    """
+    spoken = "فور ایٹ ٹو ون"
+
+    call = Call()
+    try:
+        call.says(ASK_SAVINGS)
+        call.says(SPOKEN_ID)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+
+        # The pump rules the PIN turn...
+        ruled = call.pump._feed_gate(
+            call.session_id,
+            _Event(
+                "raw_model_event",
+                data=_Event(
+                    "input_audio_transcription_completed",
+                    transcript=spoken,
+                    item_id="pin-turn",
+                ),
+            ),
+        )
+        assert ruled is not None
+
+        # ...the PIN is accepted, and the caller becomes verified...
+        assert call.tool("submit_pin", spoken_pin=HEARD_PIN)["success"] is True
+        assert call.session.authenticated is True
+
+        # ...and only now is the turn written down.
+        business.record_turn_decision(*ruled)
+
+        pin_turns = [
+            e
+            for e in call.events(trace.KIND_TURN)
+            if e.get("intent") == trace.INTENT_PIN_INPUT
+        ]
+        assert pin_turns, "the PIN turn was not recorded as one"
+        assert pin_turns[-1]["utterance"] == "[PIN REDACTED]"
+        assert spoken not in stored_blob(), "the PIN was stored in clear"
+        assert spoken not in json.dumps(call.replay(), ensure_ascii=False)
+    finally:
+        call.close()

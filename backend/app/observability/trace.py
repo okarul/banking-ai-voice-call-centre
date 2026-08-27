@@ -42,7 +42,11 @@ from sqlalchemy.exc import IntegrityError
 from app.config import settings
 from app.database.connection import session_scope
 from app.database.models import AgentSession, CallTraceEvent
-from app.observability.redaction import redact_transcript
+from app.observability.redaction import (
+    CUSTOMER_ID_PLACEHOLDER,
+    PIN_PLACEHOLDER,
+    redact_transcript,
+)
 from app.redaction import redact
 
 logger = logging.getLogger("app.observability.trace")
@@ -187,17 +191,104 @@ def sanitize_arguments(arguments) -> str | None:
     return rendered[:_MAX_ARGUMENTS]
 
 
-def utterance_for(text: str | None, *, speaker: str) -> str | None:
+# What the bank is waiting to hear, when it is waiting for a credential.
+CREDENTIAL_PIN = "PIN"
+CREDENTIAL_CUSTOMER_ID = "CUSTOMER_ID"
+
+
+def expected_credential(session, decision=None) -> str | None:
+    """The credential this caller turn is answering, from session state.
+
+    **This is the rule that keeps a PIN out of the database, and it does not
+    read the words.** A live call transcribed "four eight two one" into Urdu
+    script; `looks_like_pin` knows Latin digits and English number words, saw
+    neither, and the trace stored the caller's PIN verbatim. The authentication
+    path had understood it perfectly well - `submit_pin` succeeded on the same
+    turn - so the bank knew what had just been said while the redaction layer
+    did not.
+
+    Nothing about that is fixable by adding more number words. A PIN can arrive
+    in any language, any script, any spelling, mis-transcribed, or as digits,
+    and the only thing that reliably identifies it is that **the bank asked for
+    one and has not had it yet**. So that is what is asked here.
+
+    `candidate_customer_id` is set by a successful `submit_customer_id` and
+    cleared by nothing until the call ends, so between that and verification
+    the bank is waiting for a PIN. A caller who says something else in that
+    window is over-redacted, which is the right direction to be wrong in.
+    """
+    if session is None or getattr(session, "authenticated", False):
+        return None
+
+    category = getattr(getattr(decision, "category", None), "value", None)
+
+    if getattr(session, "candidate_customer_id", None):
+        # Unless the caller plainly asked the bank something instead. Four
+        # digits cannot become a balance enquiry: a supported intent needs an
+        # action word and a domain, so nothing credential-shaped can leave by
+        # this door - while a caller who says "actually, my savings balance?"
+        # mid-verification still reads as the question they asked.
+        return None if _is_banking_enquiry(category, decision) else CREDENTIAL_PIN
+    if category == "AUTHENTICATION":
+        return CREDENTIAL_CUSTOMER_ID
+
+    # The bank has asked who is calling - it is holding an enquiry it cannot
+    # answer yet - and this turn is not itself an enquiry. It is the answer.
+    if category in (None, "NON_BANKING_REQUEST", "SOCIAL") and _enquiry_held(session):
+        return CREDENTIAL_CUSTOMER_ID
+
+    return None
+
+
+_OWN_ENQUIRY_CATEGORIES = frozenset(
+    {"OWN_ACCOUNT_ENQUIRY", "OWN_TRANSACTION_ENQUIRY", "OWN_LOAN_ENQUIRY"}
+)
+
+
+def _is_banking_enquiry(category, decision) -> bool:
+    """Whether the caller asked the bank a supported question on this turn."""
+    if category not in _OWN_ENQUIRY_CATEGORIES:
+        return False
+    intent = getattr(getattr(decision, "intent", None), "value", None)
+    return bool(intent) and intent != "UNKNOWN"
+
+
+def _enquiry_held(session) -> bool:
+    from app import pending_request
+
+    return pending_request.recall(session) is not None
+
+
+def utterance_for(
+    text: str | None, *, speaker: str, session=None, decision=None, expected=...
+) -> str | None:
     """The recordable form of something that was said, or None.
 
     None unless an operator has turned utterances on, and never the raw words
-    even then: the same redaction the browser's transcript goes through, so a
-    PIN turn is a placeholder rather than a partially-masked credential.
+    even then.
+
+    A credential the bank is *expecting* is replaced whole, before anything is
+    written, on the strength of the authentication state rather than the shape
+    of the words - see `expected_credential`. Everything else goes through the
+    same redaction the browser's transcript uses.
     """
     if not settings.telephony_trace_utterances:
         return None
     if not text or not text.strip():
         return None
+
+    if speaker != SPEAKER_AGENT:
+        # A frozen answer from the moment the turn was ruled wins over asking
+        # again now: by now the credential may have been accepted, and the
+        # question would answer "none expected" about the very words that were
+        # the credential. See `reserve_turn`.
+        if expected is ...:
+            expected = expected_credential(session, decision)
+        if expected == CREDENTIAL_PIN:
+            return PIN_PLACEHOLDER
+        if expected == CREDENTIAL_CUSTOMER_ID:
+            return CUSTOMER_ID_PLACEHOLDER
+
     role = SPEAKER_AGENT if speaker == SPEAKER_AGENT else SPEAKER_CUSTOMER
     return redact_transcript(text, role=role)[:2000]
 
@@ -218,7 +309,7 @@ INTENT_CUSTOMER_ID_INPUT = "CUSTOMER_ID_INPUT"
 INTENT_PIN_INPUT = "PIN_INPUT"
 
 
-def describe_turn(session, decision, transcript: str | None) -> dict:
+def describe_turn(session, decision, transcript: str | None, expected=...) -> dict:
     """What this caller turn *was*, for somebody reading the call back.
 
     The scope gate answers one question — may this turn reach banking data —
@@ -242,18 +333,21 @@ def describe_turn(session, decision, transcript: str | None) -> dict:
     intent = getattr(getattr(decision, "intent", None), "value", None)
     domain = getattr(getattr(decision, "domain", None), "value", None)
 
+    if expected is ...:
+        expected = expected_credential(session, decision)
+
     # 1. The PIN, which the bank asked for a moment ago. Recognised from
-    #    session state first — the bank knows it is waiting for one — and
-    #    confirmed against the shape of the words, which are not stored.
-    if _awaiting_pin(session) and _looks_like_pin(transcript):
+    #    session state alone: the words may be in any script, and a live call
+    #    proved they may be in one nothing here can read.
+    if expected == CREDENTIAL_PIN:
         return {
             "intent": INTENT_PIN_INPUT,
             "domain": DOMAIN_AUTHENTICATION,
             "event_type": EVENT_AUTH_INPUT,
         }
 
-    # 2. The customer id. The gate already calls this AUTHENTICATION.
-    if category == "AUTHENTICATION":
+    # 2. The customer id, by the same state rule.
+    if expected == CREDENTIAL_CUSTOMER_ID:
         return {
             "intent": INTENT_CUSTOMER_ID_INPUT,
             "domain": DOMAIN_AUTHENTICATION,
@@ -384,6 +478,57 @@ def _sequence_after(db, session_pk: int) -> int:
     return int(highest or 0) + 1
 
 
+def reserve_turn(session, decision) -> dict | None:
+    """Freeze what this turn *is*, at the moment it is ruled.
+
+    Two things are captured, and both have to be, because the write happens
+    later and the call moves on in between.
+
+    **The credential the bank was expecting.** This is the one that matters.
+    A caller says their PIN; the pump rules the turn; the model calls
+    `submit_pin`; it succeeds; the session becomes authenticated - and only
+    then does the write reach the database. Asking "is a credential expected?"
+    at that point answers *no*, because the PIN has just been accepted, and the
+    words would be stored in clear. Asked here, while the bank is still waiting
+    for it, the answer is yes. The same applies one step earlier, where
+    `submit_customer_id` sets the candidate and turns the id turn into a PIN
+    turn if the question is asked too late.
+
+    **The replay position**, so the caller's words keep their place ahead of
+    the tool they caused. The live trace read `submit_customer_id`, then the
+    auth transition, then the words - backwards.
+
+    Nothing is delayed by any of this: it is a dictionary, built synchronously,
+    and the write still happens off the event loop.
+    """
+    if not settings.trace_enabled:
+        return None
+    return {
+        "sequence": _next_sequence(session),
+        "expected": expected_credential(session, decision),
+    }
+
+
+def reserve_sequence(session) -> int | None:
+    """Take this turn's replay position at the moment it is *ruled*.
+
+    A caller turn is classified synchronously, inside the realtime event pump,
+    before the model can reach for a tool. Its trace row is written later, on a
+    worker thread - and the position used to be taken there, so a replay showed
+
+        submit_customer_id  TOOL
+        AUTH
+        CUSTOMER_ID_INPUT   TURN
+
+    the caller's words arriving after the tool they caused. Reserving the
+    position here puts the turn back where it happened. Nothing is delayed: the
+    reservation is an integer, and the write still happens off the loop.
+    """
+    if not settings.trace_enabled:
+        return None
+    return _next_sequence(session)
+
+
 def open_turn(session) -> int:
     """Count one more caller turn on this call, and return its number."""
     if session is None:
@@ -404,7 +549,13 @@ def current_turn(session) -> int | None:
 
 
 @_never_fails("record")
-def record(banking_session_id: str, event: TraceEvent, *, session=None) -> None:
+def record(
+    banking_session_id: str,
+    event: TraceEvent,
+    *,
+    session=None,
+    sequence: int | None = None,
+) -> None:
     """Write one trace event. Blocking; call it off the audio event loop.
 
     The row is anchored to the call's `agent_sessions` record, so a trace can
@@ -415,7 +566,10 @@ def record(banking_session_id: str, event: TraceEvent, *, session=None) -> None:
         # Known to have no call row. Costs nothing to skip.
         return
 
-    sequence = _next_sequence(session)
+    # A position reserved when the turn was ruled keeps the turn ahead of the
+    # tool it caused; anything else is numbered as it is written.
+    if sequence is None:
+        sequence = _next_sequence(session)
     now = _now()
 
     with session_scope() as db:

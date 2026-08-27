@@ -689,6 +689,94 @@ count and how the call ended. It claims nothing the events do not show.
 
 ---
 
+## Q-900 - a credential is what the bank is waiting for (Phase 6.12.3)
+
+### The live call
+
+`7d67837b-1c7f-1240-4790-eaa5afddeeef`
+
+| Aspect | Status |
+|---|---|
+| **Banking** | **LIVE FUNCTIONAL PASS** - DEMO001 verified, `get_account_balance` OK in 11 ms, SGD 12,450.75 spoken correctly, `CALLER_GOODBYE`, no `TURN_NOT_CLASSIFIED` |
+| **Trace normalization** | **LIVE FAILED** |
+
+The banking pass stands. The trace did not.
+
+Trace failures observed:
+
+* the caller's **PIN was persisted in clear**
+* the PIN turn was labelled `SOCIAL`
+* auth events were ordered backwards - tool, transition, then the words
+* assistant partials were still duplicated
+* the closing sentence was truncated to "Thank you for calling ABC"
+
+### D-8 - the PIN was stored because redaction read the words
+
+The trace stored:
+
+```
+customer utterance: "فور ایٹ ٹو ون"      (four eight two one, Urdu script)
+submit_pin        : OK, on the same turn
+```
+
+The authentication path understood it perfectly. `looks_like_pin` did not: it
+knows Latin digits and English number words, saw neither, and
+`redact_transcript` returned the line verbatim. The bank knew what had just
+been said; the redaction layer did not.
+
+**No list of number words fixes this.** A PIN can arrive in any language, any
+script, mis-transcribed, or as digits. The only thing that reliably identifies
+one is that *the bank asked for it and has not had it yet*, so that is what
+`trace.expected_credential` asks. `candidate_customer_id` is set by a
+successful `submit_customer_id` and the caller is not yet authenticated: that
+window is exactly "waiting for a PIN", and every utterance in it is replaced
+whole. A caller who says something else there is over-redacted, which is the
+right direction to be wrong in - with one exception, a turn the classifier
+recognises as a supported banking enquiry, because four digits cannot become a
+balance question and a caller who asks one mid-verification should still be
+readable.
+
+**The same defect had a second form, and a naive fix reintroduces it.** The
+pump rules the turn, the model calls `submit_pin`, the PIN is accepted, and
+only *then* does the write reach the database. Asking "is a credential
+expected?" at write time answers **no** - the PIN has just been accepted - and
+the words go in clear. `trace.reserve_turn` freezes the answer at the moment
+the turn is ruled, which is the only moment it is true. That is also what fixes
+the ordering: the replay position is reserved there too, so the caller's words
+keep their place ahead of the tool they caused.
+
+### D-9 - generation end is not a finished sentence
+
+Phase 6.12.2 flushed the assistant turn when the model stopped generating. The
+transcript is still being filled in at that point, so partials survived and the
+goodbye was cut to "Thank you for calling ABC".
+
+The provider already says when a message is finished: the SDK carries
+`RealtimeMessageItem.status`, set to `completed` from
+`response.output_item.done`. The trace now writes on that, with generation end
+demoted to a backstop for a transport that never reports a status.
+
+The raw gate fields (`scope_category`, `scope_allowed`) are unchanged and still
+record the original ruling.
+
+| ID | Scenario | Det. | Live | Test | Crit. |
+|---|---|---|---|---|---|
+| CR-001 | A PIN is redacted in ten scripts and spellings | PROTECTED | PENDING | `test_a_pin_is_redacted_whatever_language_it_arrives_in` | HIGH |
+| CR-002 | The credential rule reads state, not words | PROTECTED | PENDING | `test_the_credential_rule_reads_state_not_words` | HIGH |
+| CR-003 | A PIN written down after acceptance is still redacted | PROTECTED | PENDING | `test_a_pin_written_down_after_it_was_accepted_is_still_redacted` | HIGH |
+| CR-004 | A banking question mid-verification is not swallowed | PROTECTED | PENDING | `test_a_banking_question_asked_mid_verification_is_not_swallowed` | MED |
+| CR-005 | A customer id turn is masked from state too | PROTECTED | PENDING | `test_a_customer_id_turn_is_masked_from_state_too` | MED |
+| CR-006 | The turn keeps its place when the tool runs first | PROTECTED | PENDING | `test_the_turn_keeps_its_place_when_the_tool_runs_first` | HIGH |
+| CR-007 | Auth turn, then tool, then transition | PROTECTED | PENDING | `test_an_auth_turn_is_recorded_before_the_tool_it_causes` | HIGH |
+| CR-008 | Replay order stays strictly increasing | PROTECTED | PENDING | `test_replay_order_is_still_strictly_increasing` | MED |
+| CR-009 | A completed message is written when complete | PROTECTED | PENDING | `test_a_completed_message_is_written_as_soon_as_it_is_complete` | HIGH |
+| CR-010 | The closing sentence is never truncated | PROTECTED | PENDING | `test_the_closing_sentence_is_never_truncated` | HIGH |
+| CR-011 | Generation end never writes an unfinished message | PROTECTED | PENDING | `test_generation_end_does_not_write_an_unfinished_message` | HIGH |
+| CR-012 | A message with no status is still written | PROTECTED | PENDING | `test_a_message_that_never_reports_a_status_is_still_written` | MED |
+| CR-013 | Two completed responses are two rows | PROTECTED | PENDING | `test_two_completed_responses_are_two_rows_and_no_more` | MED |
+
+---
+
 ## Open defects
 
 | ID | Defect | Evidence | Status |
@@ -700,6 +788,8 @@ count and how the call ended. It claims nothing the events do not show.
 | **D-5** | A caller turn that never transcribed left the scope gate open for the rest of the call, so a verified DEMO001 with a held Savings enquiry was refused `TURN_NOT_CLASSIFIED` after the full 4.0 s wait. The gate was opened by a VAD onset and closed only by a transcript with words in it - not the same guarantee. | live call `3860a81f-1bc5-1240-4790-eaa5afddeeef` (FAILED twice, ~4 s each); reproduced offline at 4061 ms; fixed by `turn_gate.resumes_held_enquiry` and `turn_gate.record_unintelligible_turn`; guarded by TN-001 to TN-017 | **CLOSED deterministically - PENDING live re-proof** |
 | **D-6** | Production startup never invoked the canonical additive schema initialiser, so a release that declared a new table shipped code querying a database that had never been told it existed. `call_trace_events` was absent after deploying `6a1d1af` and trace replay answered HTTP 500. Readiness reported the process ready throughout. | live: `UndefinedTable: relation "call_trace_events" does not exist`; fixed by `seed.ensure_schema()` in the lifespan plus `_add_declared_indexes`; readiness now verifies declared tables; guarded by SS-001 to SS-013 | **CLOSED deterministically - PENDING live re-proof** |
 | **D-7** | The trace did not read like the call: a streamed reply was stored as three growing rows, PIN and customer-id turns were labelled `NON_BANKING_REQUEST`, and multi-phrase goodbyes landed in a banking refusal category. Presentation only - the banking result on `62cdd16f-...` was correct throughout. | fixed by `bridge._note_agent_text` / `_flush_agent_turn` and `trace.describe_turn`; the gate's own ruling is still recorded; guarded by TN-101 to TN-114 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-8** | The caller's PIN was persisted in clear. Transcribed into Urdu script, it matched no number-word pattern, so `redact_transcript` returned it verbatim - while `submit_pin` succeeded on the same turn. **HIGH privacy defect.** | live `7d67837b-...`; fixed by `trace.expected_credential` (state, not words) and `trace.reserve_turn` (frozen at ruling time, before the PIN is accepted); guarded by CR-001 to CR-008 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-9** | Assistant partials were still duplicated and the closing sentence truncated to "Thank you for calling ABC": generation end is not a finished sentence. | live `7d67837b-...`; fixed by writing on the provider's own `RealtimeMessageItem.status == completed`; guarded by CR-009 to CR-013 | **CLOSED deterministically - PENDING live re-proof** |
 
 ## Open decision
 

@@ -668,7 +668,13 @@ class RealtimeManager:
         # The words travel with the ruling, for the trace. Whether they are
         # written down at all is `app.observability.trace`'s decision, not
         # this layer's - it only stops them being unavailable.
-        return session, decision, text
+        #
+        # The replay position is taken *now*, while this turn is being ruled
+        # and before the model can call anything, so the caller's words keep
+        # their place ahead of the tool they cause.
+        from app.observability import trace
+
+        return session, decision, text, trace.reserve_turn(session, decision)
 
     async def _shutdown(self, connection: RealtimeConnection) -> None:
         """Release provider resources for one call, tolerating failures."""
