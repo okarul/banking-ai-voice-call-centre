@@ -593,6 +593,102 @@ rather than names.
 
 ---
 
+## Q-800 - the first live functional pass, and what the trace read like
+
+### LIVE FUNCTIONAL PASS
+
+| Field | Observed |
+|---|---|
+| `provider_call_id` | `62cdd16f-1c66-1240-4790-eaa5afddeeef` |
+| authentication | **VERIFIED**, DEMO001 |
+| `get_account_balance` | **OK**, 11 ms |
+| spoken balance | **$12,450.75** - confirmed correct against the seeded value |
+| ending | **CALLER_GOODBYE** |
+| trace replay | **operational** |
+| `TURN_NOT_CLASSIFIED` | none |
+
+This is the first live call to exercise the whole chain end to end after
+Phase 6.11 (ordering), 6.11.1 (timing), 6.12 (tracing) and 6.12.1 (schema).
+
+**The banking result is a pass and stays a pass.** Everything below is about
+how the call *reads afterwards*. None of it touched a banking tool, the
+authentication logic, the prompts, the model, the session semantics, or the
+media path - and the qualification proves it.
+
+Live status for the balance flow therefore moves:
+
+| Baseline | Live outcome |
+|---|---|
+| `818343d` | PROVEN |
+| `67c3c71` | FAILED - `OUT_OF_SCOPE`, 0 ms |
+| `ac2343f` | LIVE INTERMITTENT - `TURN_NOT_CLASSIFIED`, ~4 s |
+| `6a1d1af` | trace replay HTTP 500 - table absent (D-6) |
+| `741dc17` + this | **LIVE FUNCTIONAL PASS** - balance answered correctly, trace replay operational |
+
+### D-7 - the trace did not read like the call
+
+Three presentation defects, none of them banking:
+
+* **One sentence, three rows.** The model streams a reply in growing pieces,
+  and `_on_history_snapshot` is keyed on the *text* so that a transcript filled
+  in later counts as new - which it must, or a goodbye would never be
+  recognised. The trace inherited that and stored "Let me check", then "Let me
+  check that for your", then the finished sentence. Fixed by holding the turn
+  being spoken and writing it once, complete, when the model stops generating
+  (`bridge._note_agent_text` / `_flush_agent_turn`).
+* **Credentials read as refusals.** The four digits a caller reads out when the
+  bank asks for a PIN are ruled `NON_BANKING_REQUEST`. That is true - a PIN is
+  not a banking enquiry - and it reads like a refusal of something nobody
+  asked for.
+* **Goodbyes read as banking refusals.** "No, that is all, thank you" is more
+  than one courtesy phrase, so `_is_social` misses it and it lands in a
+  refusal category.
+
+The last two are fixed by *describing* the turn as well as ruling it
+(`trace.describe_turn`). The gate's own answer is still recorded in
+`scope_category` and `scope_allowed`, untouched - Phase 6.11 was diagnosed by
+reading exactly those two fields, and a trace that hid them would have hidden
+the defect. Alongside them the trace now says what the turn actually was:
+`auth_input` / `CUSTOMER_ID_INPUT`, `auth_input` / `PIN_INPUT`, `closing` /
+`END_CALL`, `social` / `GREETING` or `THANKS`.
+
+**`classify_scope` is not changed.** The gate decides what it always decided;
+only the description alongside it is new.
+
+### The session-summary decision
+
+`agent_sessions.current_domain` and `last_intent` show `GENERAL/SCOPE` and a
+refusal category after a successful call, because they are deliberately the
+**last turn** and the last turn is the goodbye. That is intended: the mapping's
+own docstring says an operator "should see that a turn was turned away, not
+that a loan was discussed", and `test_dashboard.py` pins the exact values.
+
+**Kept, and documented.** Rewriting proven session state so a dashboard reads
+tidier would falsify a record. The outcome is instead **derived from the
+trace** - `trace._summarise`, returned as `summary` on the replay - which
+reports whether the caller was verified, how many banking enquiries were
+answered and refused, which operations succeeded, any refusal reasons, the turn
+count and how the call ended. It claims nothing the events do not show.
+
+| ID | Scenario | Det. | Live | Test | Crit. |
+|---|---|---|---|---|---|
+| TN-101 | Streaming chunks collapse to one final utterance | PROTECTED | PENDING | `test_streaming_agent_chunks_collapse_to_one_final_utterance` | HIGH |
+| TN-102 | A new turn flushes the previous one | PROTECTED | PENDING | `test_a_new_turn_flushes_the_previous_one` | HIGH |
+| TN-103 | An out-of-order snapshot cannot truncate a turn | PROTECTED | PENDING | `test_an_out_of_order_snapshot_cannot_truncate_the_turn` | MED |
+| TN-104 | Flushing twice writes one row | PROTECTED | PENDING | `test_flushing_twice_writes_one_row` | HIGH |
+| TN-105 | The greeting cue is never traced as speech | PROTECTED | PENDING | `test_the_greeting_cue_is_never_traced_as_speech` | HIGH |
+| TN-106 | A customer id turn is an auth input | PROTECTED | PENDING | `test_a_customer_id_turn_is_recorded_as_an_auth_input` | MED |
+| TN-107 | A PIN turn is an auth input and stays redacted | PROTECTED | PENDING | `test_a_pin_turn_is_recorded_as_an_auth_input_and_stays_redacted` | HIGH |
+| TN-108 | The gate ruling is still recorded beside the description | PROTECTED | PENDING | `test_the_gate_ruling_is_still_recorded_beside_the_description` | HIGH |
+| TN-109 | A banking question is not mistaken for an auth input | PROTECTED | PENDING | `test_a_banking_question_is_not_mistaken_for_an_auth_input` | HIGH |
+| TN-110 | A closing turn is not recorded as unsupported banking | PROTECTED | PENDING | `test_a_closing_turn_is_not_recorded_as_unsupported_banking` | MED |
+| TN-111 | Social turns say which courtesy they were | PROTECTED | PENDING | `test_social_turns_say_which_courtesy_they_were` | LOW |
+| TN-112 | Order, tools and counters unchanged | PROTECTED | PENDING | `test_normalisation_leaves_order_tools_and_counters_alone` | HIGH |
+| TN-113 | The call summary is derived, not invented | PROTECTED | PENDING | `test_the_call_summary_is_derived_not_invented` | MED |
+| TN-114 | The summary reports a refusal without hiding it | PROTECTED | PENDING | `test_the_summary_reports_a_refusal_without_hiding_it` | HIGH |
+
+---
+
 ## Open defects
 
 | ID | Defect | Evidence | Status |
@@ -603,6 +699,7 @@ rather than names.
 | **D-4** | A hang-up could cancel its own cleanup: `tear_down` aborted after the bridge left `phone_call_registry` and before `voice_call_manager.close()`, stranding an open provider session and its capacity slot with no path to reclaim either - on `REALTIME_MAX_ACTIVE_SESSIONS = 1`, one dropped socket from refusing every later caller. | traced in a failing run (`tear_down RAISED CancelledError`); fixed by `service._uninterruptible` and `service.end_media_call`; guarded by TD-001 to TD-005 | **CLOSED deterministically - PENDING live re-proof** |
 | **D-5** | A caller turn that never transcribed left the scope gate open for the rest of the call, so a verified DEMO001 with a held Savings enquiry was refused `TURN_NOT_CLASSIFIED` after the full 4.0 s wait. The gate was opened by a VAD onset and closed only by a transcript with words in it - not the same guarantee. | live call `3860a81f-1bc5-1240-4790-eaa5afddeeef` (FAILED twice, ~4 s each); reproduced offline at 4061 ms; fixed by `turn_gate.resumes_held_enquiry` and `turn_gate.record_unintelligible_turn`; guarded by TN-001 to TN-017 | **CLOSED deterministically - PENDING live re-proof** |
 | **D-6** | Production startup never invoked the canonical additive schema initialiser, so a release that declared a new table shipped code querying a database that had never been told it existed. `call_trace_events` was absent after deploying `6a1d1af` and trace replay answered HTTP 500. Readiness reported the process ready throughout. | live: `UndefinedTable: relation "call_trace_events" does not exist`; fixed by `seed.ensure_schema()` in the lifespan plus `_add_declared_indexes`; readiness now verifies declared tables; guarded by SS-001 to SS-013 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-7** | The trace did not read like the call: a streamed reply was stored as three growing rows, PIN and customer-id turns were labelled `NON_BANKING_REQUEST`, and multi-phrase goodbyes landed in a banking refusal category. Presentation only - the banking result on `62cdd16f-...` was correct throughout. | fixed by `bridge._note_agent_text` / `_flush_agent_turn` and `trace.describe_turn`; the gate's own ruling is still recorded; guarded by TN-101 to TN-114 | **CLOSED deterministically - PENDING live re-proof** |
 
 ## Open decision
 

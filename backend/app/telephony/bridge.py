@@ -191,6 +191,9 @@ class PhoneCallBridge:
         # against `history_updated` snapshots replaying the whole conversation
         # on every change. Never holds the text itself.
         self._seen_history: set[str] = set()
+        # The assistant turn currently being streamed, held until it is
+        # finished so the trace records one sentence rather than its drafts.
+        self._agent_turn: dict | None = None
 
     # --- the model's side ----------------------------------------------------
 
@@ -387,6 +390,9 @@ class PhoneCallBridge:
         to retry from, and the call waits for an acknowledgement that cannot
         come.
         """
+        # The model has stopped producing this turn, so the sentence it was
+        # streaming is complete and may be written down.
+        self._flush_agent_turn()
         await self.lifecycle.on_generation_ended()
         await self._close_if_authentication_is_over()
         await self._request_playback_boundary()
@@ -565,7 +571,7 @@ class PhoneCallBridge:
             if key in self._seen_history:
                 continue
             self._seen_history.add(key)
-            self._on_history_item(role, text)
+            self._on_history_item(role, text, getattr(item, "item_id", None))
 
     def _on_history(self, item) -> None:
         """Read each completed turn, and decide whether the call is ending.
@@ -585,7 +591,60 @@ class PhoneCallBridge:
         text = _item_text(item)
         if not text:
             return
-        self._on_history_item(getattr(item, "role", None), text)
+        self._on_history_item(
+            getattr(item, "role", None), text, getattr(item, "item_id", None)
+        )
+
+    def _note_agent_text(self, item_id, text: str) -> None:
+        """Hold the newest text for the assistant turn being spoken.
+
+        The model streams a sentence in growing pieces, and the snapshot
+        handler above is keyed on the text so that a transcript filled in later
+        counts as new — which it must, or a goodbye would never be recognised.
+        For the trace that is the wrong shape: it turned one sentence into
+
+            "Let me check"
+            "Let me check that for your"
+            "Let me check that for your savings account and then I'll share..."
+
+        three rows deep. So nothing is written while a turn is still growing.
+        The newest text is held, and the turn is written once, finished, by
+        `_flush_agent_turn`.
+
+        Kept per item, and a new item flushes the previous one: two turns can
+        follow each other with no generation boundary in between.
+
+        The longest text wins rather than the latest, because snapshots carry
+        the whole conversation and nothing guarantees the order two of them
+        arrive in. A turn can only grow, so the longest is the most complete.
+        """
+        if not text:
+            return
+
+        # Nothing to hold, and nothing to schedule, when the trace is off -
+        # which is the default. Checked here rather than inside `trace.record`
+        # so a disabled trace costs the media path no buffer, no task and no
+        # thread hop: this runs on the audio event loop, for every sentence the
+        # bank says, on every call.
+        if not settings.trace_enabled:
+            return
+
+        held = self._agent_turn
+        if held is not None and held["item_id"] == item_id:
+            if len(text) > len(held["text"]):
+                held["text"] = text
+            return
+
+        # A different turn. Whatever was being held is finished.
+        self._flush_agent_turn()
+        self._agent_turn = {"item_id": item_id, "text": text}
+
+    def _flush_agent_turn(self) -> None:
+        """Write the held assistant turn, if there is one. Never twice."""
+        held = self._agent_turn
+        self._agent_turn = None
+        if held is not None:
+            self._trace_agent_turn(held["text"])
 
     def _trace_agent_turn(self, text: str) -> None:
         """Write down what the bank said, for the replay.
@@ -628,10 +687,10 @@ class PhoneCallBridge:
 
         self._schedule(record_agent_turn())
 
-    def _on_history_item(self, role, text: str) -> None:
+    def _on_history_item(self, role, text: str, item_id=None) -> None:
         """One completed turn, from whichever history event delivered it."""
         if role == "assistant":
-            self._trace_agent_turn(text)
+            self._note_agent_text(item_id, text)
         if role == "user":
             self._on_caller_text(text)
             return
@@ -950,6 +1009,11 @@ class PhoneCallBridge:
             # Whatever is running this. It gets stopped by returning, not by
             # being cancelled from within itself.
             current = asyncio.current_task()
+
+            # A last sentence still being held is still a sentence the bank
+            # said. Written before the pumps stop, so the replay ends where the
+            # call did.
+            self._flush_agent_turn()
 
             await self.lifecycle.close()
             self._stop_tasks(self._transitions, current)

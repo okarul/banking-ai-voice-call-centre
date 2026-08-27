@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 
+from app.config import settings
 from app.observability import recorder, trace
 from app.sessions import SessionManager
 from app.sessions import session_manager as default_manager
@@ -289,9 +290,20 @@ def record_turn_decision(session, decision, transcript: str | None = None) -> No
     # And the same turn as a trace event: what was said (only if utterances are
     # switched on, and only redacted), what it was understood to be, what the
     # gate ruled, and what the caller is still owed.
+    if not settings.trace_enabled:
+        # Nothing below is read when the trace is off, and all of it costs
+        # something: recalling the held enquiry, and classifying the turn a
+        # second time to describe it. Per caller turn, on the audio path, for a
+        # row that will not be written. Checked here rather than inside
+        # `trace.record`, which is the last thing that runs.
+        return
+
     from app import pending_request
 
     held = pending_request.recall(session)
+    # What the turn *was*, told apart from what the gate *ruled*. See
+    # `trace.describe_turn`: the ruling is kept exactly as made.
+    described = trace.describe_turn(session, decision, transcript)
     trace.record(
         session.session_id,
         trace.TraceEvent(
@@ -301,8 +313,8 @@ def record_turn_decision(session, decision, transcript: str | None = None) -> No
             utterance=trace.utterance_for(
                 transcript, speaker=trace.SPEAKER_CUSTOMER
             ),
-            domain=getattr(getattr(decision, "domain", None), "value", None),
-            intent=getattr(getattr(decision, "intent", None), "value", None),
+            domain=described["domain"],
+            intent=described["intent"],
             scope_category=category,
             scope_allowed=bool(getattr(decision, "allowed", False)),
             pending_operation=held.tool if held else None,
@@ -310,7 +322,7 @@ def record_turn_decision(session, decision, transcript: str | None = None) -> No
             loan_type=held.loan_type if held else None,
             auth_status=trace.auth_status(session),
             customer_ref=trace.customer_ref(session),
-            event_type="caller_turn",
+            event_type=described["event_type"],
         ),
         session=session,
     )

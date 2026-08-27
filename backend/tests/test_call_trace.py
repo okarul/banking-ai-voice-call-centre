@@ -23,6 +23,7 @@ All customers, PINs and card numbers here are synthetic.
 import asyncio
 import json
 import logging
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1075,3 +1076,416 @@ def test_the_sweep_decides_before_it_purges(traced, monkeypatch):
     # The purge is the last thing the sweep does, so it cannot change what the
     # sweep already decided.
     assert order.index("purge") == len(order) - 2
+
+
+# === Phase 6.12.2: the trace has to read like the call ======================
+#
+# The first live UAT passed on every banking measure - DEMO001 verified,
+# `get_account_balance` OK in 11 ms, the spoken balance correct, CALLER_GOODBYE
+# - and the trace of it was hard to read. Three things, none of them banking:
+#
+#   * one sentence appeared three times, growing, because the model streams it
+#     and the snapshot handler is keyed on the text;
+#   * the four digits a caller reads out when the bank asks for a PIN were
+#     labelled NON_BANKING_REQUEST, which is what the gate ruled and reads like
+#     a refusal of something nobody asked for;
+#   * "no, that is all, thank you" missed SOCIAL - it is more than one courtesy
+#     phrase - and was filed under a banking-refusal category.
+#
+# None of these tests touches banking behaviour, and none of them changes what
+# the gate decides. They pin how a call reads afterwards.
+
+
+class _AgentItem:
+    """One assistant history item, as the SDK delivers it while streaming."""
+
+    def __init__(self, item_id: str, text: str, role: str = "assistant"):
+        self.item_id = item_id
+        self.role = role
+        self.type = "message"
+        self.content = [_AgentContent(text)]
+
+
+class _AgentContent:
+    def __init__(self, text: str):
+        self.transcript = text
+        self.text = None
+
+
+@pytest.fixture
+def bridge_call(traced, monkeypatch):
+    """A phone bridge wired to a claimed call, with tracing on."""
+    from app.telephony.bridge import PhoneCallBridge
+    from app.telephony.media import LoopbackMediaTransport
+    from app.sessions import session_manager as real_manager
+
+    manager = SessionManager()
+    banking = manager.create_session()
+    call_id = f"norm-{uuid.uuid4()}"
+    recorder.claim_phone_call(
+        banking.session_id,
+        provider_call_id=call_id,
+        provider_event_id=f"evt-{call_id}",
+    )
+
+    class _Realtime:
+        async def send_audio(self, *_a, **_k):
+            pass
+
+        async def send_message(self, *_a, **_k):
+            pass
+
+    bridge = PhoneCallBridge(
+        provider_call_id=call_id,
+        banking_session_id=banking.session_id,
+        transport=LoopbackMediaTransport(),
+        realtime_manager=_Realtime(),
+        outbound_max_frames=200,
+    )
+    bridge.conversation.session_manager = manager
+    return bridge, call_id, manager, banking
+
+
+def agent_events(call_id: str) -> list[dict]:
+    replay = trace.for_call(call_id)
+    return [
+        e
+        for e in replay["events"]
+        if e["kind"] == trace.KIND_TURN and e["speaker"] == trace.SPEAKER_AGENT
+    ]
+
+
+# --- A/B/L: streaming collapses to one complete utterance -------------------
+
+
+@pytest.mark.trace
+def test_streaming_agent_chunks_collapse_to_one_final_utterance(bridge_call):
+    """The live defect: one sentence, three rows."""
+    bridge, call_id, _manager, _banking = bridge_call
+
+    final = (
+        "Let me check that for your savings account and then I'll share "
+        "what's available."
+    )
+    partials = ("Let me check", "Let me check that for your", final)
+
+    async def stream():
+        for partial in partials:
+            bridge._on_history_item("assistant", partial, "item-1")
+        # Still nothing written: the turn is still growing.
+        assert agent_events(call_id) == []
+        bridge._flush_agent_turn()
+        await _settle(bridge)
+
+    asyncio.run(stream())
+
+    written = agent_events(call_id)
+    assert len(written) == 1, f"one sentence became {len(written)} rows"
+    assert written[0]["utterance"] == final, "the stored utterance is a draft"
+
+
+@pytest.mark.trace
+def test_a_new_turn_flushes_the_previous_one(bridge_call):
+    """Two sentences, no generation boundary between them, two rows."""
+    bridge, call_id, _manager, _banking = bridge_call
+
+    drive(
+        bridge,
+        [
+            ("assistant", "Alright, I'll confirm", "item-1"),
+            ("assistant", "Alright, I'll confirm that now.", "item-1"),
+            ("assistant", "Your balance is available.", "item-2"),
+        ],
+    )
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == ["Alright, I'll confirm that now.", "Your balance is available."]
+
+
+@pytest.mark.trace
+def test_an_out_of_order_snapshot_cannot_truncate_the_turn(bridge_call):
+    """Snapshots carry the whole conversation; their order is not guaranteed."""
+    bridge, call_id, _manager, _banking = bridge_call
+
+    drive(
+        bridge,
+        [
+            ("assistant", "The full sentence, complete.", "item-1"),
+            ("assistant", "The full", "item-1"),
+        ],
+    )
+
+    written = agent_events(call_id)
+    assert len(written) == 1
+    assert written[0]["utterance"] == "The full sentence, complete."
+
+
+@pytest.mark.trace
+def test_flushing_twice_writes_one_row(bridge_call):
+    """Generation end and call close both flush. That is one turn, not two."""
+    bridge, call_id, _manager, _banking = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "Thank you for calling.", "item-1")
+        bridge._flush_agent_turn()
+        bridge._flush_agent_turn()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    assert len(agent_events(call_id)) == 1
+
+
+@pytest.mark.trace
+def test_the_greeting_cue_is_never_traced_as_speech(bridge_call):
+    """The cue is a synthetic user turn this module injects, not a caller."""
+    from app.telephony.bridge import GREETING_CUE
+
+    bridge, call_id, _manager, _banking = bridge_call
+
+    drive(bridge, [("assistant", GREETING_CUE, "item-1")])
+
+    assert agent_events(call_id) == []
+
+
+async def _settle(bridge) -> None:
+    """Let the scheduled trace writes finish."""
+    for _ in range(200):
+        if not bridge._transitions:
+            return
+        await asyncio.sleep(0.01)
+
+
+def drive(bridge, steps) -> None:
+    """Feed history items to the bridge inside one event loop.
+
+    `_schedule` needs a running loop - it is called from the event pump, which
+    has one - so a test that drives the handler synchronously schedules nothing
+    and proves nothing.
+    """
+
+    async def scenario():
+        for role, text, item_id in steps:
+            bridge._on_history_item(role, text, item_id)
+        bridge._flush_agent_turn()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+
+# --- C/D/E: authentication inputs read as authentication --------------------
+
+
+@pytest.mark.trace
+def test_a_customer_id_turn_is_recorded_as_an_auth_input(traced):
+    call = Call()
+    try:
+        call.says(SPOKEN_ID)
+        turn = call.events(trace.KIND_TURN)[-1]
+
+        assert turn["event_type"] == trace.EVENT_AUTH_INPUT
+        assert turn["intent"] == trace.INTENT_CUSTOMER_ID_INPUT
+        assert turn["domain"] == trace.DOMAIN_AUTHENTICATION
+        assert turn["utterance"] == "[Customer ID provided]"
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_a_pin_turn_is_recorded_as_an_auth_input_and_stays_redacted(traced):
+    """The turn is named. The digits are not."""
+    call = Call()
+    try:
+        call.says(SPOKEN_ID)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        call.says(SPOKEN_PIN)
+
+        turn = call.events(trace.KIND_TURN)[-1]
+        assert turn["event_type"] == trace.EVENT_AUTH_INPUT
+        assert turn["intent"] == trace.INTENT_PIN_INPUT
+        assert turn["domain"] == trace.DOMAIN_AUTHENTICATION
+        assert turn["utterance"] == "[PIN REDACTED]"
+
+        blob = stored_blob()
+        assert PINS[CALLER] not in blob
+        assert "four eight two one" not in blob.lower()
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_the_gate_ruling_is_still_recorded_beside_the_description(traced):
+    """Describing a turn must not erase what the gate decided about it.
+
+    The whole of Phase 6.11 was diagnosed by reading these two fields. A PIN
+    turn really is ruled NON_BANKING_REQUEST, and a trace that hid that would
+    have hidden the defect.
+    """
+    call = Call()
+    try:
+        call.says(SPOKEN_ID)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        call.says(SPOKEN_PIN)
+
+        turn = call.events(trace.KIND_TURN)[-1]
+        assert turn["scope_category"] == "NON_BANKING_REQUEST"
+        assert turn["scope_allowed"] is False
+        # And the description says what it was.
+        assert turn["intent"] == trace.INTENT_PIN_INPUT
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_a_banking_question_is_not_mistaken_for_an_auth_input(traced):
+    """Being mid-authentication does not make every turn a credential."""
+    call = Call()
+    try:
+        call.says(SPOKEN_ID)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        call.says(ASK_SAVINGS)
+
+        turn = call.events(trace.KIND_TURN)[-1]
+        assert turn["event_type"] == trace.EVENT_CALLER_TURN
+        assert turn["intent"] == "ACCOUNT_BALANCE"
+    finally:
+        call.close()
+
+
+# --- F/G: closing and social ------------------------------------------------
+
+
+@pytest.mark.trace
+@pytest.mark.parametrize(
+    "goodbye",
+    [
+        "Goodbye.",
+        "No, that is all. Thank you.",
+        "That is all, thanks. Goodbye.",
+        "Nothing else, thanks.",
+    ],
+)
+def test_a_closing_turn_is_not_recorded_as_unsupported_banking(traced, goodbye):
+    call = Call()
+    try:
+        call.says(ASK_SAVINGS)
+        call.verify()
+        call.tool("get_account_balance", account_type="Savings")
+        call.says(goodbye)
+
+        turn = call.events(trace.KIND_TURN)[-1]
+        assert turn["event_type"] == trace.EVENT_CLOSING
+        assert turn["intent"] == "END_CALL"
+        assert turn["domain"] == trace.DOMAIN_CLOSING
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+@pytest.mark.parametrize(
+    "utterance, expected", [("Hello.", "GREETING"), ("Thank you.", "THANKS")]
+)
+def test_social_turns_say_which_courtesy_they_were(traced, utterance, expected):
+    call = Call()
+    try:
+        call.says(ASK_SAVINGS)
+        call.verify()
+        call.tool("get_account_balance", account_type="Savings")
+        call.says(utterance)
+
+        turn = call.events(trace.KIND_TURN)[-1]
+        assert turn["event_type"] == trace.EVENT_SOCIAL
+        assert turn["intent"] == expected
+        assert turn["domain"] == trace.DOMAIN_SOCIAL
+    finally:
+        call.close()
+
+
+# --- H/I/J: order, tools and counters unchanged -----------------------------
+
+
+@pytest.mark.trace
+def test_normalisation_leaves_order_tools_and_counters_alone(traced):
+    """Presentation changed. Nothing else did."""
+    call = Call()
+    try:
+        call.says(ASK_SAVINGS)
+        call.verify()
+        call.tool("get_account_balance", account_type="Savings")
+        call.says("Goodbye.")
+        call.ends("CALLER_GOODBYE")
+
+        events = call.replay()["events"]
+        sequences = [e["sequence"] for e in events]
+        assert sequences == sorted(sequences), "replay order is not deterministic"
+
+        with session_scope() as db:
+            row = db.scalars(
+                select(AgentSession).where(
+                    AgentSession.provider_call_id == call.call_id
+                )
+            ).one()
+            tool_events = list(
+                db.scalars(
+                    select(AgentToolEvent).where(AgentToolEvent.session_pk == row.id)
+                )
+            )
+
+        assert row.tool_call_count == 3
+        assert len(tool_events) == 3
+        assert len(call.events(trace.KIND_TOOL)) == 3
+        assert len(call.tools_named("get_account_balance")) == 1
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_the_call_summary_is_derived_not_invented(traced):
+    """The outcome comes from the events, and the session fields stay as they were.
+
+    `current_domain` and `last_intent` are deliberately the *last turn* - a
+    refused turn shows as GENERAL/SCOPE so an operator sees it was turned away.
+    That is proven behaviour and is not rewritten to look tidier.
+    """
+    call = Call()
+    try:
+        call.says(ASK_SAVINGS)
+        call.verify()
+        call.tool("get_account_balance", account_type="Savings")
+        call.says("Goodbye.")
+        call.ends("CALLER_GOODBYE")
+
+        replay = call.replay()
+        summary = replay["summary"]
+
+        assert summary["verified"] is True
+        assert summary["answered"] == 1
+        assert summary["refused"] == 0
+        assert summary["operations"] == ["get_account_balance"]
+        assert summary["ended"] == "CALLER_GOODBYE"
+        assert summary["turns"] >= 4
+
+        # And the session's own fields are untouched by any of it.
+        assert replay["call"]["authenticated"] is True
+        assert replay["call"]["customer_id"] == CALLER
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_the_summary_reports_a_refusal_without_hiding_it(traced):
+    call = Call()
+    try:
+        call.says(ASK_SAVINGS)
+        call.verify()
+        call.tool("get_account_balance", account_type="Savings")
+        call.says(f"What is {OTHER}'s savings balance?")
+        call.tool("get_account_balance", account_type="Savings")
+        call.ends("CALLER_GOODBYE")
+
+        summary = call.replay()["summary"]
+        assert summary["answered"] == 1
+        assert summary["refused"] == 1
+        assert summary["refusal_reasons"] == ["CROSS_CUSTOMER_REQUEST"]
+    finally:
+        call.close()

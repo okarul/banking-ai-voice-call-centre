@@ -202,6 +202,121 @@ def utterance_for(text: str | None, *, speaker: str) -> str | None:
     return redact_transcript(text, role=role)[:2000]
 
 
+# How a caller turn reads in a replay, when the scope category alone would
+# mislead. These are presentation, not policy: the gate's own ruling is stored
+# beside them, untouched.
+EVENT_AUTH_INPUT = "auth_input"
+EVENT_CLOSING = "closing"
+EVENT_SOCIAL = "social"
+EVENT_CALLER_TURN = "caller_turn"
+
+DOMAIN_AUTHENTICATION = "AUTHENTICATION"
+DOMAIN_CLOSING = "CLOSING"
+DOMAIN_SOCIAL = "SOCIAL"
+
+INTENT_CUSTOMER_ID_INPUT = "CUSTOMER_ID_INPUT"
+INTENT_PIN_INPUT = "PIN_INPUT"
+
+
+def describe_turn(session, decision, transcript: str | None) -> dict:
+    """What this caller turn *was*, for somebody reading the call back.
+
+    The scope gate answers one question — may this turn reach banking data —
+    and answers it in its own vocabulary. That vocabulary is exactly right for
+    the gate and misleading in a transcript: the four digits a caller reads out
+    when the bank asks for their PIN are ruled `NON_BANKING_REQUEST`, which is
+    true (a PIN is not a banking enquiry) and reads like a refusal of something
+    the caller never asked for. A goodbye fares no better: "no, that is all,
+    thank you" is more than one courtesy phrase, so it misses `SOCIAL` and
+    lands in the same place.
+
+    So the turn is *described* here as well as ruled. `scope_category` and
+    `scope_allowed` keep the gate's real answer — they are the record of a real
+    decision, and the whole of Phase 6.11 lives in being able to read them —
+    and `intent`, `domain` and `event_type` say what the turn actually was.
+
+    Nothing here changes what the gate decides, what the model is told, or what
+    the bank does. It changes only how the call reads afterwards.
+    """
+    category = getattr(getattr(decision, "category", None), "value", None)
+    intent = getattr(getattr(decision, "intent", None), "value", None)
+    domain = getattr(getattr(decision, "domain", None), "value", None)
+
+    # 1. The PIN, which the bank asked for a moment ago. Recognised from
+    #    session state first — the bank knows it is waiting for one — and
+    #    confirmed against the shape of the words, which are not stored.
+    if _awaiting_pin(session) and _looks_like_pin(transcript):
+        return {
+            "intent": INTENT_PIN_INPUT,
+            "domain": DOMAIN_AUTHENTICATION,
+            "event_type": EVENT_AUTH_INPUT,
+        }
+
+    # 2. The customer id. The gate already calls this AUTHENTICATION.
+    if category == "AUTHENTICATION":
+        return {
+            "intent": INTENT_CUSTOMER_ID_INPUT,
+            "domain": DOMAIN_AUTHENTICATION,
+            "event_type": EVENT_AUTH_INPUT,
+        }
+
+    # 3. Ending the call. The deterministic classifier recognises every way a
+    #    caller says it, including the ones `_is_social` is too strict for.
+    if _is_closing(transcript):
+        return {
+            "intent": "END_CALL",
+            "domain": DOMAIN_CLOSING,
+            "event_type": EVENT_CLOSING,
+        }
+
+    # 4. Ordinary courtesy, and which kind. "Hello" and "thank you" are both
+    #    social and are not the same moment in a call.
+    if category == "SOCIAL":
+        return {
+            "intent": _social_kind(transcript) or intent or "SOCIAL",
+            "domain": DOMAIN_SOCIAL,
+            "event_type": EVENT_SOCIAL,
+        }
+
+    return {"intent": intent, "domain": domain, "event_type": EVENT_CALLER_TURN}
+
+
+def _awaiting_pin(session) -> bool:
+    """Whether the bank has asked this caller for a PIN and not yet had one."""
+    if session is None:
+        return False
+    return bool(
+        getattr(session, "candidate_customer_id", None)
+    ) and not getattr(session, "authenticated", False)
+
+
+def _looks_like_pin(transcript: str | None) -> bool:
+    """The shape of a spoken credential. The words themselves are not kept."""
+    if not transcript:
+        return False
+    from app.observability.redaction import looks_like_pin
+
+    return looks_like_pin(transcript)
+
+
+def _social_kind(transcript: str | None) -> str | None:
+    """GREETING or THANKS, from the classifier that already knows the words."""
+    if not transcript:
+        return None
+    from app.agents.intents import social_turn
+
+    return social_turn(transcript)
+
+
+def _is_closing(transcript: str | None) -> bool:
+    """Whether the caller asked to finish, however they put it."""
+    if not transcript:
+        return False
+    from app.agents.intents import Intent, classify
+
+    return classify(transcript).intent is Intent.END_CALL
+
+
 def customer_ref(session) -> str | None:
     """The safe reference for whoever the backend believes is calling.
 
@@ -413,6 +528,55 @@ def _row_to_dict(row: CallTraceEvent) -> dict:
     return {name: value for name, value in payload.items() if value is not None}
 
 
+def _summarise(events: list[dict]) -> dict:
+    """What actually happened on this call, derived from its own trace.
+
+    `agent_sessions.current_domain` and `last_intent` are deliberately the
+    *last turn*, not the outcome: a refused turn shows as `GENERAL/SCOPE` so an
+    operator watching the board sees that something was turned away rather than
+    that a loan was discussed. That is the right answer to the question they
+    ask, and it is why a call that answered a balance perfectly well and then
+    heard "goodbye" ends up labelled by the goodbye.
+
+    Rewriting those to look tidier would falsify a proven record. So the
+    outcome is computed here instead, from the events, where it costs nothing
+    and claims nothing the trace does not show.
+    """
+    banking = [
+        event
+        for event in events
+        if event.get("kind") == KIND_TOOL
+        and event.get("tool_name", "").startswith("get_")
+    ]
+    answered = [event for event in banking if event.get("tool_status") == "OK"]
+    refused = [event for event in banking if event.get("tool_status") == "FAILED"]
+    verified = any(
+        event.get("auth_status") == "VERIFIED" for event in events
+    )
+
+    return {
+        "verified": verified,
+        "banking_enquiries": len(banking),
+        "answered": len(answered),
+        "refused": len(refused),
+        "operations": sorted({event["tool_name"] for event in answered}),
+        "refusal_reasons": sorted(
+            {event["failure_reason"] for event in refused if event.get("failure_reason")}
+        ),
+        "turns": max(
+            (event["turn"] for event in events if event.get("turn")), default=0
+        ),
+        "ended": next(
+            (
+                event.get("disconnect_reason")
+                for event in reversed(events)
+                if event.get("kind") == KIND_LIFECYCLE
+            ),
+            None,
+        ),
+    }
+
+
 def for_call(provider_call_id: str) -> dict | None:
     """One telephone call's trace, in replay order, or None if there is none.
 
@@ -436,7 +600,9 @@ def for_call(provider_call_id: str) -> dict | None:
             )
         )
 
+        events = [_row_to_dict(row) for row in rows]
         return {
+            "summary": _summarise(events),
             "call": {
                 "provider_call_id": call.provider_call_id,
                 "agent_session_id": call.agent_session_id,
@@ -454,7 +620,7 @@ def for_call(provider_call_id: str) -> dict | None:
                 "last_intent": call.last_intent,
             },
             "utterances_recorded": bool(settings.telephony_trace_utterances),
-            "events": [_row_to_dict(row) for row in rows],
+            "events": events,
         }
 
 
