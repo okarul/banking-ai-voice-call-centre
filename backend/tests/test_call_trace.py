@@ -23,6 +23,7 @@ All customers, PINs and card numbers here are synthetic.
 import asyncio
 import json
 import logging
+import time
 import uuid
 
 import pytest
@@ -232,7 +233,14 @@ class Call:
 
 
 def stored_blob() -> str:
-    """Every trace row in the database, as one string to search."""
+    """Every trace row in the database, as one string to search.
+
+    `ensure_ascii=False` is not cosmetic. With the default, a PIN transcribed
+    into Urdu is escaped to `\\uXXXX` sequences and `spoken not in
+    stored_blob()` can never match it - so the assertion that D-8 rests on
+    would have passed over a raw non-Latin PIN sitting in the table. Phase 6.14
+    found exactly that leak by another route.
+    """
     with session_scope() as db:
         rows = list(db.scalars(select(CallTraceEvent)))
         return json.dumps(
@@ -242,7 +250,8 @@ def stored_blob() -> str:
                     for column in CallTraceEvent.__table__.columns
                 }
                 for row in rows
-            ]
+            ],
+            ensure_ascii=False,
         )
 
 
@@ -1767,12 +1776,11 @@ def test_generation_end_does_not_write_an_unfinished_message(bridge_call):
         await bridge._generation_finished()
         assert agent_events(call_id) == [], "an unfinished message was written"
 
-        bridge._on_history_item(
-            "assistant",
-            "Thanks, I'll confirm that and then share your balance.",
-            "i1",
-            "completed",
-        )
+        finished = "Thanks, I'll confirm that and then share your balance."
+        bridge._on_history_item("assistant", finished, "i1", "completed")
+        # Phase 6.14: the item being finished is not the sentence being
+        # finished. The provider says the second thing separately.
+        final_transcript(bridge, "i1", finished)
         await _settle(bridge)
 
     asyncio.run(scenario())
@@ -1824,11 +1832,21 @@ def test_two_completed_responses_are_two_rows_and_no_more(bridge_call):
 
 
 def drive_with_status(bridge, steps, item_id: str = "i1") -> None:
-    """Feed assistant snapshots with their completion status, in one loop."""
+    """Feed assistant snapshots with their completion status, in one loop.
+
+    A `completed` step also emits the provider's final transcript for that
+    item, because that is the order a real audio response arrives in:
+    `response.output_audio_transcript.done` carries the finished sentence, and
+    `response.output_item.done` marks the item finished. Phase 6.14 made the
+    first of those the signal, so a harness that sent only the second would be
+    modelling a provider that does not exist.
+    """
 
     async def scenario():
         for text, status in steps:
             bridge._on_history_item("assistant", text, item_id, status)
+            if status in ("completed", "incomplete"):
+                final_transcript(bridge, item_id, text)
         await _settle(bridge)
 
     asyncio.run(scenario())
@@ -2201,3 +2219,601 @@ def test_the_longest_text_still_wins_before_the_turn_is_written(bridge_call):
     written = agent_events(call_id)
     assert len(written) == 1
     assert written[0]["utterance"] == "The complete sentence, all of it."
+
+
+# === Phase 6.14: the caller's words come before the tool they cause =========
+#
+# Live call `9cf4e328-1cac-1240-4790-eaa5afddeeef` passed on banking, on PIN
+# privacy, on non-Latin scope and on stale replay - and read like this:
+#
+#     9   TOOL     submit_customer_id  OK
+#     10  AUTH     PENDING
+#     11  CUSTOMER "[PIN REDACTED]"   intent=PIN_INPUT
+#
+# The caller turn at 11 is the one that *supplied the customer id*. It should
+# have been `[Customer ID provided]` / `CUSTOMER_ID_INPUT`, and it should have
+# come first.
+#
+# Phase 6.12.3 froze the credential expectation at the moment the turn is
+# ruled, which fixed the deferred write. What remains is that on a voice call
+# **the ruling itself is late**. The model is given the caller's audio
+# directly and can call `submit_customer_id` as soon as it has heard enough;
+# the transcript arrives from a separate ASR pass afterwards. By the time
+# `reserve_turn` asks "what credential is expected?", `submit_customer_id` has
+# already set `candidate_customer_id` - and that window *is* "waiting for a
+# PIN".
+#
+# The two turns of that same call prove it is a race and not a second code
+# path: on the PIN turn the transcript won, so the PIN was redacted correctly;
+# on the customer-id turn the tool won, so the id turn was relabelled a PIN
+# turn and filed behind the tool it caused. Same code, same call.
+#
+# `Call.says` fires the onset and the transcript together, which is only ever
+# the ordering the transcript wins. These tests drive the other one.
+
+
+class RacingCall(Call):
+    """A call where the model's tool call and the transcript race."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._deferred = []
+
+    def starts_speaking(self) -> None:
+        """VAD onset: the caller has begun. No transcript exists yet."""
+        self.speech_started()
+
+    def transcript_arrives(self, text: str, *, item_id=None, defer=False) -> None:
+        """The ASR result for speech that began earlier."""
+        self._items += 1
+        event = _Event(
+            "raw_model_event",
+            data=_Event(
+                "input_audio_transcription_completed",
+                transcript=text,
+                item_id=item_id or f"item-{self._items}",
+            ),
+        )
+        turn = self.pump._feed_gate(self.session_id, event)
+        if turn is None:
+            return
+        if defer:
+            self._deferred.append(turn)
+        else:
+            business.record_turn_decision(*turn)
+
+    def worker_catches_up(self) -> None:
+        """The off-loop write, which lands whenever it lands."""
+        while self._deferred:
+            business.record_turn_decision(*self._deferred.pop(0))
+
+
+def _story(call):
+    return [
+        (e["kind"], e.get("intent") or e.get("tool_name") or e.get("auth_status"))
+        for e in call.replay()["events"]
+    ]
+
+
+def _position(story, kind, name):
+    return next(i for i, (k, n) in enumerate(story) if k == kind and n == name)
+
+
+@pytest.mark.trace
+def test_the_id_turn_is_reserved_before_the_tool_mutates_auth_state(traced):
+    """The live ordering, exactly: onset, tool, then the transcript."""
+    call = RacingCall()
+    try:
+        call.says(ASK_SAVINGS)
+
+        call.starts_speaking()
+        # The model heard the audio and acted on it before ASR came back.
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        assert call.session.candidate_customer_id == "DEMO001"
+        call.transcript_arrives(SPOKEN_ID)
+
+        turn = call.events(trace.KIND_TURN)[-1]
+        assert turn["intent"] == trace.INTENT_CUSTOMER_ID_INPUT, (
+            "the id turn was relabelled a PIN turn by state it preceded"
+        )
+        assert turn["utterance"] == "[Customer ID provided]"
+        assert turn["event_type"] == trace.EVENT_AUTH_INPUT
+        assert turn["domain"] == trace.DOMAIN_AUTHENTICATION
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_the_id_turn_is_replayed_before_the_tool_event(traced):
+    call = RacingCall()
+    try:
+        call.says(ASK_SAVINGS)
+        call.starts_speaking()
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        call.transcript_arrives(SPOKEN_ID)
+        call.ends()
+
+        story = _story(call)
+        assert (
+            _position(story, trace.KIND_TURN, trace.INTENT_CUSTOMER_ID_INPUT)
+            < _position(story, trace.KIND_TOOL, "submit_customer_id")
+        ), story
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_the_id_turn_is_replayed_before_the_auth_transition(traced):
+    call = RacingCall()
+    try:
+        call.says(ASK_SAVINGS)
+        call.starts_speaking()
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        call.transcript_arrives(SPOKEN_ID)
+        call.ends()
+
+        story = _story(call)
+        assert (
+            _position(story, trace.KIND_TURN, trace.INTENT_CUSTOMER_ID_INPUT)
+            < _position(story, trace.KIND_AUTH, "PENDING")
+        ), story
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_the_id_turn_survives_a_worker_write_that_lands_after_the_tool(traced):
+    """Ruling late is one problem; writing late must not add another."""
+    call = RacingCall()
+    try:
+        call.says(ASK_SAVINGS)
+        call.starts_speaking()
+        call.transcript_arrives(SPOKEN_ID, defer=True)
+        # The tool runs, and the auth state moves on, before the row is written.
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        call.worker_catches_up()
+
+        turn = call.events(trace.KIND_TURN)[-1]
+        assert turn["intent"] == trace.INTENT_CUSTOMER_ID_INPUT
+        assert turn["utterance"] == "[Customer ID provided]"
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_the_id_turn_cannot_become_a_pin_turn_once_the_caller_is_verified(traced):
+    """The furthest the state can travel before the write lands."""
+    call = RacingCall()
+    try:
+        call.says(ASK_SAVINGS)
+        call.starts_speaking()
+        call.transcript_arrives(SPOKEN_ID, defer=True)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        call.says(SPOKEN_PIN)
+        call.tool("submit_pin", spoken_pin=HEARD_PIN)
+        assert call.session.authenticated is True
+        call.worker_catches_up()
+
+        intents = [e["intent"] for e in call.events(trace.KIND_TURN)]
+        assert trace.INTENT_CUSTOMER_ID_INPUT in intents, intents
+        ids = [
+            e for e in call.events(trace.KIND_TURN)
+            if e["intent"] == trace.INTENT_CUSTOMER_ID_INPUT
+        ]
+        assert ids[-1]["utterance"] == "[Customer ID provided]"
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_the_pin_turn_is_still_a_pin_turn_when_the_tool_wins_the_race(traced):
+    """The other half: fixing the id turn must not unfix the PIN turn."""
+    call = RacingCall()
+    try:
+        call.says(ASK_SAVINGS)
+        call.says(SPOKEN_ID)
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+
+        call.starts_speaking()
+        call.tool("submit_pin", spoken_pin=HEARD_PIN)
+        call.transcript_arrives(SPOKEN_PIN)
+
+        turn = call.events(trace.KIND_TURN)[-1]
+        assert turn["intent"] == trace.INTENT_PIN_INPUT
+        assert turn["utterance"] == "[PIN REDACTED]"
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_both_credential_turns_stay_redacted_when_the_tools_win(traced, caplog):
+    call = RacingCall()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            call.says(ASK_SAVINGS)
+            call.starts_speaking()
+            call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+            call.transcript_arrives(SPOKEN_ID)
+            call.starts_speaking()
+            call.tool("submit_pin", spoken_pin=HEARD_PIN)
+            call.transcript_arrives(SPOKEN_PIN)
+
+        blob = stored_blob()
+        replay = json.dumps(call.replay(), ensure_ascii=False)
+        logged = " ".join(record.getMessage() for record in caplog.records)
+        for secret in (SPOKEN_PIN, HEARD_PIN, SPOKEN_ID):
+            assert secret not in blob, secret
+            assert secret not in replay, secret
+            assert secret not in logged, secret
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_replay_order_stays_strictly_increasing_when_the_tool_wins(traced):
+    call = RacingCall()
+    try:
+        call.says(ASK_SAVINGS)
+        call.starts_speaking()
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        call.transcript_arrives(SPOKEN_ID)
+        call.starts_speaking()
+        call.tool("submit_pin", spoken_pin=HEARD_PIN)
+        call.transcript_arrives(SPOKEN_PIN)
+        call.tool("get_account_balance", account_type="Savings")
+        call.ends()
+
+        sequences = [e["sequence"] for e in call.replay()["events"]]
+        assert sequences == sorted(sequences), sequences
+        assert len(sequences) == len(set(sequences)), "two events share a position"
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_no_tool_is_delayed_to_achieve_the_ordering(traced):
+    """Ordering comes from reservation, never from making the bank wait."""
+    call = RacingCall()
+    try:
+        call.says(ASK_SAVINGS)
+        call.starts_speaking()
+
+        started = time.monotonic()
+        result = call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        elapsed = time.monotonic() - started
+
+        assert result["success"] is True
+        assert elapsed < 0.25, f"the tool waited {elapsed:.3f}s for a trace row"
+        call.transcript_arrives(SPOKEN_ID)
+    finally:
+        call.close()
+
+
+# === Phase 6.14: terminal is not the same as final =========================
+#
+# The same live call closed like this:
+#
+#     CUSTOMER  "Okay, thank you. Goodbye."
+#     AGENT     "Thank you for calling ABC Demo"      <- all that was stored
+#     lifecycle CALLER_GOODBYE
+#
+# The bank said the whole sentence. Only that much was persisted.
+#
+# `agents/realtime/session.py` merges a fuller accumulated transcript into an
+# updated item **only when the incoming transcript is falsy**:
+#
+#     entry_transcript = entry.transcript
+#     if not entry_transcript:
+#         preserved = existing.transcript or self._item_transcripts.get(item_id)
+#
+# A `response.output_item.done` carrying a *partial but non-empty* transcript
+# therefore skips that merge, and `openai_realtime.py` stamps the same item
+# `status="completed"`. Phase 6.13 then did exactly what it was built to do:
+# treat completion as terminal, write the row, and ignore everything that
+# arrived afterwards - including the rest of the sentence.
+#
+# Phase 6.13 was right about the *item* and wrong to infer the *text* from it.
+# The provider publishes the text separately and says so:
+# `response.output_audio_transcript.done` carries "the final transcript of the
+# audio", and is emitted for interrupted and cancelled responses too. The SDK
+# maps only `.delta`, so it is read raw - the same way Phase 6.11.1 had to read
+# `input_audio_transcription.failed`.
+
+GOODBYE = "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodbye."
+GOODBYE_PARTIAL = "Thank you for calling ABC Demo"
+
+
+def final_transcript(bridge, item_id: str, transcript: str) -> None:
+    """The provider's authoritative final text for one assistant item."""
+    bridge._on_raw(
+        _Event(
+            "raw_server_event",
+            data={
+                "type": "response.output_audio_transcript.done",
+                "item_id": item_id,
+                "transcript": transcript,
+                "response_id": "resp-1",
+                "content_index": 0,
+                "output_index": 0,
+            },
+        )
+    )
+
+
+@pytest.mark.trace
+def test_the_live_goodbye_is_stored_complete(bridge_call):
+    """The live sequence, end to end."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "Thank you for", "g1", "in_progress")
+        # Terminal item, partial text - the shape that truncated the live row.
+        bridge._on_history_item("assistant", GOODBYE_PARTIAL, "g1", "completed")
+        final_transcript(bridge, "g1", GOODBYE)
+        await bridge._generation_finished()
+        await _settle(bridge)
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [GOODBYE], f"the closing sentence was cut: {written}"
+
+
+@pytest.mark.trace
+def test_a_terminal_status_does_not_freeze_partial_text(bridge_call):
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", GOODBYE_PARTIAL, "g1", "completed")
+        await _settle(bridge)
+        final_transcript(bridge, "g1", GOODBYE)
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [GOODBYE], written
+
+
+@pytest.mark.trace
+def test_the_authoritative_text_is_what_gets_persisted(bridge_call):
+    """One item, one row, and the row holds the provider's final transcript."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        for piece in ("Let me", "Let me check that", "Let me check that for"):
+            bridge._on_history_item("assistant", piece, "a1", "in_progress")
+        bridge._on_history_item("assistant", "Let me check that for", "a1", "completed")
+        final_transcript(bridge, "a1", "Let me check that for your savings account.")
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = agent_events(call_id)
+    assert len(written) == 1, [e["utterance"] for e in written]
+    assert written[0]["utterance"] == "Let me check that for your savings account."
+
+
+@pytest.mark.trace
+def test_a_stale_snapshot_cannot_overwrite_the_authoritative_text(bridge_call):
+    """Phase 6.13's guarantee, kept: once written, an item is done with."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", GOODBYE_PARTIAL, "g1", "completed")
+        final_transcript(bridge, "g1", GOODBYE)
+        await _settle(bridge)
+        # Late, shorter, and for an item that has had its final say.
+        bridge._on_history_item("assistant", GOODBYE_PARTIAL, "g1", None)
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [GOODBYE], written
+
+
+@pytest.mark.trace
+def test_teardown_preserves_the_full_final_sentence(bridge_call):
+    """The goodbye disconnect must not cut the goodbye."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", GOODBYE_PARTIAL, "g1", "completed")
+        final_transcript(bridge, "g1", GOODBYE)
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [GOODBYE], written
+
+
+@pytest.mark.trace
+def test_no_stale_greeting_is_replayed_after_the_final_text(bridge_call):
+    bridge, call_id, _m, _b = bridge_call
+    greeting = "Welcome to ABC Demo Bank. How may I assist you today?"
+
+    async def scenario():
+        bridge._on_history_item("assistant", greeting, "hello", "completed")
+        final_transcript(bridge, "hello", greeting)
+        await _settle(bridge)
+        bridge._on_history_item("assistant", GOODBYE_PARTIAL, "g1", "completed")
+        final_transcript(bridge, "g1", GOODBYE)
+        await _settle(bridge)
+        bridge._on_history_item("assistant", greeting, "hello", None)
+        await bridge._generation_finished()
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [greeting, GOODBYE], written
+
+
+@pytest.mark.trace
+def test_an_interrupted_response_keeps_its_existing_semantics(bridge_call):
+    """Barge-in: one row, the text the provider settled on."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "Your balance is", "i1", "in_progress")
+        bridge._on_history_item("assistant", "Your balance is", "i1", "incomplete")
+        # The provider emits the final transcript for cancelled responses too.
+        final_transcript(bridge, "i1", "Your balance is")
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == ["Your balance is"], written
+
+
+@pytest.mark.trace
+def test_the_fallback_still_writes_when_no_final_transcript_arrives(bridge_call):
+    """A transport that never sends the authoritative event must not lose the turn."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "A whole sentence.", "i1", None)
+        await bridge._generation_finished()
+        await _settle(bridge)
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == ["A whole sentence."], written
+
+
+@pytest.mark.trace
+def test_a_completed_item_with_no_final_transcript_is_still_written_once(bridge_call):
+    """Completion remains a valid last resort when no final text ever comes."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "All done.", "i1", "completed")
+        await bridge._generation_finished()
+        await _settle(bridge)
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == ["All done."], written
+
+
+@pytest.mark.trace
+def test_a_final_transcript_with_no_prior_snapshot_is_still_written(bridge_call):
+    """The authoritative text stands on its own.
+
+    Written rather than ignored: this event *is* the bank's words, and a turn
+    whose snapshots never arrived is still a turn that was spoken. Recording it
+    once is the safe direction to be wrong in; dropping it is not.
+    """
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        final_transcript(bridge, "unannounced", "Words with no snapshot.")
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == ["Words with no snapshot."], written
+
+
+# --- Phase 6.14: the race leaks the PIN, not just its label ----------------
+#
+# Found while writing the ordering tests above, and worse than the defect they
+# were written for.
+#
+# On the PIN turn the expectation is asked for *after* `submit_pin` has already
+# succeeded, so `session.authenticated` is True and `expected_credential`
+# answers None - no credential is expected, because it has just been accepted.
+# A Latin PIN survives that because `looks_like_pin` still recognises the
+# words. A PIN transcribed into another script does not, and D-8 is open again:
+#
+#     call_trace_events.utterance = "فور ایٹ ٹو ون"
+#
+# It held on live call `9cf4e328-...` only because the transcript won that
+# particular race. Nothing guaranteed it would.
+
+URDU_PIN = "فور ایٹ ٹو ون"
+
+
+@pytest.mark.trace
+def test_a_non_latin_pin_is_redacted_even_when_the_tool_wins_the_race(traced, caplog):
+    """The state-driven rule must not depend on who wins."""
+    call = RacingCall()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            call.says(ASK_SAVINGS)
+            call.says(SPOKEN_ID)
+            call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+
+            call.starts_speaking()
+            call.tool("submit_pin", spoken_pin=HEARD_PIN)
+            call.transcript_arrives(URDU_PIN)
+
+        turn = call.events(trace.KIND_TURN)[-1]
+        assert turn["utterance"] == "[PIN REDACTED]", (
+            f"the caller's PIN was stored as {turn['utterance']!r}"
+        )
+        assert turn["intent"] == trace.INTENT_PIN_INPUT
+        assert turn["event_type"] == trace.EVENT_AUTH_INPUT
+
+        assert URDU_PIN not in stored_blob(), "the PIN reached the trace table"
+        assert URDU_PIN not in json.dumps(call.replay(), ensure_ascii=False), (
+            "the PIN reached the replay API"
+        )
+        logged = " ".join(record.getMessage() for record in caplog.records)
+        assert URDU_PIN not in logged, "the PIN reached the logs"
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_a_non_latin_customer_id_is_masked_even_when_the_tool_wins(traced):
+    """The same anchor has to carry the id turn too."""
+    call = RacingCall()
+    try:
+        spoken = "ڈیمو زیرو زیرو ون"
+        call.says(ASK_SAVINGS)
+        call.starts_speaking()
+        call.tool("submit_customer_id", spoken_customer_id=HEARD_ID)
+        call.transcript_arrives(spoken)
+
+        turn = call.events(trace.KIND_TURN)[-1]
+        assert turn["utterance"] == "[Customer ID provided]"
+        assert turn["intent"] == trace.INTENT_CUSTOMER_ID_INPUT
+        assert spoken not in stored_blob()
+    finally:
+        call.close()
+
+
+@pytest.mark.trace
+def test_the_stored_blob_helper_can_actually_see_non_latin_text(traced):
+    """The guard that guards the guard.
+
+    If this fails, every `not in stored_blob()` assertion above is vacuous for
+    any script but Latin.
+    """
+    call = Call()
+    try:
+        call.says(ASK_SAVINGS)
+        blob = stored_blob()
+        assert ASK_SAVINGS in blob
+        assert "\\u" not in blob, "non-ASCII is being escaped; the search is blind"
+    finally:
+        call.close()

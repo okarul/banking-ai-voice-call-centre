@@ -910,6 +910,155 @@ a status-less snapshot followed by generation end - they failed as they should,
 
 ---
 
+## Q-1100 - the caller's words come before the tool they cause (Phase 6.14)
+
+### The live call
+
+`9cf4e328-1cac-1240-4790-eaa5afddeeef`
+
+| Aspect | Status |
+|---|---|
+| **Banking** | **LIVE PASS** - COMPLETED, DEMO001 VERIFIED, `submit_pin` OK 94 ms, `get_account_balance` OK 8 ms, balance correct, `CALLER_GOODBYE` |
+| **PIN privacy** | **LIVE PASS** - stored as `[PIN REDACTED]`, no raw PIN visible |
+| **Non-Latin scope** | **LIVE PASS** - the PIN turn ruled `NON_BANKING_REQUEST` / `scope_allowed=false`, D-10 holding |
+| **Stale assistant replay** | **LIVE PASS** - no greeting replayed after the goodbye, D-11 holding |
+| **Customer-id ordering** | **LIVE FAIL** - see D-12 |
+| **Final assistant completeness** | **LIVE FAIL** - see D-13 |
+
+Four of six hold live, and everything Phase 6.13 shipped is among them. The
+banking result is a pass and stays a pass.
+
+### D-12 - the ruling was late, and it was racing the tool
+
+The call read:
+
+```
+9   TOOL     submit_customer_id  OK
+10  AUTH     PENDING
+11  CUSTOMER "[PIN REDACTED]"   intent=PIN_INPUT
+```
+
+Event 11 is the turn that *supplied the customer id*. It should have been
+`[Customer ID provided]` / `CUSTOMER_ID_INPUT`, and it should have been first.
+
+Phase 6.12.3 froze the credential expectation at the moment a turn is **ruled**,
+which fixed the deferred write. On a voice call the ruling is itself late: the
+model is handed the caller's audio directly and can call `submit_customer_id`
+as soon as it has heard enough, while the transcript comes back from a separate
+ASR pass afterwards. By the time `reserve_turn` asked what credential was
+expected, the tool had already set `candidate_customer_id` - and that window is,
+by definition, "waiting for a PIN".
+
+**It is a race, not a second code path**, and this one call shows both outcomes:
+on the PIN turn the transcript won, so the PIN was redacted correctly; on the
+customer-id turn the tool won, so the id turn was relabelled and filed third.
+Same code, same call, different winner.
+
+### D-12a - the same race persists the PIN
+
+Found while writing the ordering tests, and worse than the defect they were
+written for. When the tool wins on the **PIN** turn, `submit_pin` has already
+succeeded, so `session.authenticated` is True and no credential is expected -
+the state rule answers "none". A Latin PIN survives that on the old text-based
+`looks_like_pin` path. A PIN in another script does not, and D-8 is open again:
+
+```
+call_trace_events.utterance = "فور ایٹ ٹو ون"
+```
+
+It held on `9cf4e328-...` only because the transcript won that particular turn.
+Nothing guaranteed it would. **HIGH privacy defect.**
+
+**The fix for all of it is one anchor.** `trace.anchor_turn` freezes both the
+replay position and the three facts the credential rule reads
+(`authenticated`, `candidate_customer_id`, whether an enquiry is held) at
+`input_audio_buffer.speech_started` - the one instant guaranteed to precede
+anything the model does about this turn, because the model has not heard the
+turn yet. `_expected_credential` now evaluates that frozen state, so no later
+auth state can reinterpret the caller's earlier words. Text turns have no
+speech onset and need none; they fall back to `reserve_turn` unchanged, so
+Channel 1 is untouched. No tool is delayed: the anchor is a dictionary built
+synchronously on an event the pump already handles.
+
+### D-12b - the guard could not see what it was guarding
+
+`stored_blob()` serialised the trace table with `json.dumps` and no
+`ensure_ascii=False`, so non-Latin text became `\uXXXX` escapes and
+`assert spoken not in stored_blob()` - the assertion D-8 rests on - could never
+match a non-Latin PIN. It passed for the right reason; it would not have caught
+D-12a. Repaired, and guarded by PR-003.
+
+### D-13 - terminal is not the same as final
+
+The call closed:
+
+```
+CUSTOMER   "Okay, thank you. Goodbye."
+AGENT      "Thank you for calling ABC Demo"      <- all that was stored
+lifecycle  CALLER_GOODBYE
+```
+
+`agents/realtime/session.py` merges a fuller accumulated transcript into an
+updated item **only when the incoming transcript is falsy**:
+
+```python
+entry_transcript = entry.transcript
+if not entry_transcript:
+    preserved = existing.transcript or self._item_transcripts.get(item_id)
+```
+
+So a `response.output_item.done` carrying a *partial but non-empty* transcript
+skips the merge and replaces the fuller text, and `openai_realtime.py` stamps
+that same item `status="completed"`. Phase 6.13 then did exactly what it was
+built to do - treat completion as terminal, write the row, ignore everything
+after - and what came after was the rest of the sentence.
+
+Phase 6.13 was right about the *item* and wrong to infer the *text* from it.
+The provider publishes the text separately and says so:
+`response.output_audio_transcript.done` carries "the final transcript of the
+audio", and is emitted for interrupted and cancelled responses too. The SDK
+maps only the matching `.delta`, so it is read from the raw stream - the same
+technique Phase 6.11.1 needed for `input_audio_transcription.failed`.
+
+Item status now decides only that the item will not change again. What was
+said is the final transcript, with generation end and teardown as the single
+fallback for a transport that never sends one.
+
+### D-13a - and teardown was cancelling the write
+
+`_note_agent_final_text` scheduled its row onto `self._transitions`, which
+`close()` cancels - so a goodbye whose final transcript arrived a moment before
+the caller hung up lost its row entirely. The same cancellation Phase 6.13
+fixed for the *held* turn, reappearing for the *scheduled* one. Trace writes now
+live in their own set that teardown **waits for** rather than cancels.
+
+| ID | Scenario | Det. | Live | Test | Crit. |
+|---|---|---|---|---|---|
+| AO-001 | The id turn is anchored before the tool mutates auth state | PROTECTED | PENDING | `test_the_id_turn_is_reserved_before_the_tool_mutates_auth_state` | HIGH |
+| AO-002 | The id turn is replayed before the tool event | PROTECTED | PENDING | `test_the_id_turn_is_replayed_before_the_tool_event` | HIGH |
+| AO-003 | The id turn is replayed before the auth transition | PROTECTED | PENDING | `test_the_id_turn_is_replayed_before_the_auth_transition` | HIGH |
+| AO-004 | A worker write landing after the tool cannot relabel it | PROTECTED | PENDING | `test_the_id_turn_survives_a_worker_write_that_lands_after_the_tool` | HIGH |
+| AO-005 | The id turn cannot become a PIN turn once verified | PROTECTED | PENDING | `test_the_id_turn_cannot_become_a_pin_turn_once_the_caller_is_verified` | HIGH |
+| AO-006 | The PIN turn stays a PIN turn when the tool wins | PROTECTED | PENDING | `test_the_pin_turn_is_still_a_pin_turn_when_the_tool_wins_the_race` | HIGH |
+| AO-007 | Both credential turns stay redacted when the tools win | PROTECTED | PENDING | `test_both_credential_turns_stay_redacted_when_the_tools_win` | HIGH |
+| AO-008 | Replay order stays strictly increasing under the race | PROTECTED | PENDING | `test_replay_order_stays_strictly_increasing_when_the_tool_wins` | MED |
+| AO-009 | No tool is delayed to achieve the ordering | PROTECTED | PENDING | `test_no_tool_is_delayed_to_achieve_the_ordering` | HIGH |
+| PR-001 | A non-Latin PIN is redacted even when the tool wins | PROTECTED | PENDING | `test_a_non_latin_pin_is_redacted_even_when_the_tool_wins_the_race` | HIGH |
+| PR-002 | A non-Latin customer id is masked even when the tool wins | PROTECTED | PENDING | `test_a_non_latin_customer_id_is_masked_even_when_the_tool_wins` | HIGH |
+| PR-003 | The leak-detection helper can see non-Latin text | PROTECTED | PENDING | `test_the_stored_blob_helper_can_actually_see_non_latin_text` | HIGH |
+| FT-001 | The live goodbye is stored complete | PROTECTED | PENDING | `test_the_live_goodbye_is_stored_complete` | HIGH |
+| FT-002 | A terminal status does not freeze partial text | PROTECTED | PENDING | `test_a_terminal_status_does_not_freeze_partial_text` | HIGH |
+| FT-003 | The authoritative text is what gets persisted | PROTECTED | PENDING | `test_the_authoritative_text_is_what_gets_persisted` | HIGH |
+| FT-004 | A stale snapshot cannot overwrite the authoritative text | PROTECTED | PENDING | `test_a_stale_snapshot_cannot_overwrite_the_authoritative_text` | HIGH |
+| FT-005 | Teardown preserves the full final sentence | PROTECTED | PENDING | `test_teardown_preserves_the_full_final_sentence` | HIGH |
+| FT-006 | No stale greeting is replayed after the final text | PROTECTED | PENDING | `test_no_stale_greeting_is_replayed_after_the_final_text` | HIGH |
+| FT-007 | An interrupted response keeps its existing semantics | PROTECTED | PENDING | `test_an_interrupted_response_keeps_its_existing_semantics` | MED |
+| FT-008 | The fallback still writes when no final transcript arrives | PROTECTED | PENDING | `test_the_fallback_still_writes_when_no_final_transcript_arrives` | HIGH |
+| FT-009 | A completed item with no final transcript is written once | PROTECTED | PENDING | `test_a_completed_item_with_no_final_transcript_is_still_written_once` | MED |
+| FT-010 | A final transcript with no prior snapshot is still written | PROTECTED | PENDING | `test_a_final_transcript_with_no_prior_snapshot_is_still_written` | MED |
+
+---
+
 ## Open defects
 
 | ID | Defect | Evidence | Status |
@@ -925,6 +1074,11 @@ a status-less snapshot followed by generation end - they failed as they should,
 | **D-9** | Assistant partials were still duplicated and the closing sentence truncated to "Thank you for calling ABC": generation end is not a finished sentence. | live `7d67837b-...`; fixed by writing on the provider's own `RealtimeMessageItem.status == completed`; guarded by CR-009 to CR-013 | **CLOSED deterministically - PENDING live re-proof** |
 | **D-10** | A spoken PIN transcribed into Urdu was ruled `scope_category = SOCIAL`, `scope_allowed = true`. `_normalize` keeps `[a-z0-9]`, so any non-Latin script empties, and `_is_social` returned True for an emptied utterance - a branch meant for filler-only speech. The same held for punctuation-only and empty input. No data was exposed (SOCIAL authorises no lookup), but the gate agreed to a turn it had not read. | live `0989e07a-...`; fixed by one condition in `scope._is_social` - nothing survived normalisation, so it is not courtesy - with no script or language list; `IN_SCOPE` unchanged; guarded by NL-001 to NL-013 | **CLOSED deterministically - PENDING live re-proof** |
 | **D-11** | The trace stored the goodbye, a truncated copy of it, and then the greeting from the top of the call. Completion was not terminal: `_flush_agent_turn` emptied the buffer and remembered nothing, so a later snapshot of an already-written item re-created it, and teardown wrote it again. Found alongside it: `close()` scheduled its final record onto the task list it then cancelled, silently losing an unfinished last sentence. | live `0989e07a-...`; fixed by `bridge._agent_written` (an item written is done with), `incomplete` counted as finished, and an awaited teardown record; guarded by AF-001 to AF-013 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-12** | The caller turn that supplied the customer id was persisted *after* `submit_customer_id` and the AUTH transition, and labelled `PIN_INPUT`. On a voice call the ruling instant - transcript arrival - races the model's own tool call, and `reserve_turn` asks what credential is expected only once the tool has already set `candidate_customer_id`. One live call shows both outcomes of that race. | live `9cf4e328-...`; fixed by `trace.anchor_turn` at `input_audio_buffer.speech_started`, freezing replay position and credential state before the model has heard the turn; guarded by AO-001 to AO-009 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-12a** | The same race persists the credential: when the tool wins on the PIN turn, `authenticated` is already True, no credential is expected, and a non-Latin PIN is written to `call_trace_events.utterance` in clear. D-8 re-opened by timing. **HIGH privacy defect.** | found deterministically while writing the D-12 tests; fixed by the same anchor; guarded by PR-001 and PR-002 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-12b** | `stored_blob()` escaped non-ASCII, so the D-8 assertion `spoken not in stored_blob()` could never detect a non-Latin PIN in the table - it passed for the right reason but could not have caught D-12a. | test-integrity defect; helper repaired with `ensure_ascii=False`; guarded by PR-003 | **CLOSED** |
+| **D-13** | The closing sentence was stored as "Thank you for calling ABC Demo". A `response.output_item.done` carrying a partial but non-empty transcript defeats the SDK's own merge, which preserves the fuller accumulated text only when the incoming one is falsy - and that same item is stamped `completed`, which Phase 6.13 treated as the text being final. | live `9cf4e328-...`; fixed by taking the text from the provider's `response.output_audio_transcript.done` ("the final transcript of the audio"), read raw because the SDK maps only `.delta`; item status now decides only that the item will not change; guarded by FT-001 to FT-010 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-13a** | The new final-transcript write was scheduled onto the task list `close()` cancels, so a goodbye finishing moments before hang-up lost its row - the Phase 6.13 teardown cancellation, reappearing for the scheduled write instead of the held one. | found deterministically by FT-005; fixed by `_settle_trace_writes`, which teardown awaits rather than cancels | **CLOSED deterministically - PENDING live re-proof** |
 
 ## Open decision
 

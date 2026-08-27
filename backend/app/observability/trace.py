@@ -216,13 +216,41 @@ def expected_credential(session, decision=None) -> str | None:
     cleared by nothing until the call ends, so between that and verification
     the bank is waiting for a PIN. A caller who says something else in that
     window is over-redacted, which is the right direction to be wrong in.
+
+    **Which state, though.** Asked of the session as it stands, this reads
+    whatever the call has become by the time the question is put - and on a
+    voice call that can be later than the caller's own words. See
+    `anchor_turn`, which freezes the three facts below at the instant the
+    caller starts speaking, and `_expected_credential`, which is where the rule
+    actually lives so that it can be asked of a frozen state as easily as a
+    live one.
     """
-    if session is None or getattr(session, "authenticated", False):
+    return _expected_credential(_credential_state(session), decision)
+
+
+def _credential_state(session) -> dict:
+    """The three facts about the bank's position that decide what a turn is.
+
+    Copied out rather than referenced, because the session keeps moving and
+    this answer must not.
+    """
+    if session is None:
+        return {"authenticated": True, "candidate": False, "enquiry_held": False}
+    return {
+        "authenticated": bool(getattr(session, "authenticated", False)),
+        "candidate": bool(getattr(session, "candidate_customer_id", None)),
+        "enquiry_held": _enquiry_held(session),
+    }
+
+
+def _expected_credential(state: dict, decision=None) -> str | None:
+    """The rule itself, over a state that may be frozen or live."""
+    if state["authenticated"]:
         return None
 
     category = getattr(getattr(decision, "category", None), "value", None)
 
-    if getattr(session, "candidate_customer_id", None):
+    if state["candidate"]:
         # Unless the caller plainly asked the bank something instead. Four
         # digits cannot become a balance enquiry: a supported intent needs an
         # action word and a domain, so nothing credential-shaped can leave by
@@ -234,7 +262,7 @@ def expected_credential(session, decision=None) -> str | None:
 
     # The bank has asked who is calling - it is holding an enquiry it cannot
     # answer yet - and this turn is not itself an enquiry. It is the answer.
-    if category in (None, "NON_BANKING_REQUEST", "SOCIAL") and _enquiry_held(session):
+    if category in (None, "NON_BANKING_REQUEST", "SOCIAL") and state["enquiry_held"]:
         return CREDENTIAL_CUSTOMER_ID
 
     return None
@@ -506,6 +534,59 @@ def reserve_turn(session, decision) -> dict | None:
     return {
         "sequence": _next_sequence(session),
         "expected": expected_credential(session, decision),
+    }
+
+
+def anchor_turn(session) -> dict | None:
+    """Freeze the caller's turn at the instant they begin speaking.
+
+    `reserve_turn` freezes at the instant the turn is *ruled*, which Phase
+    6.12.3 established is early enough on a text turn and, it turns out, not on
+    a voice one. The model is handed the caller's audio directly and can call
+    `submit_customer_id` as soon as it has heard enough; the transcript comes
+    back from a separate ASR pass afterwards. So by the time the ruling asks
+    "what credential is expected?", the tool has already set
+    `candidate_customer_id` - and that window is, by definition, "waiting for a
+    PIN". The caller's own words are then filed behind the tool they caused and
+    labelled as the credential they had not yet been asked for.
+
+    Live call `9cf4e328-1cac-1240-4790-eaa5afddeeef` shows both outcomes of
+    that race in a single call: on the PIN turn the transcript won and the PIN
+    was redacted correctly; on the customer-id turn the tool won and the id
+    turn was relabelled `PIN_INPUT` and filed third. Same code, same call - and
+    when the losing side is a PIN in a script `looks_like_pin` cannot read, the
+    consequence is not a wrong label but the PIN itself in the database.
+
+    The speech-onset event is the one instant that is *guaranteed* to precede
+    anything the model does about this turn, because the model has not heard
+    the turn yet. Both the replay position and the credential state are taken
+    here, and nothing later can reinterpret them.
+
+    Nothing is delayed: it is a dictionary, built synchronously, on an event
+    the pump already handles.
+    """
+    if not settings.trace_enabled:
+        return None
+    return {
+        "sequence": _next_sequence(session),
+        "state": _credential_state(session),
+    }
+
+
+def resolve_turn(session, decision, anchor: dict | None = None) -> dict | None:
+    """What this turn is, preferring the anchor taken before the model acted.
+
+    Falls back to `reserve_turn` when there is no anchor - a text turn, which
+    has no speech onset and needs none: nothing can run between the words
+    arriving and the ruling, because they arrive together.
+    """
+    if not settings.trace_enabled:
+        return None
+    if anchor is None:
+        return reserve_turn(session, decision)
+    return {
+        "sequence": anchor["sequence"],
+        "expected": _expected_credential(anchor["state"], decision),
     }
 
 

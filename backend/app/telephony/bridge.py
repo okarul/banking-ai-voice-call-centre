@@ -83,8 +83,15 @@ def _item_text(item) -> str:
 #     persists no transcript today; when it does, this cue must be excluded.
 GREETING_CUE = "Hello?"
 
-# Provider statuses that mean the message will not grow again.
+# Provider statuses that mean the *item* will not change again. They say
+# nothing about whether its text is finished: see `_note_agent_final_text`.
 _FINISHED_STATUSES = frozenset({"completed", "incomplete"})
+
+# The provider's own name for "this is the final transcript of what was said".
+# The installed SDK maps only the matching `.delta`, so this is read from the
+# raw event stream - the same way Phase 6.11.1 had to read
+# `conversation.item.input_audio_transcription.failed`.
+FINAL_AGENT_TRANSCRIPT = "response.output_audio_transcript.done"
 
 
 class PhoneCallBridge:
@@ -200,6 +207,10 @@ class PhoneCallBridge:
         # Item ids already written to the trace. A finished turn is
         # finished: see `_note_agent_text`.
         self._agent_written: set[str] = set()
+        # Trace writes already in flight. Held separately from `_transitions`
+        # because `close` *cancels* that list, and a row the bank has already
+        # said is not a transition to abandon - see `_settle_trace_writes`.
+        self._trace_writes: set = set()
 
     # --- the model's side ----------------------------------------------------
 
@@ -396,12 +407,16 @@ class PhoneCallBridge:
         to retry from, and the call waits for an acknowledgement that cannot
         come.
         """
-        # A backstop, not the signal. A message that told us it was completed
-        # has already been written; one that never carries a status - an older
-        # transport, a loopback in a test - is written here, because otherwise
-        # nothing would ever write it.
+        # A backstop, not the signal. The signal is the provider's final
+        # transcript. This catches the turn whose transcript never arrived -
+        # an older transport, a loopback in a test - and the item the provider
+        # marked finished without ever saying what was in it.
+        #
+        # A message still `in_progress` is left alone: generation end arrives
+        # while the transcript is being filled in, which is the whole reason it
+        # is not the signal.
         held = self._agent_turn
-        if held is not None and held.get("status") is None:
+        if held is not None and held.get("status") != "in_progress":
             self._flush_agent_turn()
         await self.lifecycle.on_generation_ended()
         await self._close_if_authentication_is_over()
@@ -522,9 +537,16 @@ class PhoneCallBridge:
         if isinstance(server_event, dict):
             kind = server_event.get("type")
             transcript = server_event.get("transcript")
+            item_id = server_event.get("item_id")
         else:
             kind = getattr(server_event, "type", None)
             transcript = getattr(server_event, "transcript", None)
+            item_id = getattr(server_event, "item_id", None)
+
+        if kind == FINAL_AGENT_TRANSCRIPT:
+            self._note_agent_final_text(item_id, transcript or "")
+            return
+
         if kind != "conversation.item.input_audio_transcription.completed":
             return
         self._on_caller_text(transcript or "")
@@ -674,14 +696,57 @@ class PhoneCallBridge:
                 "status": status,
             }
 
-        # The provider says this message will not grow again. That is the
-        # signal to write it - not the end of generation, which arrives while
-        # the transcript is still being filled in and left the live trace
-        # holding "Thank you for calling ABC". `incomplete` counts too: a
-        # response the caller talked over stopped mid-sentence, and a turn that
-        # stopped is as finished as one that ended.
-        if self._agent_turn["status"] in _FINISHED_STATUSES:
+        # And it is *not* written here, however finished the item claims to
+        # be. Phase 6.13 wrote on `completed` and live call
+        # `9cf4e328-1cac-1240-4790-eaa5afddeeef` stored "Thank you for calling
+        # ABC Demo" for a goodbye the bank said in full.
+        #
+        # `agents/realtime/session.py` merges a fuller accumulated transcript
+        # into an updated item **only when the incoming one is falsy** - so a
+        # `response.output_item.done` carrying a partial but non-empty
+        # transcript replaces the fuller text, and `openai_realtime.py` stamps
+        # that same item `completed`. Terminal item, unfinished sentence.
+        #
+        # So the item's status decides only that it will not change again. What
+        # was actually said is `_note_agent_final_text`, with generation end and
+        # teardown as the fallback for a transport that never says it.
+
+    def _note_agent_final_text(self, item_id, text: str) -> None:
+        """The provider's final transcript for one assistant item.
+
+        This is the authoritative text and the moment to write the row: the
+        provider has said the sentence is finished, which is a different claim
+        from the item being finished, and the only one that can be trusted
+        about words. It is emitted for interrupted and cancelled responses too,
+        so a turn the caller talked over is written from the same signal as one
+        that ran to the end.
+
+        It replaces whatever was held rather than competing with it on length -
+        "longest wins" is a guess used while a turn is still growing, and this
+        is not a guess.
+        """
+        if not text:
+            return
+        if not settings.trace_enabled:
+            return
+
+        # Already written and already said. Nothing arriving now is news.
+        if item_id is not None and item_id in self._agent_written:
+            return
+
+        held = self._agent_turn
+        if held is not None and held["item_id"] != item_id:
+            # A different item is finishing; whatever was held is over.
             self._flush_agent_turn()
+            held = None
+
+        if held is None:
+            self._agent_turn = {"item_id": item_id, "text": text, "status": "final"}
+        else:
+            held["text"] = text
+            held["status"] = "final"
+
+        self._flush_agent_turn()
 
     def _take_agent_turn(self) -> dict | None:
         """Hand over the held turn and close the book on it."""
@@ -724,11 +789,20 @@ class PhoneCallBridge:
         invents a customer utterance.
 
         Scheduled, never awaited: this runs on the audio event loop, and the
-        write goes to PostgreSQL.
+        write goes to PostgreSQL. The task is remembered so that teardown can
+        wait for it rather than cancel it.
         """
         record = self._agent_turn_record(text)
-        if record is not None:
-            self._schedule(record)
+        if record is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - no loop during shutdown
+            record.close()
+            return
+        task = loop.create_task(record)
+        self._trace_writes.add(task)
+        task.add_done_callback(self._trace_writes.discard)
 
     def _agent_turn_record(self, text: str):
         """The trace record itself, for a caller that will schedule or await it.
@@ -1092,8 +1166,13 @@ class PhoneCallBridge:
             # A last sentence still being held is still a sentence the bank
             # said. Written before the pumps stop, so the replay ends where the
             # call did - and awaited, because the task list it would otherwise
-            # be scheduled on is stopped three lines below.
+            # be scheduled on is stopped a few lines below.
             await self._flush_agent_turn_now()
+
+            # And so is one already on its way. A goodbye's final transcript
+            # can arrive a moment before the caller hangs up, and cancelling
+            # its write would lose the last thing the bank said.
+            await self._settle_trace_writes()
 
             await self.lifecycle.close()
             self._stop_tasks(self._transitions, current)
@@ -1119,6 +1198,22 @@ class PhoneCallBridge:
         for task in list(tasks):
             if task is not current:
                 task.cancel()
+
+    async def _settle_trace_writes(self) -> None:
+        """Let the trace rows already in flight finish landing.
+
+        Never cancelled, unlike the pumps: these are writes of things that were
+        actually said, and the call ending is not a reason to drop them. A
+        failure here is swallowed for the same reason a pump failure is - the
+        transport still has to be released.
+        """
+        for task in list(self._trace_writes):
+            if task is asyncio.current_task():
+                continue
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     @staticmethod
     async def _stop_and_await(tasks, current) -> None:

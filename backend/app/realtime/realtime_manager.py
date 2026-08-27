@@ -43,6 +43,8 @@ logger = logging.getLogger("app.realtime")
 
 # Where the per-call set of already-recorded turns lives on the session.
 _RECORDED_TURNS = "_recorded_turn_items"
+# The caller turn frozen at speech onset, before the model heard it.
+_TURN_ANCHOR = "_trace_turn_anchor"
 
 
 class RealtimeStage(str, Enum):
@@ -614,6 +616,16 @@ class RealtimeManager:
                 raw_kind = inner.get("type")
                 if raw_kind == "input_audio_buffer.speech_started":
                     open_turn(session)
+                    # The caller has started talking and the model has not yet
+                    # heard them, so nothing can have acted on this turn. That
+                    # makes this the only instant at which the trace can ask
+                    # what the bank was waiting for and get an answer the rest
+                    # of the turn cannot contradict. See `trace.anchor_turn`.
+                    from app.observability import trace
+
+                    session.conversation_context[_TURN_ANCHOR] = trace.anchor_turn(
+                        session
+                    )
                 elif raw_kind == (
                     "conversation.item.input_audio_transcription.failed"
                 ):
@@ -665,16 +677,21 @@ class RealtimeManager:
         if item_id in seen:
             return None
         seen.add(item_id)
+        # Taken when the caller started speaking, before the model could reach
+        # for anything. Consumed here so a turn uses its own anchor and no
+        # other.
+        anchor = session.conversation_context.pop(_TURN_ANCHOR, None)
         # The words travel with the ruling, for the trace. Whether they are
         # written down at all is `app.observability.trace`'s decision, not
         # this layer's - it only stops them being unavailable.
         #
-        # The replay position is taken *now*, while this turn is being ruled
-        # and before the model can call anything, so the caller's words keep
-        # their place ahead of the tool they cause.
+        # The replay position and the credential expectation both come from the
+        # anchor taken at speech onset where there is one, so the caller's words
+        # keep their place ahead of the tool they cause even when the model
+        # acted before the transcript came back.
         from app.observability import trace
 
-        return session, decision, text, trace.reserve_turn(session, decision)
+        return session, decision, text, trace.resolve_turn(session, decision, anchor)
 
     async def _shutdown(self, connection: RealtimeConnection) -> None:
         """Release provider resources for one call, tolerating failures."""
