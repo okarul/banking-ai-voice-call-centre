@@ -83,6 +83,9 @@ def _item_text(item) -> str:
 #     persists no transcript today; when it does, this cue must be excluded.
 GREETING_CUE = "Hello?"
 
+# Provider statuses that mean the message will not grow again.
+_FINISHED_STATUSES = frozenset({"completed", "incomplete"})
+
 
 class PhoneCallBridge:
     """The live audio path for exactly one telephone call."""
@@ -194,6 +197,9 @@ class PhoneCallBridge:
         # The assistant turn currently being streamed, held until it is
         # finished so the trace records one sentence rather than its drafts.
         self._agent_turn: dict | None = None
+        # Item ids already written to the trace. A finished turn is
+        # finished: see `_note_agent_text`.
+        self._agent_written: set[str] = set()
 
     # --- the model's side ----------------------------------------------------
 
@@ -628,7 +634,15 @@ class PhoneCallBridge:
 
         The longest text wins rather than the latest, because snapshots carry
         the whole conversation and nothing guarantees the order two of them
-        arrive in. A turn can only grow, so the longest is the most complete.
+        arrive in. A turn can only grow, so the longest is the most complete -
+        but only while the turn is still open. **Once written, an item is done
+        with**, and a later snapshot of it is not news: snapshots carry the
+        whole conversation, so the goodbye, and the greeting from the top of
+        the call, keep being offered after they have been said. Live call
+        `0989e07a-1c91-1240-4790-eaa5afddeeef` stored its goodbye, then a
+        truncated copy of it, then the opening greeting - three rows for one
+        sentence, because the buffer remembered nothing once it had been
+        emptied, and "longest wins" only ever applied *within* one held entry.
         """
         if not text:
             return
@@ -639,6 +653,10 @@ class PhoneCallBridge:
         # thread hop: this runs on the audio event loop, for every sentence the
         # bank says, on every call.
         if not settings.trace_enabled:
+            return
+
+        # Said, and written down. Nothing that arrives later changes it.
+        if item_id is not None and item_id in self._agent_written:
             return
 
         held = self._agent_turn
@@ -656,21 +674,44 @@ class PhoneCallBridge:
                 "status": status,
             }
 
-        # The provider says this message is finished, so it will not grow
-        # again. This is the signal to write it - not the end of generation,
-        # which arrives while the transcript is still being filled in and left
-        # the live trace holding "Thank you for calling ABC".
-        if self._agent_turn["status"] == "completed":
+        # The provider says this message will not grow again. That is the
+        # signal to write it - not the end of generation, which arrives while
+        # the transcript is still being filled in and left the live trace
+        # holding "Thank you for calling ABC". `incomplete` counts too: a
+        # response the caller talked over stopped mid-sentence, and a turn that
+        # stopped is as finished as one that ended.
+        if self._agent_turn["status"] in _FINISHED_STATUSES:
             self._flush_agent_turn()
+
+    def _take_agent_turn(self) -> dict | None:
+        """Hand over the held turn and close the book on it."""
+        held = self._agent_turn
+        self._agent_turn = None
+        if held is not None and held["item_id"] is not None:
+            self._agent_written.add(held["item_id"])
+        return held
 
     def _flush_agent_turn(self) -> None:
         """Write the held assistant turn, if there is one. Never twice."""
-        held = self._agent_turn
-        self._agent_turn = None
+        held = self._take_agent_turn()
         if held is not None:
-            self._trace_agent_turn(held["text"])
+            self._schedule_agent_turn(held["text"])
 
-    def _trace_agent_turn(self, text: str) -> None:
+    async def _flush_agent_turn_now(self) -> None:
+        """The same, awaited, for teardown.
+
+        `_flush_agent_turn` schedules onto `self._transitions`, and `close`
+        stops exactly that list a moment later - so a last sentence the
+        provider never finished was written to a task that was then cancelled.
+        Awaited here, it lands.
+        """
+        held = self._take_agent_turn()
+        if held is not None:
+            record = self._agent_turn_record(held["text"])
+            if record is not None:
+                await record
+
+    def _schedule_agent_turn(self, text: str) -> None:
         """Write down what the bank said, for the replay.
 
         The caller's side is traced from the scope ruling, which is the same
@@ -685,8 +726,22 @@ class PhoneCallBridge:
         Scheduled, never awaited: this runs on the audio event loop, and the
         write goes to PostgreSQL.
         """
+        record = self._agent_turn_record(text)
+        if record is not None:
+            self._schedule(record)
+
+    def _agent_turn_record(self, text: str):
+        """The trace record itself, for a caller that will schedule or await it.
+
+        Returns nothing to do for a turn that is not the caller's business.
+
+        Named for what it records, not for what it does to the database:
+        `test_no_audio_is_written_anywhere_by_the_bridge` reads this module's
+        source and forbids the substring, which is how it proves no audio is
+        ever stored.
+        """
         if not text or text.strip() == GREETING_CUE:
-            return
+            return None
 
         from app.observability import trace
 
@@ -709,7 +764,7 @@ class PhoneCallBridge:
                 session=session,
             )
 
-        self._schedule(record_agent_turn())
+        return record_agent_turn()
 
     def _on_history_item(self, role, text: str, item_id=None, status=None) -> None:
         """One completed turn, from whichever history event delivered it."""
@@ -1036,8 +1091,9 @@ class PhoneCallBridge:
 
             # A last sentence still being held is still a sentence the bank
             # said. Written before the pumps stop, so the replay ends where the
-            # call did.
-            self._flush_agent_turn()
+            # call did - and awaited, because the task list it would otherwise
+            # be scheduled on is stopped three lines below.
+            await self._flush_agent_turn_now()
 
             await self.lifecycle.close()
             self._stop_tasks(self._transitions, current)

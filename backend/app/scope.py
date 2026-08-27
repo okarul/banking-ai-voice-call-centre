@@ -416,7 +416,24 @@ def _is_social(padded: str) -> bool:
     Matching a greeting *inside* a sentence is not enough: "translate hello
     into French" contains a greeting but is a translation request. So the whole
     utterance must reduce to courtesy once filler words are removed.
+
+    Reducing to *nothing at all* is a different thing, and not courtesy.
+    `_normalize` keeps `[a-z0-9]`, so an utterance spoken in any script but
+    Latin comes back as whitespace - and on live call
+    `0989e07a-1c91-1240-4790-eaa5afddeeef` a PIN transcribed into Urdu was
+    ruled SOCIAL, which is in scope, for that reason alone. The rule below is
+    the language-independent one: something was said, and none of it was read,
+    so the gate has no grounds to call it a pleasantry. It falls through to
+    `NON_BANKING_REQUEST` with everything else nobody could act on - which is
+    already where a PIN read out in English lands.
+
+    Filler-only speech is unaffected: "well, please" survives normalisation and
+    is emptied a line later, by `_COURTESY_FILLER`, which is the case the empty
+    branch was written for.
     """
+    if not padded.strip():
+        return False
+
     tokens = [word for word in padded.split() if word not in _COURTESY_FILLER]
     if not tokens:
         return True

@@ -777,6 +777,139 @@ record the original ruling.
 
 ---
 
+## Q-1000 - a gate that cannot read a turn is not agreeing to it (Phase 6.13)
+
+### The live call
+
+`0989e07a-1c91-1240-4790-eaa5afddeeef`
+
+| Aspect | Status |
+|---|---|
+| **Banking** | **LIVE PASS** - DEMO001 verified, savings balance answered, clean goodbye |
+| **Credential privacy** | **LIVE PASS** - the PIN turn stored as `[PIN REDACTED]`, D-8 holding |
+| **Auth ordering** | **LIVE PASS** - caller turn, then the tool it caused, then the transition; D-8's ordering half holding |
+| **Trace finalization** | **LIVE FAILED** - see D-11 |
+| **Non-Latin scope** | **LIVE FAILED** - see D-10 |
+
+Three of the five hold live, and the two that Phase 6.12.3 shipped are among
+them. The banking result is a pass and stays a pass: neither defect below
+touched a banking tool, an authentication decision, or the media path.
+
+### D-10 - four digits in Urdu were ruled a pleasantry
+
+The same PIN turn that was correctly masked, correctly labelled `PIN_INPUT` and
+correctly ordered carried these raw gate fields:
+
+```
+scope_category = SOCIAL
+scope_allowed  = true
+```
+
+`scope._normalize` keeps `[a-z0-9]`, so an utterance in any script but Latin
+comes back as whitespace. `_is_social` then opened with
+
+```python
+tokens = [word for word in padded.split() if word not in _COURTESY_FILLER]
+if not tokens:
+    return True
+```
+
+a branch written for speech that is *entirely* courtesy filler - "well,
+please" - which also caught "nothing survived normalisation at all". SOCIAL is
+one of the five in-scope categories, so the gate admitted a turn it had not
+read. Punctuation-only, whitespace-only and empty input took the same path.
+
+**No customer data was exposed.** Authentication and ownership are enforced in
+the tool layer; SOCIAL authorises no lookup. The defect is that the gate said
+yes for a reason that was not true.
+
+**Fixed language-independently, in one condition**: `_is_social` returns False
+when nothing survived normalisation. Something was said and none of it was
+read, so there are no grounds to call it courtesy; it falls through to
+`NON_BANKING_REQUEST`, which is already where a PIN read out in English lands.
+Filler-only speech is untouched - "well, please" survives `_normalize` and is
+emptied a line later by `_COURTESY_FILLER`, which is the case that branch was
+written for.
+
+**No script list, no language list, no number words.** A list would have had to
+be right about the next language too. `IN_SCOPE` is unchanged and no permission
+was widened - the change can only move a turn *out* of scope.
+
+A known and accepted limit: an utterance that is part Latin courtesy and part
+unreadable ("Hello" + four digits in another script) still reads as SOCIAL,
+because the greeting genuinely survived. SOCIAL authorises nothing, so this
+admits no data; ruling on partial loss would mean guessing how much loss is too
+much, and there is no non-arbitrary answer. NL-013 pins that it must never
+become a banking category.
+
+### D-11 - a finished turn was not finished
+
+The trace stored the goodbye three times:
+
+```
+1. "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodbye."
+2. "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodb"
+3. "Welcome to ABC Demo Bank. Thank you for calling. How may I assist ..."
+```
+
+One root cause behind all three: **completion was not terminal.**
+`_flush_agent_turn` emptied the buffer and remembered nothing, so a later
+snapshot of an item that had already been written simply re-created it - and
+the "longest text wins" guard only ever applied *within* one held entry, so a
+shorter, later snapshot won by default. Snapshots carry the whole conversation,
+which is why row 3 is the greeting from the top of the call arriving after the
+goodbye.
+
+The bridge now records which item ids it has written and ignores them
+afterwards. `incomplete` joins `completed` as a finishing status: a response the
+caller talked over stopped mid-sentence, and a turn that stopped is as finished
+as one that ended.
+
+**A third defect surfaced while reproducing this one.** `close()` called
+`_flush_agent_turn`, which schedules onto `self._transitions`, and then stopped
+exactly that list three lines later - so the last sentence of a turn the
+provider never finished was written to a task that was immediately cancelled.
+Not a duplicate: a silent loss, and invisible on `0989e07a-...` because that
+call's goodbye did complete. Teardown now awaits its own record.
+
+### On the fail-before-fix evidence
+
+The first two lifecycle tests written for D-11 passed against `038cb9a`, which
+would have made them worthless as proof. The reason was the cancellation above:
+they drove the duplicate through `close()`, whose write never landed, so the
+duplicate could not appear. Rewritten to drive it the way the live call did -
+a status-less snapshot followed by generation end - they failed as they should,
+7 of 13 rather than 3. The bug they now describe is the bug that happened.
+
+| ID | Scenario | Det. | Live | Test | Crit. |
+|---|---|---|---|---|---|
+| NL-001 | Ten unreadable scripts are not courtesy, verified and unverified | PROTECTED | PENDING | `test_speech_that_does_not_survive_normalisation_is_not_courtesy` | HIGH |
+| NL-002 | Unreadable speech lands in the existing refusal category | PROTECTED | PENDING | `test_unreadable_speech_lands_in_the_existing_refusal_category` | HIGH |
+| NL-003 | The set of in-scope categories is unchanged | PROTECTED | PENDING | `test_the_set_of_in_scope_categories_is_unchanged` | HIGH |
+| NL-004 | Real courtesy is still courtesy | PROTECTED | PENDING | `test_real_courtesy_is_still_courtesy` | HIGH |
+| NL-005 | Supported banking is still supported | PROTECTED | PENDING | `test_supported_banking_is_still_supported` | HIGH |
+| NL-006 | An identified caller is still an authentication turn | PROTECTED | PENDING | `test_an_identified_caller_is_still_an_authentication_turn` | HIGH |
+| NL-007 | Another customer is still refused | PROTECTED | PENDING | `test_another_customer_is_still_refused` | HIGH |
+| NL-008 | An attack is still an attack | PROTECTED | PENDING | `test_an_attack_is_still_an_attack` | HIGH |
+| NL-009 | Genuinely empty input is still refused | PROTECTED | PENDING | `test_genuinely_empty_input_is_still_refused` | MED |
+| NL-010 | Latin mixed with unreadable text still reads the Latin | PROTECTED | PENDING | `test_latin_text_mixed_with_unreadable_text_still_reads_the_latin` | HIGH |
+| NL-013 | A greeting beside unreadable text is not admitted blindly | PROTECTED | PENDING | `test_a_greeting_with_unreadable_text_beside_it_is_not_admitted_blindly` | MED |
+| AF-001 | One message streamed in pieces is one row | PROTECTED | PENDING | `test_one_message_streamed_in_pieces_is_one_row` | HIGH |
+| AF-002 | Two messages in sequence are two rows | PROTECTED | PENDING | `test_two_messages_in_sequence_are_two_rows` | HIGH |
+| AF-003 | A completed item is not rewritten by generation end | PROTECTED | PENDING | `test_a_completed_item_is_not_written_again_by_generation_end` | HIGH |
+| AF-004 | A completed item is not rewritten at teardown | PROTECTED | PENDING | `test_a_completed_item_is_not_written_again_by_teardown` | HIGH |
+| AF-005 | A completed goodbye survives generation end intact | PROTECTED | PENDING | `test_a_completed_goodbye_survives_generation_end_intact` | HIGH |
+| AF-006 | Live row 2: a truncated snapshot after completion is ignored | PROTECTED | PENDING | `test_a_truncated_snapshot_after_completion_is_ignored` | HIGH |
+| AF-007 | Live row 3: a stale greeting is never replayed | PROTECTED | PENDING | `test_a_stale_greeting_is_never_replayed` | HIGH |
+| AF-008 | Only the unfinished item is owed at the end | PROTECTED | PENDING | `test_only_the_current_item_is_flushed_at_teardown` | HIGH |
+| AF-009 | A transport that never reports completion still writes once | PROTECTED | PENDING | `test_a_transport_that_never_reports_completion_still_writes_once` | MED |
+| AF-010 | A completion after the fallback wrote it is ignored | PROTECTED | PENDING | `test_a_completion_arriving_after_the_fallback_wrote_it_is_ignored` | HIGH |
+| AF-011 | Many responses are each stored once | PROTECTED | PENDING | `test_many_responses_with_distinct_ids_are_each_stored_once` | MED |
+| AF-012 | An interrupted response is written once and not replayed | PROTECTED | PENDING | `test_an_interrupted_response_is_written_once_and_not_replayed` | HIGH |
+| AF-013 | The longest text still wins before the turn is written | PROTECTED | PENDING | `test_the_longest_text_still_wins_before_the_turn_is_written` | MED |
+
+---
+
 ## Open defects
 
 | ID | Defect | Evidence | Status |
@@ -790,6 +923,8 @@ record the original ruling.
 | **D-7** | The trace did not read like the call: a streamed reply was stored as three growing rows, PIN and customer-id turns were labelled `NON_BANKING_REQUEST`, and multi-phrase goodbyes landed in a banking refusal category. Presentation only - the banking result on `62cdd16f-...` was correct throughout. | fixed by `bridge._note_agent_text` / `_flush_agent_turn` and `trace.describe_turn`; the gate's own ruling is still recorded; guarded by TN-101 to TN-114 | **CLOSED deterministically - PENDING live re-proof** |
 | **D-8** | The caller's PIN was persisted in clear. Transcribed into Urdu script, it matched no number-word pattern, so `redact_transcript` returned it verbatim - while `submit_pin` succeeded on the same turn. **HIGH privacy defect.** | live `7d67837b-...`; fixed by `trace.expected_credential` (state, not words) and `trace.reserve_turn` (frozen at ruling time, before the PIN is accepted); guarded by CR-001 to CR-008 | **CLOSED deterministically - PENDING live re-proof** |
 | **D-9** | Assistant partials were still duplicated and the closing sentence truncated to "Thank you for calling ABC": generation end is not a finished sentence. | live `7d67837b-...`; fixed by writing on the provider's own `RealtimeMessageItem.status == completed`; guarded by CR-009 to CR-013 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-10** | A spoken PIN transcribed into Urdu was ruled `scope_category = SOCIAL`, `scope_allowed = true`. `_normalize` keeps `[a-z0-9]`, so any non-Latin script empties, and `_is_social` returned True for an emptied utterance - a branch meant for filler-only speech. The same held for punctuation-only and empty input. No data was exposed (SOCIAL authorises no lookup), but the gate agreed to a turn it had not read. | live `0989e07a-...`; fixed by one condition in `scope._is_social` - nothing survived normalisation, so it is not courtesy - with no script or language list; `IN_SCOPE` unchanged; guarded by NL-001 to NL-013 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-11** | The trace stored the goodbye, a truncated copy of it, and then the greeting from the top of the call. Completion was not terminal: `_flush_agent_turn` emptied the buffer and remembered nothing, so a later snapshot of an already-written item re-created it, and teardown wrote it again. Found alongside it: `close()` scheduled its final record onto the task list it then cancelled, silently losing an unfinished last sentence. | live `0989e07a-...`; fixed by `bridge._agent_written` (an item written is done with), `incomplete` counted as finished, and an awaited teardown record; guarded by AF-001 to AF-013 | **CLOSED deterministically - PENDING live re-proof** |
 
 ## Open decision
 

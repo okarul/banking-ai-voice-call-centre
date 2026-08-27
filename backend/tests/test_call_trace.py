@@ -1946,3 +1946,258 @@ def test_a_pin_written_down_after_it_was_accepted_is_still_redacted(traced):
         assert spoken not in json.dumps(call.replay(), ensure_ascii=False)
     finally:
         call.close()
+
+
+# === Phase 6.13: a finished assistant turn is finished for good ============
+#
+# Live call `0989e07a-1c91-1240-4790-eaa5afddeeef` stored its goodbye three
+# times over:
+#
+#   1. "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodbye."
+#   2. "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodb"
+#   3. "Welcome to ABC Demo Bank. Thank you for calling. How may I assist..."
+#
+# One root cause behind all three: **completion was not terminal.**
+# `_flush_agent_turn` cleared the buffer and remembered nothing, so a later
+# snapshot for an item that had already been written simply re-created the
+# buffer - and the "longest text wins" guard only ever applied *within* one
+# held entry, so a shorter, later snapshot won by default. Teardown then
+# flushed whatever happened to be held, which is how a truncated duplicate and
+# a greeting from the top of the call arrived after the goodbye.
+
+
+@pytest.mark.trace
+def test_one_message_streamed_in_pieces_is_one_row(bridge_call):
+    bridge, call_id, _m, _b = bridge_call
+    final = "Let me check that for your savings account."
+
+    drive_with_status(
+        bridge,
+        [("Let me check", "in_progress"),
+         ("Let me check that for your", "in_progress"),
+         (final, "completed")],
+    )
+
+    written = agent_events(call_id)
+    assert len(written) == 1
+    assert written[0]["utterance"] == final
+
+
+@pytest.mark.trace
+def test_two_messages_in_sequence_are_two_rows(bridge_call):
+    bridge, call_id, _m, _b = bridge_call
+
+    drive_with_status(bridge, [("First, complete.", "completed")], item_id="i1")
+    drive_with_status(bridge, [("Second, complete.", "completed")], item_id="i2")
+
+    assert [e["utterance"] for e in agent_events(call_id)] == [
+        "First, complete.",
+        "Second, complete.",
+    ]
+
+
+@pytest.mark.trace
+def test_a_completed_item_is_not_written_again_by_generation_end(bridge_call):
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "All done.", "i1", "completed")
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    assert len(agent_events(call_id)) == 1
+
+
+@pytest.mark.trace
+def test_a_completed_item_is_not_written_again_by_teardown(bridge_call):
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "All done.", "i1", "completed")
+        await _settle(bridge)
+        # The same item offered once more as the call winds down.
+        bridge._on_history_item("assistant", "All done.", "i1", None)
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    assert len(agent_events(call_id)) == 1
+
+
+@pytest.mark.trace
+def test_a_completed_goodbye_survives_generation_end_intact(bridge_call):
+    """Live row 1 kept, live row 2 prevented."""
+    bridge, call_id, _m, _b = bridge_call
+    goodbye = "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodbye."
+
+    async def scenario():
+        bridge._on_history_item("assistant", goodbye, "goodbye-item", "completed")
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = agent_events(call_id)
+    assert len(written) == 1
+    assert written[0]["utterance"] == goodbye
+
+
+@pytest.mark.trace
+def test_a_truncated_snapshot_after_completion_is_ignored(bridge_call):
+    """Live row 2, exactly: the same item, arriving again and shorter."""
+    bridge, call_id, _m, _b = bridge_call
+    goodbye = "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodbye."
+    truncated = "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodb"
+
+    async def scenario():
+        bridge._on_history_item("assistant", goodbye, "goodbye-item", "completed")
+        await _settle(bridge)
+        # Out of order, shorter, and carrying no status - which is what a
+        # `history_added` item looks like, and what reaches the fallback.
+        bridge._on_history_item("assistant", truncated, "goodbye-item", None)
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [goodbye], f"a finished turn was rewritten: {written}"
+
+
+@pytest.mark.trace
+def test_a_stale_greeting_is_never_replayed(bridge_call):
+    """Live row 3, exactly: the top of the call arriving after the goodbye."""
+    bridge, call_id, _m, _b = bridge_call
+    greeting = "Welcome to ABC Demo Bank. Thank you for calling. How may I assist you today?"
+    goodbye = "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodbye."
+
+    async def scenario():
+        bridge._on_history_item("assistant", greeting, "greeting-item", "completed")
+        await _settle(bridge)
+        bridge._on_history_item("assistant", goodbye, "goodbye-item", "completed")
+        await _settle(bridge)
+        # A late snapshot re-offers the greeting, with no status, and the
+        # model finishes generating.
+        bridge._on_history_item("assistant", greeting, "greeting-item", None)
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [greeting, goodbye], f"the call replayed itself: {written}"
+
+
+@pytest.mark.trace
+def test_only_the_current_item_is_flushed_at_teardown(bridge_call):
+    """A finished item and an unfinished one. Teardown owes only the unfinished."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "Finished answer.", "i1", "completed")
+        await _settle(bridge)
+        bridge._on_history_item("assistant", "Still speaking", "i2", None)
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    assert [e["utterance"] for e in agent_events(call_id)] == [
+        "Finished answer.",
+        "Still speaking",
+    ]
+
+
+@pytest.mark.trace
+def test_a_transport_that_never_reports_completion_still_writes_once(bridge_call):
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "A whole sentence.", "i1", None)
+        await bridge._generation_finished()
+        await _settle(bridge)
+        # And once more, after the fallback already owed it.
+        bridge._on_history_item("assistant", "A whole sentence.", "i1", None)
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = agent_events(call_id)
+    assert len(written) == 1
+    assert written[0]["utterance"] == "A whole sentence."
+
+
+@pytest.mark.trace
+def test_a_completion_arriving_after_the_fallback_wrote_it_is_ignored(bridge_call):
+    """The fallback already owed this item. The provider agreeing changes nothing."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "A whole sentence.", "i1", None)
+        await bridge._generation_finished()
+        await _settle(bridge)
+        bridge._on_history_item("assistant", "A whole sentence.", "i1", "completed")
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    assert len(agent_events(call_id)) == 1
+
+
+@pytest.mark.trace
+def test_many_responses_with_distinct_ids_are_each_stored_once(bridge_call):
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        for n in range(5):
+            bridge._on_history_item("assistant", f"Answer {n}.", f"i{n}", "completed")
+            await _settle(bridge)
+        # Every one of them offered again, at the end of the call.
+        for n in range(5):
+            bridge._on_history_item("assistant", f"Answer {n}.", f"i{n}", None)
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [f"Answer {n}." for n in range(5)], written
+
+
+@pytest.mark.trace
+def test_an_interrupted_response_is_written_once_and_not_replayed(bridge_call):
+    """Barge-in: the turn stops mid-sentence. It is still one turn."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "Your balance is", "i1", "in_progress")
+        # The caller talks over it; the model abandons the response.
+        bridge._on_history_item("assistant", "Your balance is", "i1", "incomplete")
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == ["Your balance is"], written
+
+
+@pytest.mark.trace
+def test_the_longest_text_still_wins_before_the_turn_is_written(bridge_call):
+    """Out-of-order snapshots before completion must not truncate the row."""
+    bridge, call_id, _m, _b = bridge_call
+
+    drive_with_status(
+        bridge,
+        [("The complete sentence, all of it.", "in_progress"),
+         ("The complete", "in_progress"),
+         ("The complete sentence, all of it.", "completed")],
+    )
+
+    written = agent_events(call_id)
+    assert len(written) == 1
+    assert written[0]["utterance"] == "The complete sentence, all of it."
