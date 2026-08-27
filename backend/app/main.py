@@ -38,15 +38,59 @@ logger = logging.getLogger("app.main")
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Startup housekeeping for the operations dashboard.
+    """Bring this process up: schema first, then housekeeping.
 
-    Banking sessions live in memory, so a restart ended every call the previous
-    process was carrying — but their operational rows survive in PostgreSQL and
-    would otherwise sit at ACTIVE for ever, showing an operator agents that
-    nobody is on. Safe if it fails: the recorder swallows its own errors, and a
-    dashboard that is briefly wrong must never stop the API from starting.
+    **Schema before anything can ask for it.** The declared tables are created
+    or completed here, through the one canonical initialiser, because nothing
+    else in production ever did. `create_tables` was reachable only from
+    `seed_database`, which a deployment runs at most once — so a release that
+    declared a new table shipped code that queried it against a database that
+    had never been told about it. That is not hypothetical: Phase 6.12 added
+    `call_trace_events`, the deployment did not run the seed, and the first
+    request for a call trace returned 500 with `relation ... does not exist`.
+    Hanging it here fixes every future additive table by the same act, with no
+    table named anywhere in this file.
+
+    Awaited, not scheduled: startup does not complete until the schema is
+    usable, so no request can be served against a half-built database. Run on a
+    worker thread because the initialiser is synchronous SQLAlchemy DDL and the
+    event loop is not the place for it.
+
+    **A schema failure does not stop the process.** This application already
+    starts with PostgreSQL offline on purpose — importing it opens no
+    connection, and `/health` answers so a restart loop cannot be triggered by a
+    database blip. Killing startup here would trade that for a crash loop, and
+    restarting fixes neither an unreachable database nor a broken migration. So
+    the failure is recorded instead, and `/ready` reports it: liveness stays up,
+    readiness goes red, and traffic stops arriving at a process that cannot
+    serve it.
+
+    **Then the dashboard housekeeping.** Banking sessions live in memory, so a
+    restart ended every call the previous process was carrying — but their
+    operational rows survive in PostgreSQL and would otherwise sit at ACTIVE
+    for ever, showing an operator agents that nobody is on. Safe if it fails:
+    the recorder swallows its own errors, and a dashboard that is briefly wrong
+    must never stop the API from starting.
     """
-    from app.observability import recorder
+    import asyncio
+
+    from app.database.seed import ensure_schema
+    from app.observability import readiness, recorder
+
+    try:
+        await asyncio.to_thread(ensure_schema)
+        readiness.record_schema_initialisation(ready=True)
+        logger.info("startup: database schema verified")
+    except Exception as error:
+        # Type only, never the exception text: a connection failure renders the
+        # connection string, password included.
+        logger.error(
+            "startup: database schema initialisation failed (%s)",
+            type(error).__name__,
+        )
+        readiness.record_schema_initialisation(
+            ready=False, reason="initialisation_failed"
+        )
 
     recorder.reconcile_active_sessions()
     yield

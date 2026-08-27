@@ -514,7 +514,18 @@ def test_readiness_reports_each_dependency(app_client):
     assert response.status_code == 200
     body = response.json()
     assert body["ready"] is True
-    assert set(body["checks"]) == {"database", "realtime", "telephony", "capacity"}
+    # `schema` joined this set in Phase 6.12.1, deliberately. Readiness used to
+    # ask only whether the database answered `SELECT 1`, and so reported a
+    # process ready while the table its own code queried did not exist - which
+    # is exactly what happened on the deployment of 6a1d1af. A reachable
+    # database is not the same as a usable one.
+    assert set(body["checks"]) == {
+        "database",
+        "schema",
+        "realtime",
+        "telephony",
+        "capacity",
+    }
 
 
 def test_readiness_never_opens_a_paid_realtime_session(app_client, monkeypatch):

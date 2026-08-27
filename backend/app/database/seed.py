@@ -222,6 +222,42 @@ DEMO_CUSTOMERS: list[dict] = [
 ]
 
 
+# Whether this process has already verified the schema. Set only on success,
+# so a startup that failed because the database was down retries on the next
+# one rather than remembering a lie.
+_schema_verified = False
+
+
+def ensure_schema() -> None:
+    """Verify or create the declared schema, once per process.
+
+    The production entry point. `create_tables` is the canonical initialiser and
+    stays the only place that knows how to build anything; this adds the one
+    thing a long-lived server needs on top of it — the guarantee that it has run
+    before requests are served, and the guarantee that it runs only once.
+
+    Once per process rather than once per application, because building a second
+    `FastAPI` app in the same interpreter is something tests do constantly and
+    production does never. Re-running the reflection each time would put tens of
+    milliseconds on the startup of every test that builds an app, for a schema
+    that cannot have changed underneath a running process.
+
+    Raises whatever the initialiser raises. The caller decides what a failure
+    means; this does not swallow it.
+    """
+    global _schema_verified
+    if _schema_verified:
+        return
+    create_tables()
+    _schema_verified = True
+
+
+def reset_schema_guard() -> None:
+    """Forget that the schema was verified. For tests that drop a table."""
+    global _schema_verified
+    _schema_verified = False
+
+
 def create_tables() -> None:
     """Create any tables that do not exist yet, and add any missing columns.
 
@@ -238,6 +274,7 @@ def create_tables() -> None:
     engine = get_engine()
     Base.metadata.create_all(engine)
     _add_missing_columns(engine)
+    _add_declared_indexes(engine)
     _add_missing_indexes(engine)
 
 
@@ -269,6 +306,43 @@ def _add_missing_columns(engine) -> list[str]:
                 text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
             )
         added.append(f"{table}.{column}")
+
+    return added
+
+
+def _add_declared_indexes(engine) -> list[str]:
+    """Create any index the models declare that an existing table lacks.
+
+    `create_all` builds a table's indexes at the moment it builds the table,
+    and does nothing at all for a table that is already there. So an index
+    declared on a table that already exists — added by a later phase, or
+    dropped by hand — is never created, which is the same shape of defect as a
+    declared table nobody creates: the models say it is there and the database
+    disagrees.
+
+    The index objects are asked to create themselves, so nothing here repeats a
+    `CREATE INDEX` that the model has already written down. `checkfirst` makes
+    it safe to run against a database that has them.
+
+    Additive only: an index the models no longer declare is left alone, because
+    dropping things is not this function's business.
+    """
+    from sqlalchemy import inspect as sqla_inspect
+
+    inspector = sqla_inspect(engine)
+    present = set(inspector.get_table_names())
+    added = []
+
+    for table in Base.metadata.sorted_tables:
+        if table.name not in present:
+            # `create_all` has just built it, indexes and all.
+            continue
+        existing = {index["name"] for index in inspector.get_indexes(table.name)}
+        for index in table.indexes:
+            if index.name in existing:
+                continue
+            index.create(bind=engine, checkfirst=True)
+            added.append(index.name)
 
     return added
 

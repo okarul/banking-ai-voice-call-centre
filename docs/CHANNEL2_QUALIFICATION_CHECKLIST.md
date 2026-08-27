@@ -520,8 +520,76 @@ unlimited setting: `_positive_int` refuses zero.
 | TR-021 | Expired traces are purged | PROTECTED | PENDING | `test_expired_traces_are_purged` | MED |
 | TR-022 | Retention is bounded by configuration | PROTECTED | PENDING | `test_retention_is_bounded_by_configuration` | MED |
 
-Every Q-600 row is `PENDING` live: the trace exists to be read during the next
-UAT, and it has not been read during one yet.
+Every Q-600 row is `PENDING` live, and the first live attempt does not change
+that: the call made against `6a1d1af` could not have proved trace replay,
+because `call_trace_events` did not exist on that deployment (see D-6). The
+trace has still never been read during a UAT.
+
+---
+
+## Q-700 - the schema a deployment ships with (Phase 6.12.1)
+
+### D-6 - production startup never created the schema it declared
+
+`6a1d1af` was deployed. The first request for a call trace answered **HTTP
+500**:
+
+```
+GET /api/telephony/calls/<provider_call_id>/trace
+psycopg.errors.UndefinedTable: relation "call_trace_events" does not exist
+```
+
+Nothing was wrong with the trace. `create_tables()` - the canonical additive
+initialiser, which knows perfectly well how to create that table - was
+reachable from exactly one place, `seed_database()`, and a deployment runs that
+at most once, long before the table was declared. The FastAPI lifespan did no
+schema work at all: it reconciled stale sessions and yielded.
+
+So the defect is not about tracing. **Any release that declares a new table
+ships code that queries a database which has never been told the table exists.**
+Phase 6.12 was simply the first release to do it.
+
+**Two things it exposed, both fixed generally and neither naming a table:**
+
+* `app.database.seed.ensure_schema()` - the production entry point, awaited in
+  the lifespan before startup completes and before any request can be served.
+  It calls `create_tables()` and nothing else, so no DDL is written twice, and
+  it runs once per process rather than once per application.
+* `_add_declared_indexes()` - `create_all` builds a table's indexes only when
+  it builds the table, so an index declared on a table that already exists was
+  never created either. The same defect, one level down. The index objects are
+  asked to create themselves; nothing repeats a `CREATE INDEX` the model has
+  already written.
+
+**Failure policy.** A schema failure does not stop the process. This
+application deliberately starts with PostgreSQL offline - importing it opens no
+connection, and `/health` answers - and killing startup would trade a database
+blip for a crash loop that fixes neither an unreachable database nor a bad
+migration. The failure is logged with the exception *type* only (a connection
+error renders the connection string, password included) and `/ready` reports
+it. Liveness stays up; readiness goes red; traffic stops arriving.
+
+**Readiness was also wrong, and is now right.** It checked `SELECT 1` and
+nothing else, so it reported this process ready for the entire life of the
+defect: the database was reachable, and the table the application needed was
+absent. It now verifies that every declared table exists, and reports a count
+rather than names.
+
+| ID | Scenario | Det. | Live | Test | Crit. |
+|---|---|---|---|---|---|
+| SS-001 | Startup creates a newly declared table (fail-before-fix) | PROTECTED | - | `test_startup_creates_a_newly_declared_table` | HIGH |
+| SS-002 | Startup creates every declared table, not just the new one | PROTECTED | PENDING | `test_startup_creates_every_declared_table_not_just_the_new_one` | HIGH |
+| SS-003 | Startup does not drop or rewrite existing data | PROTECTED | PENDING | `test_startup_does_not_drop_or_rewrite_existing_data` | HIGH |
+| SS-004 | Repeated startups are safe | PROTECTED | PENDING | `test_repeated_startups_are_safe` | HIGH |
+| SS-005 | The initialiser is idempotent | PROTECTED | PENDING | `test_the_initialiser_is_idempotent` | MED |
+| SS-006 | The schema is verified once per process | PROTECTED | PENDING | `test_the_schema_is_verified_once_per_process` | MED |
+| SS-007 | A failed verification is retried, not remembered | PROTECTED | PENDING | `test_a_failed_verification_is_retried_rather_than_remembered` | HIGH |
+| SS-008 | Missing declared indexes are restored by startup | PROTECTED | PENDING | `test_missing_indexes_are_restored_by_startup` | HIGH |
+| SS-009 | Readiness reports a missing table | PROTECTED | PENDING | `test_readiness_reports_a_missing_table` | HIGH |
+| SS-010 | Readiness reports a failed startup initialisation | PROTECTED | PENDING | `test_readiness_reports_a_failed_startup_initialisation` | HIGH |
+| SS-011 | A schema failure does not stop the process starting | PROTECTED | PENDING | `test_a_schema_failure_does_not_stop_the_process_starting` | HIGH |
+| SS-012 | No connection detail reaches the startup log | PROTECTED | PENDING | `test_no_connection_detail_reaches_the_startup_log` | HIGH |
+| SS-013 | A trace can be written and replayed after startup | PROTECTED | PENDING | `test_a_trace_can_be_written_and_replayed_after_startup` | HIGH |
 
 ---
 
@@ -534,6 +602,7 @@ UAT, and it has not been read during one yet.
 | **D-3** | A verified DEMO001 was refused their own savings balance, intermittently, decided by which tool the model called first. Live calls `26faddf0-...` and `730747e1-...` on `67c3c71`: `get_account_balance` FAILED, `duration_ms = 0`, no database lookup reached. | fixed by `turn_gate._hold_unverified_enquiry`; guarded by BD-001 to BD-022 | **CLOSED - the ordering defect did not recur live on `ac2343f`; see D-5 for the timing defect underneath it** |
 | **D-4** | A hang-up could cancel its own cleanup: `tear_down` aborted after the bridge left `phone_call_registry` and before `voice_call_manager.close()`, stranding an open provider session and its capacity slot with no path to reclaim either - on `REALTIME_MAX_ACTIVE_SESSIONS = 1`, one dropped socket from refusing every later caller. | traced in a failing run (`tear_down RAISED CancelledError`); fixed by `service._uninterruptible` and `service.end_media_call`; guarded by TD-001 to TD-005 | **CLOSED deterministically - PENDING live re-proof** |
 | **D-5** | A caller turn that never transcribed left the scope gate open for the rest of the call, so a verified DEMO001 with a held Savings enquiry was refused `TURN_NOT_CLASSIFIED` after the full 4.0 s wait. The gate was opened by a VAD onset and closed only by a transcript with words in it - not the same guarantee. | live call `3860a81f-1bc5-1240-4790-eaa5afddeeef` (FAILED twice, ~4 s each); reproduced offline at 4061 ms; fixed by `turn_gate.resumes_held_enquiry` and `turn_gate.record_unintelligible_turn`; guarded by TN-001 to TN-017 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-6** | Production startup never invoked the canonical additive schema initialiser, so a release that declared a new table shipped code querying a database that had never been told it existed. `call_trace_events` was absent after deploying `6a1d1af` and trace replay answered HTTP 500. Readiness reported the process ready throughout. | live: `UndefinedTable: relation "call_trace_events" does not exist`; fixed by `seed.ensure_schema()` in the lifespan plus `_add_declared_indexes`; readiness now verifies declared tables; guarded by SS-001 to SS-013 | **CLOSED deterministically - PENDING live re-proof** |
 
 ## Open decision
 

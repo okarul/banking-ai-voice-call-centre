@@ -45,6 +45,62 @@ def _database() -> dict:
         return {"ready": False, "reason": "unreachable"}
 
 
+# What startup made of the schema, if startup has run in this process. `None`
+# means it has not — a direct call in a test, say — and the check below then
+# answers from the database rather than from an assumption.
+_startup_schema_failure: str | None = None
+
+
+def record_schema_initialisation(*, ready: bool, reason: str | None = None) -> None:
+    """Remember how startup's schema initialisation went.
+
+    Called once, from the lifespan. A process that could not build its schema
+    must not then report itself ready to take calls: the database is reachable,
+    `SELECT 1` answers, and the tables the application needs are not there.
+    That is precisely the shape of the Phase 6.12.1 live defect.
+    """
+    global _startup_schema_failure
+    _startup_schema_failure = None if ready else (reason or "initialisation_failed")
+
+
+def _schema() -> dict:
+    """Whether every table this application declares actually exists.
+
+    Answered from the database, not from a flag, so it stays true for a process
+    whose startup never ran and for one whose database changed underneath it.
+    One reflection query, on an endpoint a monitor polls every few seconds.
+
+    Only counts are reported. A table name is not a secret, but this module's
+    rule is a fixed vocabulary and a number, and there is no reason to make an
+    exception for the one check most likely to fire during a bad deployment.
+    """
+    if _startup_schema_failure is not None:
+        return {"ready": False, "reason": _startup_schema_failure}
+
+    try:
+        from sqlalchemy import inspect
+
+        from app.database.connection import get_engine
+        from app.database.models import Base
+
+        existing = set(inspect(get_engine()).get_table_names())
+        missing = set(Base.metadata.tables) - existing
+        if missing:
+            # Names go to the log, where an operator can act on them; the
+            # response says how many.
+            logger.error(
+                "readiness: schema incomplete, %d table(s) missing: %s",
+                len(missing),
+                ", ".join(sorted(missing)),
+            )
+            return {"ready": False, "reason": "tables_missing", "missing": len(missing)}
+        return {"ready": True}
+    except Exception as error:
+        # Type only. A connection error carries the connection string.
+        logger.error("readiness: schema unverifiable (%s)", type(error).__name__)
+        return {"ready": False, "reason": "unverifiable"}
+
+
 def _realtime_configuration() -> dict:
     """Configured, not proven. See the module docstring for why."""
     if not getattr(settings, "openai_api_key", None):
@@ -105,6 +161,7 @@ def readiness_report() -> dict:
     """Every dependency, and one verdict over them."""
     checks = {
         "database": _database(),
+        "schema": _schema(),
         "realtime": _realtime_configuration(),
         "telephony": _telephony(),
         "capacity": _capacity(),
