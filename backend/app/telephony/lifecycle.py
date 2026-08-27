@@ -175,6 +175,20 @@ class CallLifecycle:
             self._generation_ended = True
 
     @property
+    def closing(self) -> bool:
+        """Whether this call has decided to end, for whatever reason.
+
+        Read by the bridge to stop feeding the model a conversation that is
+        over. Exposed rather than duplicated, for the same reason
+        `generation_ended` is: two flags for one fact drift apart.
+
+        True from the moment closure is armed - by the caller's goodbye, by the
+        assistant's own closing line, by silence, or by an authentication
+        ending - and not merely once the line has dropped.
+        """
+        return self._closing_for is not None
+
+    @property
     def generation_ended(self) -> bool:
         """Whether the model has finished generating the current turn.
 

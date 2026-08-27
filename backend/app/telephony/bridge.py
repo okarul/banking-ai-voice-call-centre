@@ -207,6 +207,9 @@ class PhoneCallBridge:
         # Item ids already written to the trace. A finished turn is
         # finished: see `_note_agent_text`.
         self._agent_written: set[str] = set()
+        # Caller frames received after the call decided to end. Drained, never
+        # forwarded - see `_pump_caller_to_model`.
+        self.frames_after_closing = 0
         # Trace writes already in flight. Held separately from `_transitions`
         # because `close` *cancels* that list, and a row the bank has already
         # said is not a transition to abandon - see `_settle_trace_writes`.
@@ -967,6 +970,28 @@ class PhoneCallBridge:
                     break
                 self.frames_from_caller += 1
                 self.last_activity = time.monotonic()
+
+                # The conversation is over. Everything after that point is
+                # still received, still drained, and deliberately not offered
+                # to the model.
+                #
+                # Live call `1790e545-1cca-1240-4790-eaa5afddeeef` recognised
+                # the caller's goodbye and then answered two more turns,
+                # because arming closure never stopped the audio. Worse than
+                # untidy: each reply that begins while closing resets
+                # `_generation_ended`, and the hang-up waits on the drain that
+                # follows generation - so every extra answer pushed the ending
+                # further away, and the last one was still being generated when
+                # the line finally dropped.
+                #
+                # The lifecycle already states the rule - "a caller who speaks
+                # over the closing line does not stop it" - and refuses to
+                # reopen a CLOSING call. This is the same rule applied one
+                # layer earlier, where the question is asked.
+                if self.conversation.closing or self.lifecycle.closing:
+                    self.frames_after_closing += 1
+                    continue
+
                 try:
                     await self._realtime.send_audio(
                         self.banking_session_id, codec.telephony_to_model(frame)

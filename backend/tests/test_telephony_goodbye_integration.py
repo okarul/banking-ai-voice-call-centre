@@ -35,7 +35,7 @@ from app.database.models import AgentSession, AgentToolEvent, ConversationMessag
 from app.realtime.realtime_manager import RealtimeConnection, RealtimeManager
 from app.sessions import session_manager
 from app.telephony.bridge import PhoneCallBridge
-from app.telephony.lifecycle import EndReason
+from app.telephony.lifecycle import CallState, EndReason
 from app.telephony.media import LoopbackMediaTransport
 
 
@@ -171,8 +171,13 @@ class FakeSession:
 class Realtime:
     def __init__(self):
         self.messages = []
+        # Phase 6.15 counts what actually reaches the model, because "the
+        # caller's goodbye was recognised" and "the model stopped being asked
+        # questions" turned out to be different facts.
+        self.audio_frames = 0
 
     async def send_audio(self, session_id, audio):
+        self.audio_frames += 1
         return None
 
     async def send_message(self, session_id, text):
@@ -730,3 +735,183 @@ def test_a_terminal_goodbye_before_audio_end_still_waits_for_playback():
 
     assert reason is EndReason.CALLER_GOODBYE
     assert ended == [EndReason.CALLER_GOODBYE.value]
+
+
+# === Phase 6.15: armed is not the same as enforced =========================
+#
+# Live call `1790e545-1cca-1240-4790-eaa5afddeeef` recognised the caller's
+# goodbye and then kept going:
+#
+#     seq 20  CUSTOMER  "Yeah, your balance is correct. Thank you. Goodbye."
+#                       domain=CLOSING intent=END_CALL
+#     seq 21  AGENT     "I do not hear anything from you. Thank you."
+#     seq 23  CUSTOMER  "OK."
+#     seq 24  CUSTOMER  "The balance is correct, thank you."
+#     seq 25  AGENT     "You're most welcome. Is"          <- cut off
+#     seq 26  CALLER_GOODBYE
+#
+# seq 21 is *not* the silence path. That path sets `_closing_for =
+# CALLER_SILENT` and the call then ends CALLER_SILENT; this one ended
+# CALLER_GOODBYE. `is_canonical_closing` and `is_terminal_goodbye` are both
+# False for that sentence, so it armed nothing either. It is the model quoting
+# a line that lives in its own instructions.
+#
+# What actually happened is simpler and worse: `arm_goodbye` arms closure and
+# waits for playback, but nothing stops the caller's audio reaching the model.
+# `_pump_caller_to_model` is an unconditional `while True: send_audio(...)`, so
+# seq 23 and seq 24 were forwarded and the model answered them. And every reply
+# that starts while CLOSING resets `_generation_ended`, which postpones the
+# very drain that ends the call - so each extra answer pushes the hang-up
+# further away, and seq 25 was still being generated when the line finally
+# dropped.
+#
+# The contract this violates is its own: "A caller who speaks over the closing
+# line does not stop it. The bank has said goodbye; reopening the conversation
+# here would leave a call nothing ever ends."
+
+
+def _terminal_bridge(call_id):
+    """A bridge with the caller's goodbye already recognised."""
+    session = session_manager.create_session()
+    realtime = Realtime()
+    transport = LoopbackMediaTransport()
+    bridge = PhoneCallBridge(
+        provider_call_id=call_id,
+        banking_session_id=session.session_id,
+        transport=transport,
+        realtime_manager=realtime,
+        outbound_max_frames=200,
+    )
+    return bridge, realtime, transport
+
+
+def test_no_caller_audio_reaches_the_model_after_the_terminal_decision():
+    """The live defect, at its source.
+
+    Once the caller has asked to leave, what they say next must not become a
+    new question for the bank to answer.
+    """
+
+    async def scenario():
+        bridge, realtime, transport = _terminal_bridge("term-audio")
+        await bridge.start()
+        try:
+            transport.inbound.put(PCM)
+            await asyncio.sleep(0.05)
+            before = realtime.audio_frames
+            assert before > 0, "the pump was not forwarding audio to begin with"
+
+            bridge._read_caller_intent(GOODBYE)
+            await asyncio.sleep(0.05)
+            assert bridge.conversation.goodbye_armed is True
+
+            for _ in range(5):
+                transport.inbound.put(PCM)
+            await asyncio.sleep(0.1)
+
+            assert realtime.audio_frames == before, (
+                f"{realtime.audio_frames - before} frames reached the model "
+                "after the caller asked to end the call"
+            )
+        finally:
+            await bridge.close()
+
+    run(scenario())
+
+
+def test_the_caller_speaking_after_the_goodbye_starts_no_new_response():
+    """seq 23 and seq 24: heard, recorded, and not answered."""
+
+    async def scenario():
+        bridge, realtime, transport = _terminal_bridge("term-speech")
+        await bridge.start()
+        try:
+            bridge._read_caller_intent(GOODBYE)
+            await asyncio.sleep(0.05)
+
+            # The caller carries on, exactly as they did live.
+            bridge._on_caller_text("OK.")
+            bridge._on_caller_text("The balance is correct, thank you.")
+            for _ in range(5):
+                transport.inbound.put(PCM)
+            await asyncio.sleep(0.1)
+
+            assert realtime.audio_frames == 0, (
+                "the model was still being fed after the terminal decision"
+            )
+            assert bridge.lifecycle.state is CallState.CLOSING
+        finally:
+            await bridge.close()
+
+    run(scenario())
+
+
+def test_no_silence_prompt_follows_a_terminal_goodbye():
+    """The silence cue must never be sent once closure is armed."""
+
+    async def scenario():
+        bridge, realtime, transport = _terminal_bridge("term-silence")
+        bridge.lifecycle._silence_seconds = 0.05
+        await bridge.start()
+        try:
+            bridge._read_caller_intent(GOODBYE)
+            await asyncio.sleep(0.25)
+
+            assert speech.SILENCE_CLOSING_CUE not in realtime.messages, (
+                "a silent-caller cue was sent to a call that had said goodbye"
+            )
+            assert bridge.lifecycle.silence_prompts == 0
+        finally:
+            await bridge.close()
+
+    run(scenario())
+
+
+def test_the_live_shaped_race_still_ends_on_the_caller_goodbye():
+    """END_CALL, the reply begins, the caller speaks again, the call ends.
+
+    The ending must stay CALLER_GOODBYE and must still wait for the reply to
+    finish playing - the 6.6/6.7 contract, unchanged.
+    """
+    ended, reason, armed = run(
+        drive(
+            [
+                caller_started(),
+                RawModelEvent(TranscriptionCompleted("user-1", GOODBYE)),
+                # The bank's closing reply begins.
+                Simple("audio", audio=Simple("audio", data=PCM)),
+                # The caller talks over it, as they did live.
+                caller_started(),
+                RawModelEvent(TranscriptionCompleted("user-2", "OK.")),
+                RawModelEvent(
+                    TranscriptionCompleted(
+                        "user-3", "The balance is correct, thank you."
+                    )
+                ),
+                HistoryAdded(Item("assistant-close", "assistant",
+                                  "Thank you for calling. Goodbye.")),
+                Simple("audio_end"),
+            ],
+            call_id="term-race",
+        )
+    )
+
+    assert armed is True
+    assert reason is EndReason.CALLER_GOODBYE, reason
+    assert ended == [EndReason.CALLER_GOODBYE.value], ended
+
+
+def test_capacity_is_reclaimed_after_the_terminal_goodbye():
+    """The slot must come back however much the caller said on the way out."""
+
+    async def scenario():
+        bridge, realtime, transport = _terminal_bridge("term-capacity")
+        await bridge.start()
+        bridge._read_caller_intent(GOODBYE)
+        await asyncio.sleep(0.05)
+        bridge._on_caller_text("OK.")
+        await bridge.close()
+        assert bridge.closed is True
+        assert transport.ended is True
+
+    run(scenario())

@@ -1059,6 +1059,123 @@ live in their own set that teardown **waits for** rather than cancels.
 
 ---
 
+## Q-1200 - armed is not enforced (Phase 6.15)
+
+### The live call
+
+`1790e545-1cca-1240-4790-eaa5afddeeef`
+
+| Aspect | Status |
+|---|---|
+| **Banking** | **LIVE PASS** - COMPLETED, DEMO001 VERIFIED, 4 tools, `get_authentication_status` 4 ms, `submit_customer_id` 0 ms, `submit_pin` 110 ms, `get_account_balance` 10 ms, Savings balance correct and confirmed by the caller, `CALLER_GOODBYE` |
+| **Authentication** | **LIVE PASS** |
+| **Customer-ID semantics** | **LIVE PASS** - `[Customer ID provided]` / `CUSTOMER_ID_INPUT` / `auth_input` |
+| **Customer-ID sequence ordering** | **LIVE PASS** - seq 7 CUSTOMER, seq 8 TOOL, seq 9 AUTH |
+| **PIN privacy** | **LIVE PASS** |
+| **PIN semantics** | **LIVE PASS** - `[PIN REDACTED]` / `PIN_INPUT` |
+| **PIN sequence ordering** | **LIVE PASS** - seq 11 CUSTOMER, seq 13 TOOL, seq 14 AUTH VERIFIED |
+| **Non-Latin scope** | **LIVE PASS** |
+| **Balance** | **LIVE PASS** |
+| **CALLER_GOODBYE** | **LIVE PASS** |
+| **Assistant response identity** | **NOT A DEFECT** - see below |
+| **Terminal-goodbye post-END_CALL activity** | **LIVE FAIL** - see D-14 |
+| **Truncated terminal assistant trace** | **LIVE FAIL** - consequence of D-14 |
+
+Phase 6.14 is live-proven: the customer-ID turn is now masked, labelled and
+**sequenced ahead of the tool it caused**, and the PIN turn likewise. Sequence
+order is authoritative for replay; `created_at` may trail it because
+persistence is asynchronous, and that is expected.
+
+### Not a defect - the two balance answers
+
+seq 16 and seq 18 answered the balance twice, ten seconds apart:
+
+```
+seq 16  "... an available balance of 12,450.75 SGD."
+seq 18  "... an available balance of 12,450 dollars and 75 cents in SGD."
+```
+
+The obvious reading - one response written twice - is wrong, and five
+independent facts say so:
+
+* since Phase 6.13 the bridge remembers every item id it has written and
+  refuses it afterwards, and **every** write path goes through that check, so
+  two rows can only mean two provider items;
+* the same mechanism excludes the "one item, two representations" reading: an
+  audio transcript and a history rendering of one item share its id, so the
+  second is ignored rather than written;
+* it excludes a replay or fallback origin for the same reason;
+* the two renderings differ, and one generation produces one transcript;
+* only two cues can start a response - the greeting and the silent-caller cue -
+  and both are once-only.
+
+So these are two genuine model responses and the trace is right to hold both.
+**Deduplication is by identity, never by wording**, and RI-004 pins that two
+responses saying exactly the same thing stay two rows. No change was made here;
+the nine RI tests are regression coverage, not a fix.
+
+### D-14 - the call kept talking after it had decided to stop
+
+```
+seq 20  CUSTOMER  "Yeah, your balance is correct. Thank you. Goodbye."
+                  domain=CLOSING intent=END_CALL
+seq 21  AGENT     "I do not hear anything from you. Thank you."
+seq 23  CUSTOMER  "OK."
+seq 24  CUSTOMER  "The balance is correct, thank you."
+seq 25  AGENT     "You're most welcome. Is"          <- cut off
+seq 26  CALLER_GOODBYE
+```
+
+**seq 21 is not the silence path.** Driving the real `CallLifecycle` shows that
+path sets `_closing_for = CALLER_SILENT` and the call then ends
+`CALLER_SILENT`; this call ended `CALLER_GOODBYE`. `is_canonical_closing` and
+`is_terminal_goodbye` are both False for that sentence, so it armed nothing
+either. It is the model quoting a line that lives in its own instructions.
+
+`classify(seq20)` returns `END_CALL` - the same classifier the bridge uses - so
+`arm_goodbye` did run. But arming only decides *when to hang up*. Nothing
+stopped the caller's audio: `_pump_caller_to_model` was an unconditional
+`while True: send_audio(...)`, so seq 23 and seq 24 were forwarded and the
+model answered them.
+
+And each reply that begins while CLOSING resets `_generation_ended`, because
+the lifecycle rightly treats it as the closing line starting to play. The
+hang-up waits on the drain that follows generation - so **every extra answer
+pushed the ending further away**, and seq 25 was still being generated when the
+line finally dropped. That is also the whole of the third symptom: the
+truncated terminal row is not a persistence defect but a response that should
+never have started, whose final transcript could not arrive because the session
+was gone. The fallback wrote the best known text once, as designed.
+
+**The fix applies the lifecycle's own rule one layer earlier.** The lifecycle
+already refuses to reopen a CLOSING call - "a caller who speaks over the
+closing line does not stop it" - so the pump now declines to *ask* once
+`conversation.closing` or `lifecycle.closing` is set. Frames are still
+received, still drained, still counted (`frames_after_closing`), and simply not
+offered to the model. Nothing in the goodbye contract changes: playback
+boundary, drain, pacing, framing, barge-in and capacity reclamation are all
+untouched, and GT-004 pins that the live-shaped race still ends
+`CALLER_GOODBYE` after the reply has played.
+
+| ID | Scenario | Det. | Live | Test | Crit. |
+|---|---|---|---|---|---|
+| RI-001 | One item, many transcript events, one row | PROTECTED | PASS | `test_one_item_with_many_transcript_events_is_one_row` | HIGH |
+| RI-002 | One item in history and transcript-done, one row | PROTECTED | PASS | `test_one_item_in_both_history_and_transcript_done_is_one_row` | HIGH |
+| RI-003 | Two distinct items with similar text, two rows | PROTECTED | PASS | `test_two_distinct_items_with_similar_text_are_two_rows` | HIGH |
+| RI-004 | Identical text from two items is still two rows | PROTECTED | PASS | `test_identical_text_from_two_items_is_still_two_rows` | HIGH |
+| RI-005 | A final transcript after a partial snapshot wins | PROTECTED | PASS | `test_a_final_transcript_after_a_partial_snapshot_wins` | HIGH |
+| RI-006 | A stale completed item is not replayed | PROTECTED | PASS | `test_a_stale_completed_item_reappearing_later_is_not_replayed` | HIGH |
+| RI-007 | An interrupted response with a final transcript, once | PROTECTED | PASS | `test_an_interrupted_response_with_a_final_transcript_is_written_once` | MED |
+| RI-008 | Teardown straight after a partial loses nothing | PROTECTED | PASS | `test_teardown_immediately_after_a_partial_loses_nothing` | HIGH |
+| RI-009 | The final row settles before teardown | PROTECTED | PASS | `test_the_final_trace_row_settles_before_the_call_is_torn_down` | HIGH |
+| GT-001 | No caller audio reaches the model after the terminal decision | PROTECTED | PENDING | `test_no_caller_audio_reaches_the_model_after_the_terminal_decision` | HIGH |
+| GT-002 | Caller speech after the goodbye starts no new response | PROTECTED | PENDING | `test_the_caller_speaking_after_the_goodbye_starts_no_new_response` | HIGH |
+| GT-003 | No silence prompt follows a terminal goodbye | PROTECTED | PENDING | `test_no_silence_prompt_follows_a_terminal_goodbye` | HIGH |
+| GT-004 | The live-shaped race still ends CALLER_GOODBYE | PROTECTED | PENDING | `test_the_live_shaped_race_still_ends_on_the_caller_goodbye` | HIGH |
+| GT-005 | Capacity is reclaimed after the terminal goodbye | PROTECTED | PENDING | `test_capacity_is_reclaimed_after_the_terminal_goodbye` | HIGH |
+
+---
+
 ## Open defects
 
 | ID | Defect | Evidence | Status |
@@ -1079,6 +1196,7 @@ live in their own set that teardown **waits for** rather than cancels.
 | **D-12b** | `stored_blob()` escaped non-ASCII, so the D-8 assertion `spoken not in stored_blob()` could never detect a non-Latin PIN in the table - it passed for the right reason but could not have caught D-12a. | test-integrity defect; helper repaired with `ensure_ascii=False`; guarded by PR-003 | **CLOSED** |
 | **D-13** | The closing sentence was stored as "Thank you for calling ABC Demo". A `response.output_item.done` carrying a partial but non-empty transcript defeats the SDK's own merge, which preserves the fuller accumulated text only when the incoming one is falsy - and that same item is stamped `completed`, which Phase 6.13 treated as the text being final. | live `9cf4e328-...`; fixed by taking the text from the provider's `response.output_audio_transcript.done` ("the final transcript of the audio"), read raw because the SDK maps only `.delta`; item status now decides only that the item will not change; guarded by FT-001 to FT-010 | **CLOSED deterministically - PENDING live re-proof** |
 | **D-13a** | The new final-transcript write was scheduled onto the task list `close()` cancels, so a goodbye finishing moments before hang-up lost its row - the Phase 6.13 teardown cancellation, reappearing for the scheduled write instead of the held one. | found deterministically by FT-005; fixed by `_settle_trace_writes`, which teardown awaits rather than cancels | **CLOSED deterministically - PENDING live re-proof** |
+| **D-14** | The call kept talking after it had decided to stop. `arm_goodbye` armed closure but nothing stopped the caller's audio reaching the model, so two further turns were answered - and because each reply beginning while CLOSING resets `_generation_ended`, every extra answer postponed the drain that ends the call, leaving the last one truncated when the line finally dropped. | live `1790e545-...`; the silence path was excluded by driving the real lifecycle (it ends `CALLER_SILENT`; this call ended `CALLER_GOODBYE`); fixed by declining to forward caller audio once `conversation.closing` or `lifecycle.closing` is set - the lifecycle's own rule, applied where the question is asked; guarded by GT-001 to GT-005 | **CLOSED deterministically - PENDING live re-proof** |
 
 ## Open decision
 

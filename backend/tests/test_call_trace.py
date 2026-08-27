@@ -2817,3 +2817,217 @@ def test_the_stored_blob_helper_can_actually_see_non_latin_text(traced):
         assert "\\u" not in blob, "non-ASCII is being escaped; the search is blind"
     finally:
         call.close()
+
+
+# === Phase 6.15: response identity ==========================================
+#
+# Live call `1790e545-1cca-1240-4790-eaa5afddeeef` answered the balance twice:
+#
+#   seq 16  "... has an available balance of 12,450.75 SGD."
+#   seq 18  "... has an available balance of 12,450 dollars and 75 cents in SGD."
+#
+# Ten seconds apart, and the obvious reading - one response written twice - is
+# the wrong one. Since Phase 6.13 the bridge remembers every item id it has
+# written and refuses it afterwards, and every write path goes through that
+# check, so two rows can only mean two provider items. The renderings differ,
+# which is the other half of the proof: one generation produces one transcript.
+#
+# So these are two genuine model responses, and the trace is right to hold
+# both. What must never happen is the opposite error - collapsing two real
+# answers because they say nearly the same thing.
+
+BALANCE_NUMERIC = (
+    "Thank you. Your identity has been verified. Your Savings account ending "
+    "[redacted] has an available balance of 12,450.75 SGD."
+)
+BALANCE_SPOKEN = (
+    "Thank you. Your identity has been verified. Your Savings account ending "
+    "[redacted] has an available balance of 12,450 dollars and 75 cents in SGD."
+)
+
+
+@pytest.mark.trace
+def test_one_item_with_many_transcript_events_is_one_row(bridge_call):
+    """One response id, one item id, several deltas and a final transcript."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        for piece in ("Your", "Your Savings", "Your Savings account"):
+            bridge._on_history_item("assistant", piece, "resp-1-item", "in_progress")
+        final_transcript(bridge, "resp-1-item", BALANCE_NUMERIC)
+        # The provider repeats itself; it is still one item.
+        final_transcript(bridge, "resp-1-item", BALANCE_NUMERIC)
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [BALANCE_NUMERIC], written
+
+
+@pytest.mark.trace
+def test_one_item_in_both_history_and_transcript_done_is_one_row(bridge_call):
+    """Two representations of one item - the option-C reading, excluded."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        # The history rendering of the item...
+        bridge._on_history_item("assistant", BALANCE_NUMERIC, "one-item", "completed")
+        # ...and the audio transcript of the very same item, worded differently.
+        final_transcript(bridge, "one-item", BALANCE_SPOKEN)
+        await bridge._generation_finished()
+        await _settle(bridge)
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = agent_events(call_id)
+    assert len(written) == 1, [e["utterance"] for e in written]
+    # The authoritative transcript wins, and there is still only one row.
+    assert written[0]["utterance"] == BALANCE_SPOKEN
+
+
+@pytest.mark.trace
+def test_two_distinct_items_with_similar_text_are_two_rows(bridge_call):
+    """The live shape. Two responses, kept as two."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", BALANCE_NUMERIC, "item-16", "completed")
+        final_transcript(bridge, "item-16", BALANCE_NUMERIC)
+        await _settle(bridge)
+        bridge._on_history_item("assistant", BALANCE_SPOKEN, "item-18", "completed")
+        final_transcript(bridge, "item-18", BALANCE_SPOKEN)
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [BALANCE_NUMERIC, BALANCE_SPOKEN], written
+
+
+@pytest.mark.trace
+def test_identical_text_from_two_items_is_still_two_rows(bridge_call):
+    """Deduplication is by identity, never by wording.
+
+    Two responses that happen to say exactly the same thing are two things the
+    bank said, and a trace that showed one would be hiding a repetition an
+    operator needs to see.
+    """
+    bridge, call_id, _m, _b = bridge_call
+    line = "Is there anything else I can help you with?"
+
+    async def scenario():
+        for item in ("ask-1", "ask-2"):
+            bridge._on_history_item("assistant", line, item, "completed")
+            final_transcript(bridge, item, line)
+            await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    assert [e["utterance"] for e in agent_events(call_id)] == [line, line]
+
+
+@pytest.mark.trace
+def test_a_final_transcript_after_a_partial_snapshot_wins(bridge_call):
+    """The authoritative form only - the partial must not survive beside it."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item(
+            "assistant", "Your Savings account ending", "b1", "completed"
+        )
+        final_transcript(bridge, "b1", BALANCE_NUMERIC)
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [BALANCE_NUMERIC], written
+
+
+@pytest.mark.trace
+def test_a_stale_completed_item_reappearing_later_is_not_replayed(bridge_call):
+    """History snapshots carry the whole call; an answered turn stays answered."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", BALANCE_NUMERIC, "item-16", "completed")
+        final_transcript(bridge, "item-16", BALANCE_NUMERIC)
+        await _settle(bridge)
+        bridge._on_history_item("assistant", "Goodbye.", "item-20", "completed")
+        final_transcript(bridge, "item-20", "Goodbye.")
+        await _settle(bridge)
+        # The balance answer is offered again, after the goodbye.
+        bridge._on_history_item("assistant", BALANCE_NUMERIC, "item-16", "completed")
+        final_transcript(bridge, "item-16", BALANCE_NUMERIC)
+        await bridge._generation_finished()
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [BALANCE_NUMERIC, "Goodbye."], written
+
+
+@pytest.mark.trace
+def test_an_interrupted_response_with_a_final_transcript_is_written_once(bridge_call):
+    """The provider sends the final transcript for cancelled responses too."""
+    bridge, call_id, _m, _b = bridge_call
+    partial = "You're most welcome. Is"
+
+    async def scenario():
+        bridge._on_history_item("assistant", "You're most", "i25", "in_progress")
+        bridge._on_history_item("assistant", partial, "i25", "incomplete")
+        final_transcript(bridge, "i25", partial)
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [partial], written
+
+
+@pytest.mark.trace
+def test_teardown_immediately_after_a_partial_loses_nothing(bridge_call):
+    """seq 25: the line dropped while the answer was still being generated.
+
+    No final transcript ever arrives, because the session is gone. The best
+    known text is still written, exactly once - losing the bank's last words
+    would be the worse failure.
+    """
+    bridge, call_id, _m, _b = bridge_call
+    partial = "You're most welcome. Is"
+
+    async def scenario():
+        bridge._on_history_item("assistant", partial, "i25", "in_progress")
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [partial], written
+
+
+@pytest.mark.trace
+def test_the_final_trace_row_settles_before_the_call_is_torn_down(bridge_call):
+    """A playback-driven disconnect must not outrun the last row."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "Goodbye.", "g1", "completed")
+        final_transcript(bridge, "g1", "Thank you for calling. Goodbye.")
+        # No settle: teardown follows immediately, as it does on a real hang-up.
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == ["Thank you for calling. Goodbye."], written
