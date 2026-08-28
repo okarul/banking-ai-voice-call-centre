@@ -410,16 +410,26 @@ class PhoneCallBridge:
         to retry from, and the call waits for an acknowledgement that cannot
         come.
         """
-        # A backstop, not the signal. The signal is the provider's final
-        # transcript. This catches the turn whose transcript never arrived -
-        # an older transport, a loopback in a test - and the item the provider
-        # marked finished without ever saying what was in it.
+        # A backstop, and a narrow one. The signal is the provider's final
+        # transcript; this only catches the item the provider has already
+        # declared finished without ever saying what was in it.
         #
-        # A message still `in_progress` is left alone: generation end arrives
-        # while the transcript is being filled in, which is the whole reason it
-        # is not the signal.
+        # It may not write an item that is still streaming, and "still
+        # streaming" includes carrying no status at all. The history items that
+        # deliver a transcript as it arrives are built by the SDK as
+        # `AssistantMessageItem(item_id=..., content=[AssistantAudio(...)])`
+        # with no status, so theirs is None - and generation end is
+        # `response.output_audio.done`, which the provider always sends
+        # *before* `response.output_audio_transcript.done`. Treating None as
+        # finished therefore lost the race every time: live call
+        # `fc9fa4cd-1d0e-1240-4790-eaa5afddeeef` stored "Thank you for calling
+        # ABC" for a goodbye the bank said in full, and refused the real
+        # sentence a moment later as a stale repeat of an item already written.
+        #
+        # What is left waiting is not lost: it is written by the authoritative
+        # transcript, by the next item starting, or by teardown.
         held = self._agent_turn
-        if held is not None and held.get("status") != "in_progress":
+        if held is not None and held.get("status") in _FINISHED_STATUSES:
             self._flush_agent_turn()
         await self.lifecycle.on_generation_ended()
         await self._close_if_authentication_is_over()
@@ -1192,11 +1202,18 @@ class PhoneCallBridge:
             # said. Written before the pumps stop, so the replay ends where the
             # call did - and awaited, because the task list it would otherwise
             # be scheduled on is stopped a few lines below.
+            # Anything already on its way lands first. Replay position is
+            # taken when a row is written, so a turn flushed earlier must reach
+            # the database earlier - and the flush below awaits its write
+            # directly, which would otherwise let the last turn overtake a
+            # scheduled one and reorder the end of the call.
+            await self._settle_trace_writes()
+
             await self._flush_agent_turn_now()
 
-            # And so is one already on its way. A goodbye's final transcript
-            # can arrive a moment before the caller hangs up, and cancelling
-            # its write would lose the last thing the bank said.
+            # And once more, for whatever that flush set going. A goodbye's
+            # final transcript can arrive a moment before the caller hangs up,
+            # and cancelling its write would lose the last thing the bank said.
             await self._settle_trace_writes()
 
             await self.lifecycle.close()

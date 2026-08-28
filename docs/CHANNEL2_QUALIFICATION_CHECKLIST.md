@@ -1176,6 +1176,110 @@ untouched, and GT-004 pins that the live-shaped race still ends
 
 ---
 
+## Q-1300 - generation end is not the end of the sentence (Phase 6.16)
+
+### The live call
+
+`fc9fa4cd-1d0e-1240-4790-eaa5afddeeef`
+
+| Aspect | Status |
+|---|---|
+| **Banking** | **LIVE PASS** - COMPLETED, VERIFIED, DEMO001, 4 tools |
+| **Authentication** | **LIVE PASS** - `get_authentication_status` 2 ms, `submit_customer_id` 0 ms, `submit_pin` 77 ms |
+| **Customer-ID semantics** | **LIVE PASS** - seq 7 `[Customer ID provided]` / `CUSTOMER_ID_INPUT` |
+| **Customer-ID ordering** | **LIVE PASS** - seq 7 CUSTOMER, seq 8 TOOL, seq 9 AUTH |
+| **PIN privacy** | **LIVE PASS** |
+| **PIN semantics** | **LIVE PASS** - seq 11 `[PIN REDACTED]` / `PIN_INPUT` |
+| **PIN ordering** | **LIVE PASS** - seq 11 CUSTOMER, seq 13 TOOL, seq 14 AUTH VERIFIED |
+| **Balance** | **LIVE PASS** - seq 16 complete, 12,450 dollars and 75 cents, `get_account_balance` 13 ms |
+| **Goodbye terminalization** | **LIVE PASS** - seq 17 END_CALL, and no caller or model turn after it. **D-14 LIVE CLOSED** |
+| **No post-END_CALL model activity** | **LIVE PASS** |
+| **CALLER_GOODBYE** | **LIVE PASS** |
+| **Final terminal assistant trace** | **LIVE FAIL** - see D-15 |
+
+Phase 6.15 is live-proven: nothing follows the terminal decision. Everything
+Phases 6.12.3 through 6.15 shipped now holds on a real call. One row was still
+wrong.
+
+### D-15 - the fallback outran the sentence
+
+```
+seq 18  AGENT      "Thank you for calling ABC"
+seq 19  LIFECYCLE  CALLER_GOODBYE
+```
+
+Two facts meet here, and either alone is harmless.
+
+**The provider always finishes the audio before it finishes the transcript.**
+`response.output_audio.done` - which the bridge reads as generation end -
+precedes `response.output_audio_transcript.done`, which is the authoritative
+text. That ordering is not a race; it is the protocol.
+
+**A streaming transcript carries no status.** `agents.realtime.session` builds
+its history items as
+
+```python
+AssistantMessageItem(item_id=..., content=[AssistantAudio(transcript=...)])
+```
+
+with no `status`, so it is `None`. Phase 6.14's generation-end fallback fired
+for anything that was not `in_progress` - and `None` is not `in_progress`. So
+it wrote whatever had streamed so far, added the item to `_agent_written`, and
+the real sentence arriving a moment later was refused as a stale repeat.
+
+Driving the real bridge over both orderings shows it exactly: with a streaming
+item, "transcript before generation end" stores the full goodbye and
+"transcript after generation end" stores `"Thank you for calling ABC"`. The
+sequence numbers agree - the agent row was written at generation end, *before*
+teardown, and `_trace_ending` wrote the lifecycle row during it.
+
+**The fix demotes generation end to what it can prove.** It may write only an
+item the provider has already declared finished (`completed` or `incomplete`),
+which it only ever does *after* the transcript has finished streaming. An item
+still streaming - including one carrying no status - waits, and is written by
+its authoritative transcript, by the next item starting, or by teardown. No
+timer, no debounce, no waiting: three existing events, used in the right order.
+
+### D-15a - and the last turn could overtake an earlier one
+
+Found by AF-008 the moment the fallback moved. `close()` awaited the final
+flush directly while an earlier turn's write was still merely scheduled, so the
+last turn could take a lower replay position than the turn before it. Teardown
+now settles what is already in flight, then flushes, then settles again.
+
+### D-16 - the privacy gate was matching the clock
+
+`test_more_sensitive_shapes_never_reach_the_trace[cvv]` failed once during
+qualification and passed on every re-run. It was not a leak. The CVV shape is
+the three-digit string `419`, and the assertion searched a blob that included
+`duration_ms` - and `submit_pin` takes a few hundred milliseconds, so it lands
+on exactly 419 about once in every hundred and fifty runs. A timestamp reaches
+the same end by another road: `12:04:19` contains "419" too.
+
+An intermittently red privacy gate is worse than a noisy one, because it
+teaches everybody to run it again. The comparison now searches every
+**text-bearing** column - filtered by type, so a column added later is covered
+automatically - and no integers or timestamps. A negative control confirms the
+change is strictly stronger: `419`, `S1234567D`, `4821` and a PIN in Urdu are
+still detected in `utterance`, `tool_arguments` and `refusal_reason`, and
+`duration_ms = 419` no longer registers as the secret.
+
+| ID | Scenario | Det. | Live | Test | Crit. |
+|---|---|---|---|---|---|
+| TF-001 | The terminal goodbye survives generation end | PROTECTED | PENDING | `test_the_terminal_goodbye_survives_generation_end` | HIGH |
+| TF-002 | No partial is committed before the authoritative text | PROTECTED | PENDING | `test_a_partial_is_never_committed_before_the_authoritative_text` | HIGH |
+| TF-003 | Authoritative text arriving as teardown starts is not lost | PROTECTED | PENDING | `test_the_authoritative_text_arriving_after_teardown_starts_is_not_lost` | HIGH |
+| TF-004 | Best known text kept when none ever comes | PROTECTED | PENDING | `test_the_best_known_text_is_kept_when_no_authoritative_text_ever_comes` | HIGH |
+| TF-005 | Authoritative text before generation end, written once | PROTECTED | PENDING | `test_an_authoritative_text_before_generation_end_is_written_once` | HIGH |
+| TF-006 | Stale snapshots after the authoritative text add no row | PROTECTED | PENDING | `test_stale_snapshots_after_the_authoritative_text_add_no_row` | HIGH |
+| TF-007 | The agent row precedes the lifecycle row where ordering allows | PROTECTED | PENDING | `test_the_agent_row_precedes_the_lifecycle_row_when_ordering_allows` | MED |
+| TF-008 | No post-END_CALL caller audio reaches the model | PROTECTED | PASS | GT-001 / GT-002 (Phase 6.15) | HIGH |
+| TF-009 | Capacity reclaimed | PROTECTED | PASS | GT-005 (Phase 6.15) | HIGH |
+| TF-010 | Normal non-terminal responses unaffected | PROTECTED | PENDING | `test_a_normal_non_terminal_response_is_unaffected` | HIGH |
+| TF-011 | A provider-finished item is still written at generation end | PROTECTED | PENDING | `test_a_provider_finished_item_is_still_written_at_generation_end` | MED |
+
+---
+
 ## Open defects
 
 | ID | Defect | Evidence | Status |
@@ -1196,7 +1300,10 @@ untouched, and GT-004 pins that the live-shaped race still ends
 | **D-12b** | `stored_blob()` escaped non-ASCII, so the D-8 assertion `spoken not in stored_blob()` could never detect a non-Latin PIN in the table - it passed for the right reason but could not have caught D-12a. | test-integrity defect; helper repaired with `ensure_ascii=False`; guarded by PR-003 | **CLOSED** |
 | **D-13** | The closing sentence was stored as "Thank you for calling ABC Demo". A `response.output_item.done` carrying a partial but non-empty transcript defeats the SDK's own merge, which preserves the fuller accumulated text only when the incoming one is falsy - and that same item is stamped `completed`, which Phase 6.13 treated as the text being final. | live `9cf4e328-...`; fixed by taking the text from the provider's `response.output_audio_transcript.done` ("the final transcript of the audio"), read raw because the SDK maps only `.delta`; item status now decides only that the item will not change; guarded by FT-001 to FT-010 | **CLOSED deterministically - PENDING live re-proof** |
 | **D-13a** | The new final-transcript write was scheduled onto the task list `close()` cancels, so a goodbye finishing moments before hang-up lost its row - the Phase 6.13 teardown cancellation, reappearing for the scheduled write instead of the held one. | found deterministically by FT-005; fixed by `_settle_trace_writes`, which teardown awaits rather than cancels | **CLOSED deterministically - PENDING live re-proof** |
-| **D-14** | The call kept talking after it had decided to stop. `arm_goodbye` armed closure but nothing stopped the caller's audio reaching the model, so two further turns were answered - and because each reply beginning while CLOSING resets `_generation_ended`, every extra answer postponed the drain that ends the call, leaving the last one truncated when the line finally dropped. | live `1790e545-...`; the silence path was excluded by driving the real lifecycle (it ends `CALLER_SILENT`; this call ended `CALLER_GOODBYE`); fixed by declining to forward caller audio once `conversation.closing` or `lifecycle.closing` is set - the lifecycle's own rule, applied where the question is asked; guarded by GT-001 to GT-005 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-14** | The call kept talking after it had decided to stop. `arm_goodbye` armed closure but nothing stopped the caller's audio reaching the model, so two further turns were answered - and because each reply beginning while CLOSING resets `_generation_ended`, every extra answer postponed the drain that ends the call, leaving the last one truncated when the line finally dropped. | live `1790e545-...`; the silence path was excluded by driving the real lifecycle (it ends `CALLER_SILENT`; this call ended `CALLER_GOODBYE`); fixed by declining to forward caller audio once `conversation.closing` or `lifecycle.closing` is set - the lifecycle's own rule, applied where the question is asked; guarded by GT-001 to GT-005 | **CLOSED - LIVE PROVEN on `fc9fa4cd-...`: no caller or model turn follows END_CALL** |
+| **D-15** | The terminal assistant row was truncated to "Thank you for calling ABC". The provider always sends `response.output_audio.done` - read as generation end - before `response.output_audio_transcript.done`, and the history items carrying a streaming transcript have no status at all. Phase 6.14's fallback fired for anything not `in_progress`, so it wrote the draft and then refused the real sentence as a stale repeat of an item already written. | live `fc9fa4cd-...`; reproduced offline over both orderings; fixed by letting generation end write only an item the provider has declared finished, leaving a streaming item to its authoritative transcript, the next item, or teardown; guarded by TF-001 to TF-011 | **CLOSED deterministically - PENDING live re-proof** |
+| **D-15a** | With the fallback moved, `close()` awaited the final flush while an earlier turn's write was still only scheduled, so the last turn could take a lower replay position than the one before it. | found deterministically by AF-008; fixed by settling in-flight trace writes before the final flush and again after | **CLOSED deterministically - PENDING live re-proof** |
+| **D-16** | A privacy assertion matched the clock: the CVV shape `419` was searched for in a blob containing `duration_ms`, and `submit_pin` lands on 419 ms about once in every hundred and fifty runs - so the gate failed intermittently for a secret that had never been stored. | found during Phase 6.16 qualification; test-integrity defect, not a leak; the comparison now covers every text-bearing column by type and no integers or timestamps; negative control proves all four secret shapes are still detected | **CLOSED** |
 
 ## Open decision
 

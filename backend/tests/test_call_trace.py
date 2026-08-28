@@ -232,6 +232,45 @@ class Call:
         self.manager.clear()
 
 
+def _text_blob(model) -> str:
+    """Every text-bearing column of every row of `model`, as one searchable string.
+
+    Text-bearing, and deliberately not "every column". A machine-generated
+    integer or timestamp cannot carry anything a caller said, and searching
+    them makes a short secret collide with the clock: `submit_pin` takes a few
+    hundred milliseconds, so `duration_ms` lands on exactly 419 about once in
+    every hundred and fifty runs - and `test_more_sensitive_shapes_never_reach
+    _the_trace[cvv]` then failed for a CVV that had never been stored. A
+    timestamp reaches the same end by another road, since `12:04:19` contains
+    "419" too.
+
+    An intermittently red privacy gate is worse than a noisy one: it teaches
+    everybody to run it again. So the noise is removed and the coverage is not
+    - every column that could hold an utterance is still searched, including
+    any added later, because the filter is on type rather than on a list of
+    names.
+    """
+    from sqlalchemy import DateTime, Integer
+
+    with session_scope() as db:
+        return json.dumps(
+            [
+                {
+                    column.name: str(getattr(row, column.name))
+                    for column in model.__table__.columns
+                    if not isinstance(column.type, (Integer, DateTime))
+                }
+                for row in db.scalars(select(model))
+            ],
+            ensure_ascii=False,
+        )
+
+
+def tool_event_blob() -> str:
+    """Every text-bearing column of `agent_tool_events`."""
+    return _text_blob(AgentToolEvent)
+
+
 def stored_blob() -> str:
     """Every trace row in the database, as one string to search.
 
@@ -240,19 +279,10 @@ def stored_blob() -> str:
     stored_blob()` can never match it - so the assertion that D-8 rests on
     would have passed over a raw non-Latin PIN sitting in the table. Phase 6.14
     found exactly that leak by another route.
+
+    Phase 6.16: text-bearing columns only, for the reason in `_text_blob`.
     """
-    with session_scope() as db:
-        rows = list(db.scalars(select(CallTraceEvent)))
-        return json.dumps(
-            [
-                {
-                    column.name: str(getattr(row, column.name))
-                    for column in CallTraceEvent.__table__.columns
-                }
-                for row in rows
-            ],
-            ensure_ascii=False,
-        )
+    return _text_blob(CallTraceEvent)
 
 
 # === 1. the trace tells the story ==========================================
@@ -959,14 +989,11 @@ def test_more_sensitive_shapes_never_reach_the_trace(traced, name, caplog):
         replay = json.dumps(call.replay())
         assert secret.lower() not in replay.lower(), f"{name} reached the API"
 
-        with session_scope() as db:
-            events = json.dumps(
-                [
-                    (e.tool_name, e.status, e.duration_ms)
-                    for e in db.scalars(select(AgentToolEvent))
-                ]
-            )
-        assert secret.lower() not in events.lower(), f"{name} reached agent_tool_events"
+        # Every text column of the row, rather than a hand-picked tuple with a
+        # stopwatch in it. See `_text_blob`.
+        assert secret.lower() not in tool_event_blob().lower(), (
+            f"{name} reached agent_tool_events"
+        )
 
         logged = " ".join(record.getMessage() for record in caplog.records)
         assert secret.lower() not in logged.lower(), f"{name} reached the logs"
@@ -1792,12 +1819,20 @@ def test_generation_end_does_not_write_an_unfinished_message(bridge_call):
 
 @pytest.mark.trace
 def test_a_message_that_never_reports_a_status_is_still_written(bridge_call):
-    """A transport that says nothing must not lose the turn entirely."""
+    """A transport that says nothing must not lose the turn entirely.
+
+    Phase 6.16: generation end no longer writes an item that is still
+    streaming, because a status-less item is exactly what a transcript still
+    arriving looks like. The turn is not lost - teardown is the last moment it
+    can be written, and it is written there.
+    """
     bridge, call_id, _manager, _banking = bridge_call
 
     async def scenario():
         bridge._on_history_item("assistant", "A complete sentence.", "i1", None)
         await bridge._generation_finished()
+        await _settle(bridge)
+        await bridge.close()
         await _settle(bridge)
 
     asyncio.run(scenario())
@@ -2120,6 +2155,10 @@ def test_only_the_current_item_is_flushed_at_teardown(bridge_call):
         bridge._on_history_item("assistant", "Still speaking", "i2", None)
         await bridge._generation_finished()
         await _settle(bridge)
+        # Phase 6.16: the unfinished item is owed at teardown, not at
+        # generation end. Both rows, in order, exactly once.
+        await bridge.close()
+        await _settle(bridge)
 
     asyncio.run(scenario())
 
@@ -2141,6 +2180,8 @@ def test_a_transport_that_never_reports_completion_still_writes_once(bridge_call
         bridge._on_history_item("assistant", "A whole sentence.", "i1", None)
         await bridge._generation_finished()
         await _settle(bridge)
+        await bridge.close()
+        await _settle(bridge)
 
     asyncio.run(scenario())
 
@@ -2151,12 +2192,19 @@ def test_a_transport_that_never_reports_completion_still_writes_once(bridge_call
 
 @pytest.mark.trace
 def test_a_completion_arriving_after_the_fallback_wrote_it_is_ignored(bridge_call):
-    """The fallback already owed this item. The provider agreeing changes nothing."""
+    """The fallback already owed this item. The provider agreeing changes nothing.
+
+    Phase 6.16: the fallback for a still-streaming item is teardown rather than
+    generation end. What is being pinned is unchanged - once the row exists, a
+    later completion for the same item must not add a second one.
+    """
     bridge, call_id, _m, _b = bridge_call
 
     async def scenario():
         bridge._on_history_item("assistant", "A whole sentence.", "i1", None)
         await bridge._generation_finished()
+        await _settle(bridge)
+        await bridge.close()
         await _settle(bridge)
         bridge._on_history_item("assistant", "A whole sentence.", "i1", "completed")
         await _settle(bridge)
@@ -3031,3 +3079,249 @@ def test_the_final_trace_row_settles_before_the_call_is_torn_down(bridge_call):
 
     written = [e["utterance"] for e in agent_events(call_id)]
     assert written == ["Thank you for calling. Goodbye."], written
+
+
+# === Phase 6.16: generation end is not the end of the sentence =============
+#
+# Live call `fc9fa4cd-1d0e-1240-4790-eaa5afddeeef` was correct in every other
+# respect - customer id and PIN masked, ordered and sequenced ahead of their
+# tools, balance right, and Phase 6.15's terminalization holding with no turn
+# of any kind after END_CALL - and closed like this:
+#
+#     seq 18  AGENT      "Thank you for calling ABC"
+#     seq 19  LIFECYCLE  CALLER_GOODBYE
+#
+# The provider always sends `response.output_audio.done` **before**
+# `response.output_audio_transcript.done`: the audio finishes generating, then
+# the transcript of it finishes streaming. The bridge turns the first of those
+# into generation end.
+#
+# And the history items that carry a streaming transcript have no status at
+# all. `agents.realtime.session` builds them as
+#
+#     AssistantMessageItem(item_id=..., content=[AssistantAudio(transcript=...)])
+#
+# with no `status`, so it is None. The generation-end fallback fired for
+# anything that was not `in_progress`, which includes None - so it wrote
+# whatever had streamed so far and marked the item written, and the
+# authoritative transcript that arrived a moment later was refused as stale.
+#
+# That also explains the sequence numbers: the agent row was written at
+# generation end, *before* teardown, and `_trace_ending` wrote the lifecycle
+# row during it.
+#
+# So generation end is demoted to what it can actually prove: an item the
+# provider has declared finished (`completed` or `incomplete`) will not grow
+# again, and may be written. An item still streaming waits for its transcript,
+# or for teardown.
+
+GOODBYE_FULL = "Thank you for calling ABC Demo Bank. Have a pleasant day. Goodbye."
+GOODBYE_PART = "Thank you for calling ABC"
+
+
+def stream_partial(bridge, item_id="g1", pieces=("Thank you", "Thank you for calling",
+                                                 GOODBYE_PART)):
+    """Transcript deltas, as the SDK renders them: growing text, no status."""
+    for piece in pieces:
+        bridge._on_history_item("assistant", piece, item_id, None)
+
+
+@pytest.mark.trace
+def test_the_terminal_goodbye_survives_generation_end(bridge_call):
+    """TF-001 / TF-003. The live graph, exactly.
+
+    Audio finishes, generation end fires, and only then does the provider say
+    what was actually said. The row must be the sentence, not the draft.
+    """
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        stream_partial(bridge)
+        await bridge._generation_finished()          # response.output_audio.done
+        await _settle(bridge)
+        final_transcript(bridge, "g1", GOODBYE_FULL)  # transcript.done
+        await _settle(bridge)
+        await bridge.close()                          # teardown, session still open
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [GOODBYE_FULL], written
+
+
+@pytest.mark.trace
+def test_a_partial_is_never_committed_before_the_authoritative_text(bridge_call):
+    """TF-002. No permanent partial write that blocks replacement."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        stream_partial(bridge)
+        await bridge._generation_finished()
+        await _settle(bridge)
+        # Nothing may have been written yet: the sentence is not finished.
+        assert agent_events(call_id) == [], (
+            "a partial was committed before the provider said what was said"
+        )
+        final_transcript(bridge, "g1", GOODBYE_FULL)
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [GOODBYE_FULL], written
+
+
+@pytest.mark.trace
+def test_the_authoritative_text_arriving_after_teardown_starts_is_not_lost(bridge_call):
+    """TF-003. `bridge.close()` runs before the realtime session is closed."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        stream_partial(bridge)
+        await bridge._generation_finished()
+        final_transcript(bridge, "g1", GOODBYE_FULL)
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [GOODBYE_FULL], written
+
+
+@pytest.mark.trace
+def test_the_best_known_text_is_kept_when_no_authoritative_text_ever_comes(bridge_call):
+    """TF-004. A stream that closes without saying so still costs nothing."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        stream_partial(bridge)
+        await bridge._generation_finished()
+        await _settle(bridge)
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [GOODBYE_PART], written
+
+
+@pytest.mark.trace
+def test_an_authoritative_text_before_generation_end_is_written_once(bridge_call):
+    """TF-005. The other ordering, which already worked, kept working."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        stream_partial(bridge)
+        final_transcript(bridge, "g1", GOODBYE_FULL)
+        await bridge._generation_finished()
+        await _settle(bridge)
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [GOODBYE_FULL], written
+
+
+@pytest.mark.trace
+def test_stale_snapshots_after_the_authoritative_text_add_no_row(bridge_call):
+    """TF-006."""
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        stream_partial(bridge)
+        final_transcript(bridge, "g1", GOODBYE_FULL)
+        await _settle(bridge)
+        # The whole conversation is offered again on the way out.
+        bridge._on_history_item("assistant", GOODBYE_PART, "g1", None)
+        bridge._on_history_item("assistant", GOODBYE_FULL, "g1", "completed")
+        await bridge._generation_finished()
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [GOODBYE_FULL], written
+
+
+@pytest.mark.trace
+def test_the_agent_row_precedes_the_lifecycle_row_when_ordering_allows(bridge_call):
+    """TF-007.
+
+    When the authoritative transcript arrives before teardown - the ordinary
+    case, and the live one - the bank's last words are recorded before the row
+    that says the call ended. Where it never arrives, teardown is the only
+    moment left and the ending is written first; that is the limit of what
+    event ordering allows, not a choice.
+    """
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        stream_partial(bridge)
+        await bridge._generation_finished()
+        final_transcript(bridge, "g1", GOODBYE_FULL)
+        await _settle(bridge)
+        # Teardown's own trace row would be written from here on.
+        await bridge.close()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    events = trace.for_call(call_id)["events"]
+    agent = [e for e in events if e["kind"] == trace.KIND_TURN
+             and e["speaker"] == trace.SPEAKER_AGENT]
+    assert len(agent) == 1
+    assert agent[0]["utterance"] == GOODBYE_FULL
+    sequences = [e["sequence"] for e in events]
+    assert sequences == sorted(sequences)
+
+
+@pytest.mark.trace
+def test_a_normal_non_terminal_response_is_unaffected(bridge_call):
+    """TF-010. Mid-call answers keep their existing behaviour."""
+    bridge, call_id, _m, _b = bridge_call
+    answer = "Your Savings account has an available balance of 12,450.75 SGD."
+
+    async def scenario():
+        for piece in ("Your", "Your Savings account has", answer):
+            bridge._on_history_item("assistant", piece, "balance", None)
+        final_transcript(bridge, "balance", answer)
+        await bridge._generation_finished()
+        await _settle(bridge)
+        # A second, ordinary turn follows.
+        bridge._on_history_item("assistant", "Anything else?", "next", None)
+        final_transcript(bridge, "next", "Is there anything else I can help with?")
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == [answer, "Is there anything else I can help with?"], written
+
+
+@pytest.mark.trace
+def test_a_provider_finished_item_is_still_written_at_generation_end(bridge_call):
+    """The half of the fallback that survives.
+
+    `completed` and `incomplete` come from the provider *after* the transcript
+    has finished streaming, so an item wearing one of them will not grow again
+    and generation end may still write it.
+    """
+    bridge, call_id, _m, _b = bridge_call
+
+    async def scenario():
+        bridge._on_history_item("assistant", "A finished sentence.", "done-1",
+                                "completed")
+        await bridge._generation_finished()
+        await _settle(bridge)
+
+    asyncio.run(scenario())
+
+    written = [e["utterance"] for e in agent_events(call_id)]
+    assert written == ["A finished sentence."], written
