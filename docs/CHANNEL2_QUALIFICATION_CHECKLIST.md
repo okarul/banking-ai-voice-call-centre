@@ -1280,6 +1280,131 @@ still detected in `utterance`, `tool_arguments` and `refusal_reason`, and
 
 ---
 
+## Q-1400 - one ceiling, and a suite that cannot phone out (Phase 7.2)
+
+No live call was made in this phase, and `REALTIME_MAX_ACTIVE_SESSIONS` is
+still 1.
+
+### TEST-SAFETY FINDING - an accidental provider session
+
+**Classification: test-isolation / process finding. Not a production incident.**
+
+An early version of CG-001 drove `POST /dev/realtime/session/{id}/start` over
+HTTP. That route called `start()` with no connector, so it fell through to
+`open_openai_session` and opened one real OpenAI Realtime session.
+
+Facts:
+
+* one short provider session
+* no audio
+* no customer data
+* no DIDWW call, no telephony media
+* no code, config, `.env` or capacity change
+* the test was hardened immediately, and every subsequent piece of evidence in
+  this phase was obtained with injected or stubbed connectors
+
+Why it was possible: every *other* provider test in the suite injects its own
+connector, so nothing had ever needed a backstop, and there was none. Cleaning
+up afterwards would not have helped - by the time a teardown runs, the
+connection has been made and the usage spent.
+
+`conftest.block_live_provider` is the durable answer, and it uses the
+convention the repository already had rather than inventing one. `pytest.ini`
+already carries `addopts = -m "not integration"`, `integration` already means
+"reaches a real external service; deselected by default", and `realtime`
+already means "uses the live OpenAI Realtime API and consumes paid usage". The
+guard exempts those two markers and blocks everything else, replacing the live
+connector with one that raises and says what to do instead. PG-001 to PG-005
+are its own regression tests, because a guard nobody checks is a guard that
+quietly stops working.
+
+Two details of the guard were themselves defects on the way, and both are worth
+recording because both were caught by tests rather than by reading:
+
+* it first replaced **every** manager's default connector, including
+  `browser_call_manager`'s `open_browser_call` - a stand-in that never leaves
+  the process. That broke 23 browser tests. It now replaces the live connector
+  only where the live connector is actually installed.
+* it first took `monkeypatch`. An autouse fixture that requests `monkeypatch`
+  changes when that fixture is created for **every** test in the suite, and so
+  when its undo runs relative to other teardowns - which was enough to break
+  `test_a_schema_failure_does_not_stop_the_process_starting`. It now saves and
+  restores by hand. A guard must not reorder the suite it guards.
+
+### D-17 - the capacity ceiling was split in two
+
+`RealtimeManager` counts what it has admitted, and there were two module-level
+instances:
+
+* `browser_calls.voice_call_manager` - the production pool, shared by the
+  browser and telephone channels, and the one `readiness` reports;
+* `realtime_manager.realtime_manager` - an older instance from when the
+  development router was its only consumer.
+
+`app/routers/dev_realtime.py` still used the second, and `main.py` mounted that
+router **unconditionally** - despite the router's own docstring saying "This
+router must not be exposed in a production deployment." Both instances read the
+same `REALTIME_MAX_ACTIVE_SESSIONS`, so a process could hold **twice** the
+configured number of provider sessions while readiness reported half of them.
+
+Nothing was wrong with the admission logic: check-and-claim has been atomic
+under one lock since Phase 12. The defect was that there were two of them.
+
+**Why it hid so well.** `app/realtime/__init__.py` re-exported the instance
+under the module's own name, so `from app.realtime import realtime_manager`
+*and* `import app.realtime.realtime_manager as m` both hand back the
+**instance**. Only a `sys.modules` lookup reaches the module. Two separate
+drafts of these tests read the instance, found no `open_openai_session`
+attribute on it, and proved nothing.
+
+**Fixed by removing the second counter rather than coordinating it.** The
+orphan instance is gone and is no longer re-exported; the development router
+uses `voice_call_manager` like every other route, and names
+`open_openai_session` explicitly rather than relying on a shared manager's
+default. And the development routers are now mounted only when `APP_ENV` is not
+production - `settings.is_production`, one place, existing configuration.
+
+Not registering a route is a stronger guarantee than registering one that
+refuses. That is the reasoning `create_app` already applied to the telephony
+webhook, applied to the one development route that can spend money.
+
+### What the offline multi-caller evidence now shows
+
+Two `PhoneCallBridge` instances, driven through the real
+`RealtimeManager._pump_events`, strictly interleaved with `asyncio.Event` and
+no sleeps, produce two independent calls: separate `provider_call_id`, separate
+sessions, separate authenticated customers, separate lifecycles, separate
+traces - and **each trace's sequence is monotonic in its own right**, both
+starting at 1. Sequence is per call and deliberately not global.
+
+### Media ports - a Phase 7.1 finding withdrawn
+
+Phase 7.1 listed "media-port exhaustion behaviour untested" as a MEDIUM gap.
+That was wrong: `tests/test_gateway_udp_media.py` already covers a unique port
+per active call, six concurrent calls never sharing one, `MediaPortsExhausted`
+on a full range, and a closed port becoming available again. No new test and no
+gateway change was needed.
+
+| ID | Scenario | Det. | Live | Test | Crit. |
+|---|---|---|---|---|---|
+| PG-001 | The phone connector seam cannot reach a provider | PROTECTED | N/A | `test_the_phone_connector_seam_cannot_reach_a_real_provider` | HIGH |
+| PG-002 | The dev route cannot reach a provider offline | PROTECTED | N/A | `test_the_dev_realtime_route_cannot_reach_a_real_provider` | HIGH |
+| PG-003 | A manager holding the live connector is blocked | PROTECTED | N/A | `test_a_manager_holding_the_live_connector_is_blocked` | HIGH |
+| PG-004 | An offline default connector is left working | PROTECTED | N/A | `test_an_offline_default_connector_is_left_working` | HIGH |
+| PG-005 | The paid opt-in still exists and is honoured | PROTECTED | N/A | `test_the_repository_still_has_an_explicit_paid_provider_opt_in`, `test_a_marked_test_keeps_the_real_connector` | HIGH |
+| CG-001 | The dev route cannot exceed the ceiling | PROTECTED | PENDING | `test_the_dev_route_cannot_open_a_session_beyond_the_ceiling` | HIGH |
+| CG-002 | The production path cannot exceed it either | PROTECTED | PENDING | `test_the_production_path_cannot_open_a_session_the_dev_route_already_holds` | HIGH |
+| CG-003 | Readiness counts every admitted session | PROTECTED | PENDING | `test_readiness_counts_every_admitted_provider_session` | HIGH |
+| CG-004 | Two simultaneous admissions admit exactly one | PROTECTED | PENDING | `test_two_simultaneous_admissions_at_a_ceiling_of_one_admit_exactly_one` | HIGH |
+| CG-005 | A failed connection frees the slot | PROTECTED | PENDING | `test_a_failed_connection_frees_the_slot_for_the_next_route` | HIGH |
+| CG-006 | Double teardown leaves capacity at zero | PROTECTED | PENDING | `test_tearing_down_twice_leaves_capacity_at_zero` | HIGH |
+| CG-007 | There is no second capacity pool | PROTECTED | PENDING | `test_only_one_capacity_pool_is_reachable_from_the_application` | HIGH |
+| CG-008 | No dev routes in production | PROTECTED | PENDING | `test_the_development_router_is_not_mounted_in_production` | HIGH |
+| TC-001 | Two calls overlap without touching each other | PROTECTED | PENDING | `test_two_telephone_calls_overlap_without_touching_each_other` | HIGH |
+| TC-002 | Two calls ending together release one slot each | PROTECTED | PENDING | `test_two_calls_tearing_down_together_release_exactly_one_slot_each` | HIGH |
+
+---
+
 ## Open defects
 
 | ID | Defect | Evidence | Status |
@@ -1304,6 +1429,7 @@ still detected in `utterance`, `tool_arguments` and `refusal_reason`, and
 | **D-15** | The terminal assistant row was truncated to "Thank you for calling ABC". The provider always sends `response.output_audio.done` - read as generation end - before `response.output_audio_transcript.done`, and the history items carrying a streaming transcript have no status at all. Phase 6.14's fallback fired for anything not `in_progress`, so it wrote the draft and then refused the real sentence as a stale repeat of an item already written. | live `fc9fa4cd-...`; reproduced offline over both orderings; fixed by letting generation end write only an item the provider has declared finished, leaving a streaming item to its authoritative transcript, the next item, or teardown; guarded by TF-001 to TF-011 | **CLOSED deterministically - PENDING live re-proof** |
 | **D-15a** | With the fallback moved, `close()` awaited the final flush while an earlier turn's write was still only scheduled, so the last turn could take a lower replay position than the one before it. | found deterministically by AF-008; fixed by settling in-flight trace writes before the final flush and again after | **CLOSED deterministically - PENDING live re-proof** |
 | **D-16** | A privacy assertion matched the clock: the CVV shape `419` was searched for in a blob containing `duration_ms`, and `submit_pin` lands on 419 ms about once in every hundred and fifty runs - so the gate failed intermittently for a secret that had never been stored. | found during Phase 6.16 qualification; test-integrity defect, not a leak; the comparison now covers every text-bearing column by type and no integers or timestamps; negative control proves all four secret shapes are still detected | **CLOSED** |
+| **D-17** | The provider-capacity ceiling was split across two `RealtimeManager` instances. `dev_realtime` used the older one and `main.py` mounted that router unconditionally, so a process could hold twice the configured number of provider sessions while readiness reported half. Hidden by `app/realtime/__init__` re-exporting the instance under the module's own name. | found by the Phase 7.1 review; fixed by removing the orphan instance, pointing the development router at `voice_call_manager` with an explicit connector, and mounting the development routers only when `settings.is_production` is false; guarded by CG-001 to CG-008 | **CLOSED deterministically - capacity unchanged at 1, PENDING live re-proof** |
 
 ## Open decision
 

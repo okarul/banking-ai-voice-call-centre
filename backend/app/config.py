@@ -63,6 +63,9 @@ class Settings:
     def __init__(self) -> None:
         self.app_name: str = os.getenv("APP_NAME", "ABC Demo Bank Voice Banking API")
         self.app_env: str = os.getenv("APP_ENV", "development")
+        # Read once here and asked as `settings.is_production`, so that what
+        # counts as production is decided in one place rather than by whichever
+        # string comparison a caller happens to write.
         # Optional: the app still imports and serves /health without it.
         self.database_url: str | None = os.getenv("DATABASE_URL") or None
         # Backend-only. Never returned by a route, logged, or sent to a client.
@@ -284,6 +287,18 @@ class Settings:
                 "http://127.0.0.1:5173,http://localhost:5173",
             )
         )
+
+    @property
+    def is_production(self) -> bool:
+        """Whether this process is running as a production deployment.
+
+        One place decides, so that "is this production?" cannot be answered
+        differently by two callers writing two string comparisons. Anything
+        that is not explicitly production is treated as development, which is
+        the safe direction: a mislabelled environment loses a diagnostic route
+        rather than exposing one.
+        """
+        return self.app_env.strip().lower() in {"production", "prod"}
 
     @property
     def telephony_configured(self) -> bool:

@@ -713,6 +713,19 @@ class RealtimeManager:
             )
 
 
-# Shared manager for the running process. Holds connections keyed by banking
-# session id — never a place to put one customer's state.
-realtime_manager = RealtimeManager()
+# There is deliberately no module-level manager here.
+#
+# There used to be, from when the development router was its only consumer.
+# `browser_calls` later created its own for the browser connector, and when the
+# telephone channel arrived that one was named `voice_call_manager` and made the
+# application-wide ceiling. The original was never retired, and the development
+# router went on using it - so two independent counters each read
+# `REALTIME_MAX_ACTIVE_SESSIONS` and the process would hold twice the configured
+# number of provider sessions, while readiness reported one of the two.
+#
+# A capacity ceiling only means anything if there is one of it. The single
+# authoritative manager is `app.realtime.browser_calls.voice_call_manager`;
+# every route that can open a provider session goes through that one.
+#
+# Importing it here would be circular - `browser_calls` imports this module for
+# the class - so it is not re-exported. Ask for it where it lives.

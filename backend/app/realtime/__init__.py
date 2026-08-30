@@ -24,7 +24,6 @@ from app.realtime.realtime_manager import (
     Reason,
     new_realtime_session_id,
     open_openai_session,
-    realtime_manager,
 )
 
 __all__ = [
@@ -35,7 +34,6 @@ __all__ = [
     "Reason",
     "new_realtime_session_id",
     "open_openai_session",
-    "realtime_manager",
     "describe_event",
     "log_event",
     "safe_arguments",

@@ -137,15 +137,27 @@ def create_app() -> FastAPI:
     # surface from the customer routes above.
     application.include_router(admin.router)
 
-    # Development-only diagnostics. Remove before any production deployment.
-    application.include_router(dev.router)
-    application.include_router(dev_sessions.router)
-    application.include_router(dev_auth.router)
-    application.include_router(dev_accounts.router)
-    application.include_router(dev_loans.router)
-    application.include_router(dev_authorization.router)
-    application.include_router(dev_agents.router)
-    application.include_router(dev_realtime.router)
+    # Development-only diagnostics, and now actually only in development.
+    #
+    # "Remove before any production deployment" was a comment, which is a
+    # request rather than a guarantee: every one of these was mounted wherever
+    # the application ran. `/dev/realtime/session/{id}/start` opens a provider
+    # session, so on a production deployment it was a route that could spend
+    # money and hold capacity outside the customer paths entirely.
+    #
+    # Not registering the route is a stronger guarantee than registering one
+    # that refuses - the same reasoning the telephony endpoint above already
+    # follows - and `APP_ENV` is the switch this application already has.
+    if not settings.is_production:
+        application.include_router(dev.router)
+        application.include_router(dev_sessions.router)
+        application.include_router(dev_auth.router)
+        application.include_router(dev_accounts.router)
+        application.include_router(dev_loans.router)
+        application.include_router(dev_authorization.router)
+        application.include_router(dev_agents.router)
+        application.include_router(dev_realtime.router)
+        logger.info("development diagnostics registered (APP_ENV=%s)", settings.app_env)
 
     # The provider-facing event boundary. Absent by default.
     if settings.telephony_webhook_ready:
