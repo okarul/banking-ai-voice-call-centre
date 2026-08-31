@@ -328,9 +328,17 @@ def test_a_happy_path_balance_call_reads_end_to_end(traced):
         assert "[Customer ID provided]" in utterances
         assert "[PIN REDACTED]" in utterances
 
-        # The verification, and the balance that follows it.
+        # The verification, and the balance that follows it. Two events, and
+        # deliberately not one: Phase 7.3 answers the held enquiry the moment
+        # the PIN checks out, so the model's own call for the same enquiry is
+        # served from that answer. The bank was read once - the second event
+        # says CACHE_SERVED and is kept out of `answered`, `operations` and the
+        # tool counters - and the trace shows both, so no model invocation is
+        # left without an event against it.
         balance = call.tools_named("get_account_balance")
-        assert len(balance) == 1
+        assert len(balance) == 2
+        assert [e["tool_status"] for e in balance] == ["OK", trace.CACHE_SERVED]
+        assert balance[1]["duration_ms"] == 0
         assert balance[0]["tool_status"] == "OK"
         assert balance[0]["auth_status"] == "VERIFIED"
         assert balance[0]["customer_ref"] == CALLER
@@ -360,7 +368,10 @@ def test_the_turn_not_classified_path_is_visible(traced):
         call.ends("PROVIDER_ENDED")
 
         balance = call.tools_named("get_account_balance")
-        assert len(balance) == 1
+        # The real read, then the same enquiry served from it. See the happy
+        # path above for why there are two.
+        assert len(balance) == 2
+        assert [e["tool_status"] for e in balance] == ["OK", trace.CACHE_SERVED]
         # Fixed in 6.11.1, and the trace now says so in one line.
         assert balance[0]["tool_status"] == "OK"
         assert balance[0].get("failure_reason") is None
@@ -552,10 +563,19 @@ def test_the_trace_does_not_inflate_the_existing_counters(traced):
                 )
             )
 
-        # submit_customer_id, submit_pin, get_account_balance.
+        # submit_customer_id, submit_pin, get_account_balance. The model's
+        # repeat of the already-answered enquiry is NOT here: the bank was not
+        # asked, so the counter surface does not count it.
         assert row.tool_call_count == 3
         assert len(tool_events) == 3
-        assert len(call.events(trace.KIND_TOOL)) == 3
+        assert not any(e.status == trace.CACHE_SERVED for e in tool_events)
+
+        # The narrative surface does carry it, as a fourth event that says what
+        # it was. That split is the point - the counters stay conservative and
+        # the story stays complete.
+        traced_tools = call.events(trace.KIND_TOOL)
+        assert len(traced_tools) == 4
+        assert [e["tool_status"] for e in traced_tools].count(trace.CACHE_SERVED) == 1
     finally:
         call.close()
 
@@ -720,9 +740,18 @@ def test_a_database_failure_reaches_the_trace_as_a_reason_not_a_statement(
 
     call = Call()
     try:
-        call.says(ASK_SAVINGS)
+        # Verified first, and the enquiry made only afterwards. Asking before
+        # verifying would hold the enquiry, and Phase 7.3 answers a held
+        # enquiry deterministically the moment the PIN checks out - while the
+        # database below is still working. The identical request that followed
+        # would then be served from the resumed-result cache and never reach
+        # `get_accounts_for_customer` at all, so the outage this test exists to
+        # observe would never happen. `pending_request.remember` ignores an
+        # authenticated session, so in this order there is no hold, no resume
+        # and no cache: the tool call really does go to the broken lookup.
         call.verify()
         monkeypatch.setattr(accounts, "get_accounts_for_customer", unreachable)
+        call.says(ASK_SAVINGS)
         answer = call.tool("get_account_balance", account_type="Savings")
         call.ends()
 
@@ -1469,8 +1498,13 @@ def test_normalisation_leaves_order_tools_and_counters_alone(traced):
 
         assert row.tool_call_count == 3
         assert len(tool_events) == 3
-        assert len(call.events(trace.KIND_TOOL)) == 3
-        assert len(call.tools_named("get_account_balance")) == 1
+        # Four traced, three counted: the fourth is the model repeating an
+        # enquiry Phase 7.3 had already answered, served from that answer.
+        assert len(call.events(trace.KIND_TOOL)) == 4
+        assert len(call.tools_named("get_account_balance")) == 2
+        assert [
+            e["tool_status"] for e in call.tools_named("get_account_balance")
+        ] == ["OK", trace.CACHE_SERVED]
     finally:
         call.close()
 

@@ -155,7 +155,9 @@ def _binding(context: Ctx) -> tuple[str, object]:
     return banking.session_id, banking.manager
 
 
-async def _dispatch(context: Ctx, tool_name: str, arguments: dict) -> dict:
+async def _dispatch(
+    context: Ctx, tool_name: str, arguments: dict, *, keep_pending: bool = False
+) -> dict:
     """Run a Phase 8 registered tool off the event loop.
 
     If the enquiry was refused only because the caller has not been verified
@@ -165,6 +167,49 @@ async def _dispatch(context: Ctx, tool_name: str, arguments: dict) -> dict:
     `app.pending_request`.
     """
     session_id, manager = _binding(context)
+
+    # Already read for this exact question by the deterministic resume. Hand
+    # that back rather than asking the bank a second time - one enquiry, one
+    # business operation, one tool event. The match is on tool *and* validated
+    # arguments: a follow-up about a different account is a different question
+    # and goes the ordinary way.
+    #
+    # Reached only after `_check_scope` has authorised the call, so this is a
+    # deduplication step and never a way in.
+    session = await asyncio.to_thread(context.context.session)
+    cached = pending_request.answer_for(session, tool_name, arguments)
+    if cached is not None:
+        if not keep_pending:
+            # The normal resumable-tool success path arriving: the enquiry has
+            # now been handed to the caller, so it stops being held, exactly as
+            # it would have if the tool had run here.
+            #
+            # Under `keep_pending` it must not be, or the deterministic resume
+            # would consume the very hold it is required to leave standing.
+            pending_request.clear(session, manager=manager)
+
+        # Written down, and written down as what it is. Returning here without
+        # recording anything left the model emitting a banking tool call that
+        # no operator could see - the one invocation with no event against it,
+        # which is precisely the shape that made the Phase 7.3 live failure
+        # slow to place. `served_from_cache` keeps it out of `answered` and
+        # `operations`, so the single real read stays single.
+        #
+        # `duration_ms=0` because nothing was waited for. The arguments go
+        # through the same sanitiser as every other tool event, and the cached
+        # banking result itself is never logged.
+        await asyncio.to_thread(
+            business.record_tool_outcome,
+            session_id,
+            tool_name,
+            cached,
+            duration_ms=0,
+            arguments=arguments,
+            session=session,
+            served_from_cache=True,
+        )
+        return cached
+
     started = time.perf_counter()
     result = await asyncio.to_thread(
         _run_tool, tool_name, session_id, arguments, manager
@@ -203,9 +248,20 @@ async def _dispatch(context: Ctx, tool_name: str, arguments: dict) -> dict:
             loan_type=arguments.get("loan_type"),
             manager=manager,
         )
-    elif result.get("success") and tool_name in pending_request.RESUMABLE_TOOLS:
+    elif (
+        result.get("success")
+        and tool_name in pending_request.RESUMABLE_TOOLS
+        and not keep_pending
+    ):
         # Answered. Nothing is owed to the caller any more, and a held enquiry
         # left lying about would keep the gate exemption open on later turns.
+        #
+        # `keep_pending` is the deterministic resume, which has answered the
+        # enquiry but must leave it held: the hold is also what authorises the
+        # model's own follow-up on a later turn without waiting for a ruling,
+        # and taking it away here reintroduced Phase 6.11.1's D-5 defect - a
+        # verified caller told `TURN_NOT_CLASSIFIED` about their own balance.
+        # The follow-up consumes the hold through the cached-answer path above.
         session = await asyncio.to_thread(context.context.session)
         pending_request.clear(session, manager=manager)
 
@@ -375,8 +431,92 @@ async def submit_pin(context: Ctx, spoken_pin: str) -> dict:
         pending = pending_request.recall(session)
         if pending is not None:
             result = {**result, "pending_request": pending.to_dict()}
+            # And answered here, rather than left to the model to remember.
+            answer = await _resume_held_enquiry(context, pending)
+            if answer is not None:
+                result = {**result, "pending_result": answer}
 
     return result
+
+
+async def _resume_held_enquiry(context: Ctx, pending) -> dict | None:
+    """Answer the enquiry the caller made before we knew who they were.
+
+    **The bank owns this action; the model owns only the wording.**
+
+    Two live calls at capacity 1 - `21fbca8a-1f16-...` (DEMO002, loan details)
+    and `5f9c0453-1f16-...` (DEMO001, savings balance) - authenticated
+    correctly, reached VERIFIED with the right customer, and then never called
+    the banking tool. Their enquiries were still sitting in the session
+    afterwards and both callers sat in silence until `CALLER_SILENT`. A control
+    call did the same three tools and asked for the balance 0.61 s later.
+
+    Nothing in this codebase differed between them. `submit_pin` handed the
+    held enquiry back in its result and the *prompt* asked the model to call
+    the tool it named - so whether a verified caller got an answer depended on
+    the model choosing to follow an instruction. Once an enquiry has been
+    classified, authorised and stored, that must not be optional.
+
+    So it is run here, and the result travels back inside `submit_pin`'s own
+    tool result. That is deliberately not a second response generator: the
+    model is already going to speak about this tool result, and putting the
+    answer inside it means no `response.create` of ours can overlap an active
+    response, cut into barge-in, or disturb the goodbye lifecycle.
+
+    **Nothing is trusted that was not already checked.** The tool name and its
+    account or loan type come only from `pending_request`, which
+    `turn_gate._hold_unverified_enquiry` wrote from a scope ruling and which
+    accepts nothing outside `RESUMABLE_TOOLS`. No model or caller input reaches
+    this. The call then goes through exactly the sequence a model-initiated one
+    does - `_check_scope`, then `_dispatch` - so `refusal_for`, the resume
+    exemption, cross-customer protection and the tool's own authorization all
+    apply unchanged, and the invocation is recorded like any other.
+
+    **Once only, and not by consuming the hold** - under B1 the hold is
+    deliberately left standing, because it is also what authorises the model's
+    own follow-up on a later turn. Three separate things make the business
+    operation happen at most once. A repeated or stale `submit_pin` never
+    reaches here: `authentication.submit_pin` answers an already-verified
+    session with `ALREADY_AUTHENTICATED` and no success, so the block that
+    calls this does not run. Should one arrive by any other route, `_dispatch`
+    returns the answer already read instead of asking the bank again. And a
+    failure caches nothing and leaves the enquiry held, which is the right way
+    round - an enquiry that was not answered is still owed.
+    """
+    session = await asyncio.to_thread(context.context.session)
+    if session is None or not session.authenticated:
+        # Deterministic resume is a post-verification act. Anything else is a
+        # caller who has not been identified reaching for banking data.
+        return None
+
+    if pending.tool not in pending_request.RESUMABLE_TOOLS:
+        # `remember` already refuses anything else; this is the second lock on
+        # the same door, because this value decides which tool runs.
+        logger.warning("held enquiry named a tool that cannot be resumed")
+        return None
+
+    arguments = pending.arguments()
+
+    refusal = await _check_scope(context, pending.tool)
+    if refusal is not None:
+        return refusal
+
+    answer = await _dispatch(context, pending.tool, arguments, keep_pending=True)
+
+    # The enquiry stays held - it is what authorises the model's own follow-up,
+    # on this turn or a later one, without waiting for a ruling that may never
+    # come. What changes is that the answer is already known, so that follow-up
+    # returns it instead of asking the bank again.
+    if isinstance(answer, dict) and answer.get("success"):
+        pending_request.remember_answer(
+            await asyncio.to_thread(context.context.session),
+            tool=pending.tool,
+            arguments=arguments,
+            result=answer,
+            manager=_binding(context)[1],
+        )
+
+    return answer
 
 
 @function_tool

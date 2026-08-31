@@ -184,6 +184,7 @@ def record_tool_outcome(
     duration_ms: int | None = None,
     arguments: dict | None = None,
     session=None,
+    served_from_cache: bool = False,
 ) -> None:
     """Count one banking tool, exactly once, for whichever channel ran it.
 
@@ -203,13 +204,37 @@ def record_tool_outcome(
     if reason is not None:
         logger.warning("%s tool=%s reason=%s", TOOL_FAILED, tool_name, reason)
 
-    status = "OK" if succeeded(result) else "FAILED"
-    recorder.record_tool_call(
-        session_id,
-        tool_name,
-        status=status,
-        duration_ms=duration_ms,
-    )
+    # `served_from_cache` says the bank was not asked: the model called a tool
+    # whose exact enquiry Phase 7.3 had already answered during the
+    # deterministic resume, so `_dispatch` returned the answer already read.
+    #
+    # The `succeeded` guard is not ceremony. Only a successful result is ever
+    # cached, so a failure arriving here would mean that invariant had broken,
+    # and the one thing that must never happen is an outage being written down
+    # as an answer the caller was given.
+    if served_from_cache and succeeded(result):
+        status = trace.CACHE_SERVED
+    else:
+        status = "OK" if succeeded(result) else "FAILED"
+
+    # `agent_tool_events` and `tool_call_count` are the **counter** surface, and
+    # they count what the bank was actually asked to do. A cache-served
+    # follow-up asked it nothing, so it is deliberately absent from both:
+    # `test_the_trace_does_not_inflate_the_existing_counters` exists to hold one
+    # invocation to one row and one count, and an enquiry the bank answered once
+    # must never reach an operations board as two tool calls.
+    #
+    # It is still recorded below, in the trace, which is the **narrative**
+    # surface and is where the distinction can be drawn without arithmetic.
+    # That split is the design: the counters stay conservative, the story stays
+    # complete, and neither has to lie to keep the other honest.
+    if status != trace.CACHE_SERVED:
+        recorder.record_tool_call(
+            session_id,
+            tool_name,
+            status=status,
+            duration_ms=duration_ms,
+        )
 
     # The same invocation, told as a story rather than counted. Hung off this
     # function rather than off a second call site, so a tool can never be

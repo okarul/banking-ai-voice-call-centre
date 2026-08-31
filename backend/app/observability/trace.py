@@ -60,6 +60,19 @@ KIND_TOOL = "TOOL"
 KIND_AUTH = "AUTH"
 KIND_LIFECYCLE = "LIFECYCLE"
 
+# `tool_status` values. OK and FAILED are what a tool that actually ran
+# reports. CACHE_SERVED is the third thing that can happen to a banking
+# invocation, and it is deliberately neither: the model asked again for an
+# enquiry the backend had already answered during Phase 7.3's deterministic
+# resume, so the caller was served the answer already read and **the bank was
+# not asked a second time**. Recording it as OK would put two business
+# executions in the trace where one happened; leaving it out entirely - which
+# is what it did before - left the operator a model tool call with no event
+# against it at all.
+TOOL_OK = "OK"
+TOOL_FAILED_STATUS = "FAILED"
+CACHE_SERVED = "CACHE_SERVED"
+
 SPEAKER_CUSTOMER = "CUSTOMER"
 SPEAKER_AGENT = "AGENT"
 SPEAKER_SYSTEM = "SYSTEM"
@@ -783,8 +796,20 @@ def _summarise(events: list[dict]) -> dict:
         if event.get("kind") == KIND_TOOL
         and event.get("tool_name", "").startswith("get_")
     ]
-    answered = [event for event in banking if event.get("tool_status") == "OK"]
-    refused = [event for event in banking if event.get("tool_status") == "FAILED"]
+    answered = [event for event in banking if event.get("tool_status") == TOOL_OK]
+    refused = [
+        event for event in banking if event.get("tool_status") == TOOL_FAILED_STATUS
+    ]
+    # Counted apart from both. `banking_enquiries` has always counted
+    # invocations rather than executions - a refusal reaches the bank no more
+    # than a cache hit does, and has always been counted - so a follow-up
+    # served from the resumed answer belongs in it. What must not move is
+    # `answered`, which is how many times the bank was actually read, and
+    # `operations`, which names those reads. Both are left to the real
+    # executions alone, so one resumed enquiry can never read as two.
+    cache_served = [
+        event for event in banking if event.get("tool_status") == CACHE_SERVED
+    ]
     verified = any(
         event.get("auth_status") == "VERIFIED" for event in events
     )
@@ -794,6 +819,7 @@ def _summarise(events: list[dict]) -> dict:
         "banking_enquiries": len(banking),
         "answered": len(answered),
         "refused": len(refused),
+        "cache_served": len(cache_served),
         "operations": sorted({event["tool_name"] for event in answered}),
         "refusal_reasons": sorted(
             {event["failure_reason"] for event in refused if event.get("failure_reason")}
