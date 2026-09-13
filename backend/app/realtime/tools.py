@@ -34,7 +34,7 @@ import time
 from agents import RunContextWrapper, function_tool
 from sqlalchemy.exc import SQLAlchemyError
 
-from app import pending_request
+from app import pending_clarification, pending_request
 from app.agents.intents import Domain
 from app.agents.registry import dispatch
 from app.agents.selection import carry_type
@@ -265,6 +265,54 @@ async def _dispatch(
         session = await asyncio.to_thread(context.context.session)
         pending_request.clear(session, manager=manager)
 
+    # --- the question this bank asked the caller ----------------------------
+    #
+    # A missing selection is not a refusal and not an outage: it is the bank
+    # putting a question, and from Phase 7.4B the bank remembers having put it.
+    # Recorded here because this is the one place every banking tool's outcome
+    # passes through, so a seventh tool gets the same behaviour by existing.
+    session = await asyncio.to_thread(context.context.session)
+    reason = result.get("reason")
+
+    if result.get("success") is False and reason in (
+        pending_clarification.CLARIFYING_REASONS
+    ):
+        pending_clarification.open_for(
+            session,
+            tool=tool_name,
+            reason=reason,
+            arguments=arguments,
+            choices=(
+                result.get("available_account_types")
+                or result.get("available_loan_types")
+                or ()
+            ),
+            manager=manager,
+        )
+    elif result.get("success"):
+        answered = pending_clarification.recall(session)
+        completed_here = (
+            answered is not None
+            and answered.complete
+            and answered.tool == tool_name
+        )
+        # Answered, so nothing is outstanding any more - whether this result
+        # came from a clarification or from a question the caller asked whole.
+        pending_clarification.clear(session, manager=manager)
+
+        if completed_here:
+            # Kept against the exact arguments that produced it, so a caller who
+            # repeats their answer is read back the same figure rather than
+            # having the bank read twice. Written after the clear above, which
+            # forgets the previous one.
+            pending_request.remember_answer(
+                session,
+                tool=tool_name,
+                arguments=arguments,
+                result=result,
+                manager=manager,
+            )
+
     return result
 
 
@@ -360,10 +408,31 @@ async def _carried(
     if session is None:
         return stated
 
-    carried = carry_type(session, domain, stated)
+    # 1. What the caller just said, as the model heard it.
+    if stated is not None:
+        return stated
+
+    # 2. The answer they gave to this bank's own clarifying question. Scoped to
+    #    the one tool that question was asked for and to the domain it was
+    #    asked in, so it can never redirect a different enquiry. This is what
+    #    stops a clarified request depending on the model repeating a word the
+    #    caller has already said.
+    clarified = pending_clarification.recall(session)
+    if (
+        clarified is not None
+        and clarified.complete
+        and clarified.tool == tool_name
+        and clarified.domain is domain
+    ):
+        return clarified.answer
+
+    # 3. The account or loan this call is already discussing.
+    carried = carry_type(session, domain, None)
     if carried is not None:
         return carried
 
+    # 4. The account or loan named in the enquiry being held across
+    #    authentication.
     held = pending_request.recall(session)
     if held is None or held.tool != tool_name:
         return None
@@ -392,6 +461,20 @@ async def submit_customer_id(context: Ctx, spoken_customer_id: str) -> dict:
         spoken_customer_id,
         manager=manager,
     )
+    # Identifying resets what the call is about. An enquiry opened while the
+    # bank believed it was speaking to somebody else must not become authority
+    # once it believes otherwise: the clarification carries a tool and an
+    # account type, and answering it after an identity change would answer the
+    # new customer's question with the old one's shape.
+    #
+    # Cleared unconditionally rather than only on a change, because "the same
+    # id again" and "a different id" are not reliably distinguishable at this
+    # point and the safe answer is the same for both. The cost is that a caller
+    # who re-states their id is asked which account again; the alternative is a
+    # question surviving across identities.
+    session = await asyncio.to_thread(manager.get_session, session_id)
+    pending_clarification.clear(session, manager=manager)
+
     # The authentication tools do not pass through `_dispatch`, so they mirror
     # themselves. Identity is re-read from the session afterwards rather than
     # taken from `result`: a claim is not a verification.

@@ -34,6 +34,68 @@ cd ..\frontend
 & "C:\Social Eagle AI Course\Call Centre Project\banking-ai-voice-call-centre\backend\.venv\Scripts\python.exe" serve.py
 ```
 
+## 1a. Supported process topology — read before scaling or deploying
+
+This backend runs as **one process with one worker**, and that is a correctness
+requirement rather than a sizing preference.
+
+```powershell
+# Correct: one process, one worker.
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --port 8001
+
+# NOT supported. Do not do this.
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --port 8001 --workers 4
+```
+
+Three pieces of state live in process memory and have no shared-state
+equivalent:
+
+| State | Where | Consequence of a second worker |
+|---|---|---|
+| capacity ceiling | `voice_call_manager` | each worker enforces its own ceiling, so the bank holds N times the configured number of provider sessions |
+| live calls | `phone_call_registry` | a worker cannot see, drain or reclaim another's calls |
+| call ownership | `app.process_ownership` | startup repair cannot tell another worker's live call from a crash orphan |
+
+**Restarts and deploys must not overlap.** Stop the old process, let it drain,
+then start the new one. `app.main.lifespan` repairs rows left open by a previous
+generation during startup, *before* it begins serving — and under one
+non-overlapping process everything still open at that moment genuinely does
+belong to a generation that is gone.
+
+Start a new process while the old one is still carrying calls and that
+assumption is false. The new process will stamp the old one's live calls
+`FORCED_CLEANUP`, which is an operations-board inaccuracy: it reads as "abandoned
+by a crashed process" for a call that is going perfectly well. It is **not** a
+resource leak — since Phase 7.4A.1 a process releases its own bridge, model
+session and capacity slot from its own memory and no longer asks the database
+for permission — but the recorded reason will be wrong.
+
+### What is not solved
+
+**True multi-process rolling-restart liveness remains out of scope and is not
+solved. Supported topology is one backend process / one worker /
+non-overlapping restart.**
+
+Specifically:
+
+* `PROCESS_OWNER_ID` and the pending-terminal set in `app.process_ownership` are
+  **process-local memory**, not a distributed lease. They establish *same-process*
+  ownership and nothing more.
+* Nothing here leases, heartbeats, or takes an advisory lock, so no process can
+  establish whether another process is alive. That was a deliberate decision, not
+  an omission.
+* Multiple workers, or overlapping old/new application processes, require a
+  future ownership/lease architecture. Until that exists, the topology above is
+  the supported one.
+
+Nothing in the repository can enforce this: `--workers 4` is a command line, not
+a code path. It is an operational requirement, and this is where it is written
+down. See the module docstring of `backend/app/process_ownership.py` for the
+reasoning, and `docs/TELEPHONY_MEDIA.md`, which already recorded that the
+capacity ceiling is in-memory and single-process.
+
+---
+
 ## 2. Health checks
 
 ```powershell

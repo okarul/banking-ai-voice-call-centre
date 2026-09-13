@@ -102,6 +102,36 @@ SILENCE_CHECK_SPEECH = "I do not hear anything from you. Do you want to continue
 # speaks. See `app.telephony.lifecycle`.
 SILENCE_CLOSING_CUE = "[The caller has been silent. Close the call now.]"
 
+
+def clarified_answer_cue(result) -> str:
+    """What is sent into a telephone session when the bank has answered itself.
+
+    A cue carrying data, in the same shape as `SILENCE_CLOSING_CUE` and for the
+    same reason: the *wording* lives in the agent's instructions, which is the
+    one place that decides how this bank speaks. Nothing here is a sentence the
+    caller hears.
+
+    What it carries is the banking result exactly as the tool returned it - the
+    same structure the model would have received had it made the call itself.
+    That is deliberate. The alternative, writing the sentence here, would put a
+    second voice in this system and make the telephone answer differ from the
+    browser for no reason anybody could see.
+
+    Used when a caller has completed a clarification the bank asked for: the
+    backend runs the enquiry and hands the answer to the response path rather
+    than waiting for the model to ask on the caller's behalf. The instruction
+    not to call the tool again is guidance, not a control - the exactly-once
+    guarantee is the cache in `app.pending_request`, which holds whether the
+    model follows this or not.
+    """
+    import json
+
+    return (
+        "[The caller has answered your question and the bank has already "
+        "looked it up. Do not call the tool again. Tell them this result in "
+        "your own words: " + json.dumps(result, ensure_ascii=False, default=str) + "]"
+    )
+
 # Words that mean the bank has said its closing line and the call may be taken
 # down once the line has finished playing.
 #

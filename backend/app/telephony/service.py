@@ -34,6 +34,7 @@ import asyncio
 import time
 
 from app.config import settings
+from app import process_ownership
 from app.observability import recorder
 from app.observability.events import AuditEvent, safe_event
 from app.realtime.browser_calls import voice_call_manager
@@ -137,6 +138,109 @@ async def handle_event(payload: InboundCallEvent) -> EventResult:
     return await _end_call(payload)
 
 
+# What an attempt to write the terminal row came to. Three outcomes, because
+# two of them are finished and one is not, and the caller has to tell them
+# apart: `_record_ending` used to swallow the difference, which is precisely how
+# a row this process still owed could stop looking like ours.
+TERMINAL_RECORDED = "recorded"
+TERMINAL_ALREADY = "already_terminal"
+TERMINAL_FAILED = "failed"
+
+
+async def _record_and_release(
+    provider_call_id: str, banking_session_id: str, reason: str
+) -> None:
+    """End one call: write it down, let it go, and finish writing it down.
+
+    The ordering is the whole of Phase 7.4A.1 and every step of it is
+    load-bearing.
+
+    **1. Claim the row first.** Before anything can fail, and before
+    `tear_down` destroys the session, the bridge and the slot - which is every
+    other trace of this process having been involved. A claim made after the
+    write could not be made at all if the write raised.
+
+    **2. Try to write it.** Bounded by the Phase 7.4A statement and lock
+    timeouts, so this cannot hang.
+
+    **3. Release the caller's resources whatever happened.** This is the Phase
+    7.4A invariant and it does not bend: a database that will not answer must
+    never keep a bridge, a model session or a capacity slot alive. The release
+    does not wait for the database and is not conditional on it.
+
+    **4. Only then, one retry.** After the release, so it delays nothing a
+    caller can feel, and exactly once - a second attempt catches the ordinary
+    transient (a lock lost under contention, a connection recycled) and a third
+    would only be a slower way of finding out the database is down.
+
+    If the retry also fails the claim stays, which is the point: the row is
+    still ours to finish, so the next startup *in this process* must leave it
+    alone rather than repair it as a crash orphan. Should this process then
+    die, the claim dies with it and the row becomes a genuine orphan that a
+    genuinely new process may repair - which is exactly what it is.
+    """
+    process_ownership.mark_terminal_pending(banking_session_id, reason)
+
+    outcome = _record_ending(provider_call_id, reason)
+    if outcome is not TERMINAL_FAILED:
+        process_ownership.clear_terminal_pending(banking_session_id)
+
+    await tear_down(provider_call_id, banking_session_id)
+
+    if outcome is TERMINAL_FAILED:
+        # Off the loop: this is synchronous SQLAlchemy and the caller it is
+        # running under may be pacing audio for other calls. Awaited rather
+        # than scheduled, so the attempt is observed and nothing is left to a
+        # task nobody holds.
+        retry = await asyncio.to_thread(_record_ending, provider_call_id, reason)
+        if retry is not TERMINAL_FAILED:
+            process_ownership.clear_terminal_pending(banking_session_id)
+        else:
+            logger.error(
+                "telephony ending still unrecorded for %s; the row stays owned "
+                "by this process and will not be reconciled as an orphan",
+                provider_call_id,
+            )
+
+
+def _record_ending(provider_call_id: str, reason: str) -> str:
+    """Write down how a call ended, and never let that stop it being released.
+
+    `close_phone_call` deliberately raises where the rest of observability
+    swallows: the conditional update *is* the guarantee that one hang-up
+    releases one capacity slot, and reporting success for a write that did not
+    happen would be the exact failure idempotency exists to prevent. That
+    reasoning holds for `_end_call`, which reads the return value to decide
+    whether it may release anything at all.
+
+    It does not hold here. These three callers have already decided the call is
+    over — a lifecycle ending, a failed pump, an idle sweep — and the row is
+    the *record* of that decision rather than the decision itself. Letting an
+    exception out of it skips the `tear_down` on the next line, and what that
+    strands is a provider session that goes on billing and a capacity slot that
+    never comes back. On a deployment with `REALTIME_MAX_ACTIVE_SESSIONS = 1`
+    that is one database blip away from every later caller being told the bank
+    is full.
+
+    So the release always runs, and a row that could not be written is
+    reconciled at the next startup, which is what that reconciliation is for.
+    """
+    try:
+        moved = recorder.close_phone_call(provider_call_id, reason=reason)
+    except Exception as error:
+        # Type only, like every other log in this module.
+        logger.error(
+            "telephony ending not recorded for %s: %s",
+            provider_call_id,
+            type(error).__name__,
+        )
+        return TERMINAL_FAILED
+    # A row came back, so this execution is the one that ended the call. None
+    # means something else got there first, or there was nothing to end - both
+    # of which leave the row terminal and neither of which is ours to redo.
+    return TERMINAL_RECORDED if moved is not None else TERMINAL_ALREADY
+
+
 async def _on_call_ended(
     provider_call_id: str, banking_session_id: str, reason: str
 ) -> None:
@@ -159,8 +263,7 @@ async def _on_call_ended(
     # loop happened to schedule the route first, and an operator would be told
     # the caller rang off in the middle of the bank's own closing line.
     # This call is synchronous, so nothing can interleave before it commits.
-    recorder.close_phone_call(provider_call_id, reason=recorded)
-    await tear_down(provider_call_id, banking_session_id)
+    await _record_and_release(provider_call_id, banking_session_id, recorded)
 
 
 async def _on_call_lost(
@@ -178,11 +281,98 @@ async def _on_call_lost(
     # Before the teardown, for the reason given in `_on_call_ended`: the
     # teardown wakes the media route, and the route would otherwise record
     # this failure as a caller hang-up.
-    recorder.close_phone_call(provider_call_id, reason=cause)
-    await tear_down(provider_call_id, banking_session_id)
+    await _record_and_release(provider_call_id, banking_session_id, cause)
+
+
+# Conversations still being opened. Held for the same reason `_releasing`
+# is: `asyncio` keeps only a weak reference to a running task, so one that
+# nothing else names may be collected mid-flight. What that loses here is the
+# whole of `_open_conversation` — the media wait, the protocol check, the
+# greeting, and the teardown that each of them falls back on.
+# Keyed by call rather than held as an anonymous set, because holding a
+# reference is only half of owning something. A call that ends while its
+# greeting is still waiting for media has to be able to *stop* that greeting,
+# and to do that it needs to find the one task that belongs to it. An unkeyed
+# set can only be waited on or cancelled in its entirety, which on a five-call
+# switchboard would mean one hang-up silencing the other four.
+_opening: dict[str, asyncio.Task] = {}
+
+
+def _begin_conversation(bridge: PhoneCallBridge) -> None:
+    """Start the greeting sequence for an admitted call, owned by that call."""
+    task = asyncio.ensure_future(_open_conversation(bridge))
+    _opening[bridge.provider_call_id] = task
+
+    def _forget(finished: asyncio.Task, call_id=bridge.provider_call_id) -> None:
+        # Only if it is still *this* task. A provider that re-announced the call
+        # would otherwise have the first attempt's completion evict the second.
+        if _opening.get(call_id) is finished:
+            del _opening[call_id]
+
+    task.add_done_callback(_forget)
+
+
+async def _stop_opening(provider_call_id: str) -> None:
+    """Stop a greeting sequence still waiting on a call that has ended.
+
+    A greeting waits up to the media-connect timeout for a socket to attach,
+    and a caller can hang up inside that window. Left running, the task waits
+    out the timeout on a call that no longer exists and then tries to tear it
+    down a second time - and in the worst case reaches a model session to speak
+    into a line that is already down. Neither is dangerous today; both are the
+    kind of activity that must not outlive its call.
+
+    Never awaits itself. `_open_conversation` reaches `tear_down` on its own
+    failure paths, so this can be running *inside* the task it is cancelling -
+    the same shape `PhoneCallBridge.close` handles for its pumps, and the same
+    answer.
+    """
+    task = _opening.pop(provider_call_id, None)
+    if task is None or task.done():
+        return
+    task.cancel()
+    if task is asyncio.current_task():
+        return
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        # It was cancelled, which is the point, or it failed on the way down,
+        # which changes nothing: the call is over either way.
+        pass
 
 
 async def _open_conversation(bridge: PhoneCallBridge) -> None:
+    """`_greet_when_ready`, with nowhere for a failure to disappear to.
+
+    This runs as a task nobody awaits, and an exception escaping a task nobody
+    awaits is not reported until the interpreter collects it — by which time
+    the call it belonged to has been sitting on a capacity slot and an open
+    provider session, silent, for however long the idle sweep takes to notice.
+    Every *expected* failure below already converges on `tear_down`; this is
+    the same ending for the ones nobody predicted.
+    """
+    try:
+        await _greet_when_ready(bridge)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.error(
+            "telephony conversation could not be opened for %s: %s",
+            bridge.provider_call_id,
+            type(error).__name__,
+        )
+        if bridge.closed:
+            # Something already ended this call, and that ending owns the
+            # record of why. Releasing again would be harmless and saying
+            # anything would be wrong.
+            return
+        recorder.mark_phone_call_rejected(
+            bridge.provider_call_id, reason=reasons.APPLICATION_ERROR
+        )
+        await tear_down(bridge.provider_call_id, bridge.banking_session_id)
+
+
+async def _greet_when_ready(bridge: PhoneCallBridge) -> None:
     """Wait for the caller's audio path, then have the agent say hello.
 
     Two jobs that have to happen in this order, which is why they are one task
@@ -275,10 +465,11 @@ async def sweep_idle_calls() -> int:
         # so tearing down first would wake it and let `CUSTOMER_ENDED` land on
         # a call that no caller was on — which is the one thing an idle sweep
         # exists to be able to say.
-        recorder.close_phone_call(
-            bridge.provider_call_id, reason=reasons.IDLE_TIMEOUT
+        await _record_and_release(
+            bridge.provider_call_id,
+            bridge.banking_session_id,
+            reasons.IDLE_TIMEOUT,
         )
-        await tear_down(bridge.provider_call_id, bridge.banking_session_id)
         closed += 1
 
     # Retention rides this sweep, so there is no timer to supervise - but only
@@ -300,6 +491,57 @@ async def sweep_idle_calls() -> int:
             "telephony trace retention failed: %s", type(error).__name__
         )
     return closed
+
+
+async def release_live_calls() -> int:
+    """Hand back every telephone call this process is still carrying.
+
+    For shutdown, and only for shutdown. The idle sweep reclaims calls that
+    have gone quiet; this reclaims calls that are going perfectly well, because
+    the process they are running in has been asked to stop.
+
+    Without it, a restart — which is to say every deployment — abandons its
+    live calls rather than ending them:
+
+    * the model session is never closed, so the provider goes on holding it
+      (and billing for it) until it times out on its own;
+    * the media socket is never closed, so the gateway is never told the call
+      is over and never sends the SIP BYE — the caller is left holding a line
+      that has stopped answering rather than one that hung up;
+    * and the row stays ACTIVE with no `ended_at`, so the operations board
+      shows a call nobody is on until some later process happens to start and
+      reconcile it. If the deployment is rolled back, no later process does.
+
+    `PhoneCallRegistry.close_all` has said "used on shutdown" since it was
+    written and nothing but the test suite has ever called it. This is the
+    caller it was waiting for.
+
+    Each call is released through the same `tear_down` every other ending uses,
+    one at a time, and a failure on one does not stop the next: half a
+    switchboard released is better than none, and the ones that fail are what
+    the startup reconciliation is for.
+
+    Returns how many calls were released.
+    """
+    bridges = phone_call_registry.all_bridges()
+    if not bridges:
+        return 0
+
+    logger.info("shutdown: releasing %d live telephone call(s)", len(bridges))
+    for bridge in bridges:
+        try:
+            await _record_and_release(
+                bridge.provider_call_id,
+                bridge.banking_session_id,
+                reasons.SERVICE_SHUTDOWN,
+            )
+        except Exception as error:
+            logger.error(
+                "shutdown: call %s not released: %s",
+                bridge.provider_call_id,
+                type(error).__name__,
+            )
+    return len(bridges)
 
 
 async def _far_end_is_compatible(transport, timeout: float) -> bool:
@@ -455,7 +697,7 @@ async def _register_incoming(payload: InboundCallEvent) -> EventResult:
 
     # Waits for the caller's audio path, then greets them. Exits by itself when
     # the call ends, because ending the transport marks it ready.
-    asyncio.ensure_future(_open_conversation(bridge))
+    _begin_conversation(bridge)
 
     _audit(AuditEvent.CALL_ACCEPTED, payload, agent_session_id=agent_session_id)
     return EventResult(
@@ -600,7 +842,23 @@ async def _release_everything(
     provider session and its capacity slot. A bridge that cannot close is not a
     reason to keep paying for a model session nobody is listening to.
     """
-    await asyncio.to_thread(_trace_ending, banking_session_id, provider_call_id)
+    # First, because it is the only step that stops something still *running*.
+    # Everything below releases a resource; this ends an activity, and ending it
+    # before the transport and the model session are released is what stops a
+    # greeting arriving at a call that has just been taken apart underneath it.
+    await _released("greeting", _stop_opening(provider_call_id))
+
+    # Through `_released` like every other step, and it is the step that most
+    # needed it. This is the last line of the replay, which makes it
+    # observability — but it stood outside the guard, first, ahead of every
+    # actual release. `trace.record` is deliberately not `@_safe` (a trace with
+    # holes in it is worse than no trace), so a database blip at hang-up raised
+    # here and stranded the whole function: the bridge stayed in the registry,
+    # the provider session stayed open, and the capacity slot never came back —
+    # precisely the sequence this docstring promises cannot happen.
+    await _released(
+        "trace", asyncio.to_thread(_trace_ending, banking_session_id, provider_call_id)
+    )
 
     bridge = await _released("bridge", phone_call_registry.remove(provider_call_id))
     if bridge is not None:
@@ -650,16 +908,48 @@ async def _end_call(payload: InboundCallEvent) -> EventResult:
         payload.provider_call_id, reason=reasons.PROVIDER_HANGUP
     )
 
-    if banking_session_id is None:
-        # Either unknown or already closed. Both are no-ops, and both are
-        # answered the same way so that an event naming somebody else's call
-        # cannot be used to discover whether that call exists.
+    # Whether this process still holds anything for this call is a **local**
+    # question, and only a local answer settles it.
+    #
+    # It used to be answered by the line above. "The conditional update returned
+    # a row, so this is the one execution that may hand the slot back" is sound
+    # reasoning about two concurrent `ended` webhooks - and unsound the moment
+    # anything *else* closes the row, because it uses a shared database
+    # transition as a proxy for a process-local fact. The row says what the bank
+    # has recorded; the registry says what this process is holding; only the
+    # second decides what there is to release.
+    #
+    # Phase 7.4A.1 measured the gap. Another application context's startup
+    # repair closed the row, this path got `None` back, reported
+    # `ALREADY_ENDED`, and released nothing - leaving a bridge, a capacity slot
+    # and a provider session held until the idle sweep noticed minutes later. At
+    # `REALTIME_MAX_ACTIVE_SESSIONS = 1` that is every subsequent caller being
+    # told the bank is full.
+    bridge = phone_call_registry.get(payload.provider_call_id)
+
+    if banking_session_id is None and bridge is None:
+        # Nothing recorded and nothing held. Unknown call, or an ending already
+        # dealt with in full. Both are no-ops, and both are answered the same
+        # way so that an event naming somebody else's call cannot be used to
+        # discover whether that call exists.
         _audit(AuditEvent.CALL_ENDED, payload, reason="NO_OPEN_CALL")
         return EventResult(Outcome.ALREADY_ENDED, payload.provider_event_id)
 
-    # The conditional update above returned a row, so this is the one execution
-    # that closed this call, and therefore the one that may hand the slot back.
-    await tear_down(payload.provider_call_id, banking_session_id)
+    # Idempotent, so arriving here twice releases one call's worth of
+    # resources: the registry hands a bridge back once, and `close` returns
+    # False the second time.
+    await tear_down(
+        payload.provider_call_id,
+        banking_session_id or bridge.banking_session_id,
+    )
+
+    if banking_session_id is None:
+        # Something else recorded the ending, so this execution may not claim
+        # it - but it *was* the one still holding the resources, and they are
+        # now released. Reported as it always was, so an operator reading the
+        # board still sees one ending per call.
+        _audit(AuditEvent.CALL_ENDED, payload, reason="NO_OPEN_CALL")
+        return EventResult(Outcome.ALREADY_ENDED, payload.provider_event_id)
 
     _audit(AuditEvent.CALL_ENDED, payload, reason=reasons.PROVIDER_HANGUP)
     return EventResult(Outcome.ENDED, payload.provider_event_id)

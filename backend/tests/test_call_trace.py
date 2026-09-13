@@ -23,6 +23,7 @@ All customers, PINs and card numbers here are synthetic.
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 
@@ -283,6 +284,79 @@ def stored_blob() -> str:
     Phase 6.16: text-bearing columns only, for the reason in `_text_blob`.
     """
     return _text_blob(CallTraceEvent)
+
+
+# Field names whose value is produced by this application's clock or its
+# counters, never by anything a caller or a model said.
+#
+# Listed for the assertion below rather than for the filter: the filter itself
+# works on *type*, so a machine-generated field added later is covered without
+# anyone remembering this tuple. What the names are for is proving the filter
+# has not quietly swallowed anything else - see `_api_text_blob`.
+MACHINE_GENERATED_TRACE_FIELDS = (
+    "sequence", "turn", "at", "duration_ms", "started_at", "ended_at",
+    "duration_seconds", "tool_call_count",
+)
+
+# What a serialised ISO-8601 instant looks like. Deliberately anchored and
+# deliberately narrow: it matches the output of `datetime.isoformat()` and
+# nothing a caller could plausibly say.
+_ISO_INSTANT = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)?$"
+)
+
+
+def _api_text_blob(payload) -> str:
+    """The trace API response, with the clock removed and every word kept.
+
+    The same correction `_text_blob` already applies to the database, applied
+    to the other half of the same assertion. The stored rows stopped being
+    searched with a stopwatch in them in Phase 6.16; the API response they are
+    rendered into did not, and it carries the identical hazard in `at`,
+    `duration_ms`, `duration_seconds` and the summary counters.
+
+    Phase 7.4B watched it fire: `test_more_sensitive_shapes_never_reach_the
+    _trace[cvv]` failed on a CVV of "419" that had never been stored anywhere,
+    because the microsecond field of an event timestamp read
+    `...:37.494192+00:00`. A three-digit secret collides with a clock roughly
+    as often as the clock is read.
+
+    **This removes noise, not coverage.** What is dropped is numbers and
+    instants, and neither can hold an utterance: the columns behind them are
+    `Integer` and `DateTime`, so a string the caller spoke cannot be stored in
+    one even if the redaction failed completely. Every text-bearing field -
+    `utterance`, `tool_arguments`, `customer_ref`, `intent`, `refusal_reason`,
+    `pending_operation`, `account_type`, `loan_type`, and anything added beside
+    them - is still searched, because the filter names none of them.
+
+    Booleans are kept. They stringify to "true" and "false", which no secret in
+    this suite resembles, and keeping them costs nothing.
+    """
+    return json.dumps(_api_searchable(payload), ensure_ascii=False)
+
+
+def _api_searchable(value):
+    """The same payload with every clock and counter blanked, as a structure.
+
+    Kept apart from the dump so a test can compare what survives field by
+    field, rather than by substring - `tool_arguments` is itself JSON, and its
+    quotes come back escaped from `json.dumps`, so a literal comparison against
+    the rendered blob would fail for a value that is perfectly well covered.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        # A counter or a duration. Cannot carry text.
+        return None
+    if isinstance(value, str):
+        # An instant. Cannot carry text either, and is the field that actually
+        # caused the false positive.
+        return None if _ISO_INSTANT.match(value) else value
+    if isinstance(value, dict):
+        return {name: _api_searchable(item) for name, item in value.items()}
+    if isinstance(value, list):
+        return [_api_searchable(item) for item in value]
+    return value
 
 
 # === 1. the trace tells the story ==========================================
@@ -689,7 +763,13 @@ def test_a_sensitive_utterance_never_reaches_the_trace(traced, name, caplog):
         assert secret not in blob, f"{name} reached the trace table"
         assert secret.lower() not in blob.lower(), f"{name} reached the trace table"
 
-        replay = json.dumps(call.replay())
+        # The clock removed and every word kept - see `_api_text_blob`.
+        # The stored-row half of this assertion has been type-filtered
+        # since Phase 6.16 for exactly this reason; the API response it
+        # renders into was still scanned with a stopwatch in it, and a
+        # short secret collides with a microsecond field about as often
+        # as the clock is read.
+        replay = _api_text_blob(call.replay())
         assert secret.lower() not in replay.lower(), f"{name} reached the API"
 
         logged = " ".join(record.getMessage() for record in caplog.records)
@@ -813,7 +893,7 @@ def test_the_balance_itself_is_never_stored(traced):
         balance = answer["available_balance"]
         assert balance, "the test stopped exercising a successful lookup"
         assert balance not in stored_blob()
-        assert balance not in json.dumps(call.replay())
+        assert balance not in _api_text_blob(call.replay())
     finally:
         call.close()
 
@@ -1015,7 +1095,13 @@ def test_more_sensitive_shapes_never_reach_the_trace(traced, name, caplog):
         blob = stored_blob()
         assert secret.lower() not in blob.lower(), f"{name} reached the trace table"
 
-        replay = json.dumps(call.replay())
+        # The clock removed and every word kept - see `_api_text_blob`.
+        # The stored-row half of this assertion has been type-filtered
+        # since Phase 6.16 for exactly this reason; the API response it
+        # renders into was still scanned with a stopwatch in it, and a
+        # short secret collides with a microsecond field about as often
+        # as the clock is read.
+        replay = _api_text_blob(call.replay())
         assert secret.lower() not in replay.lower(), f"{name} reached the API"
 
         # Every text column of the row, rather than a hand-picked tuple with a
@@ -3359,3 +3445,108 @@ def test_a_provider_finished_item_is_still_written_at_generation_end(bridge_call
 
     written = [e["utterance"] for e in agent_events(call_id)]
     assert written == ["A finished sentence."], written
+
+
+# === 12. the privacy search itself (Phase 7.4B) =============================
+
+
+@pytest.mark.trace
+def test_a_clock_that_reads_like_a_secret_is_not_a_privacy_failure():
+    """The false positive, pinned so it cannot return.
+
+    `test_more_sensitive_shapes_never_reach_the_trace[cvv]` failed a full-suite
+    run on a CVV of "419" that had never been stored anywhere: the microsecond
+    field of an event timestamp read `...:37.494192+00:00`. An intermittently
+    red privacy gate is worse than a noisy one, because it teaches everybody to
+    run it again - and the final qualification for this phase requires a
+    deterministic zero.
+
+    Both halves are asserted here. A clock must not read as a leak, and the
+    same search must still catch a real one; a filter that bought the first by
+    giving up the second would be worse than the flake it replaced.
+    """
+    secret = "419"
+
+    clock_only = {
+        "summary": {"banking_enquiries": 419},
+        "call": {
+            "started_at": "2026-09-11T01:34:37.419000+00:00",
+            "duration_seconds": 419,
+        },
+        "events": [
+            {
+                "sequence": 419,
+                "turn": 419,
+                "at": "2026-09-11T01:34:37.494192+00:00",
+                "duration_ms": 419,
+                "kind": "turn",
+                "utterance": "what is my savings balance",
+            }
+        ],
+    }
+    assert secret not in _api_text_blob(clock_only), (
+        "a timestamp or a counter still reads as a leaked secret"
+    )
+
+    genuinely_leaked = {
+        "events": [
+            {
+                "at": "2026-09-11T01:34:37.000000+00:00",
+                "kind": "turn",
+                "utterance": "the cvv is 419",
+            }
+        ],
+    }
+    assert secret in _api_text_blob(genuinely_leaked), (
+        "the search stopped catching a secret in an utterance"
+    )
+
+
+@pytest.mark.trace
+def test_the_api_privacy_search_gives_up_nothing_but_the_clock(traced):
+    """The filter must never be the reason the assertion above passes.
+
+    Every field of a real replay that is not a number or an instant is still in
+    what gets searched. Asserted against a live trace rather than a fixture, so
+    a field added to `_row_to_dict` later is covered by this the day it appears.
+    """
+    call = Call()
+    try:
+        call.says(ASK_SAVINGS)
+        call.verify()
+        call.tool("get_account_balance", account_type="Savings")
+        call.ends()
+
+        raw = call.replay()
+
+        def text_fields(node, seen):
+            """Every (name, value) in this payload that could hold an utterance."""
+            if isinstance(node, dict):
+                for name, value in node.items():
+                    if isinstance(value, (dict, list)):
+                        text_fields(value, seen)
+                    elif isinstance(value, str) and not _ISO_INSTANT.match(value):
+                        seen.add((name, value))
+            elif isinstance(node, list):
+                for item in node:
+                    text_fields(item, seen)
+            return seen
+
+        before = text_fields(raw, set())
+        after = text_fields(_api_searchable(raw), set())
+
+        assert before, "the harness produced a trace with no text in it at all"
+        assert before == after, (
+            "the privacy search stopped looking at "
+            f"{sorted(name for name, _ in before - after)}, which can carry "
+            "what a caller said"
+        )
+
+        # And what it drops is only ever machine-generated.
+        searched = _api_text_blob(raw)
+        for name in MACHINE_GENERATED_TRACE_FIELDS:
+            assert f'"{name}": null' in searched or f'"{name}"' not in searched, (
+                f"{name} is a clock or a counter and should not be searched"
+            )
+    finally:
+        call.close()

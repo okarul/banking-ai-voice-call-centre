@@ -33,6 +33,8 @@ from app.database.models import AgentSession, AgentToolEvent, ConversationMessag
 from app.main import create_app
 from app.realtime.browser_calls import browser_call_manager
 from app.sessions import session_manager
+from app.telephony import reasons
+from app.telephony.bridge import phone_call_registry
 from app.telephony import service as telephony_service
 from app.telephony.schemas import InboundCallEvent
 from app.telephony.signature import (
@@ -540,6 +542,43 @@ def test_many_browser_calls_may_all_have_no_provider_id(client, monkeypatch):
 # --- the race ---------------------------------------------------------------
 
 
+def _concurrent_duplicates(application, body, headers, *, callers):
+    """Send the same event from `callers` threads through ONE live application.
+
+    Returns the statuses and a snapshot of what the bank was holding *while it
+    was still running* - which is the only moment a capacity slot or a bridge is
+    supposed to exist, and the thing the previous shape could not observe.
+
+    The threads are started before any is joined, so they contend for the unique
+    index genuinely; nothing here serialises them.
+    """
+    import threading
+
+    statuses = []
+    lock = threading.Lock()
+
+    with TestClient(application) as client:
+        def fire():
+            answer = client.post(ENDPOINT, content=body, headers=headers).json()
+            with lock:
+                statuses.append(answer["status"])
+
+        threads = [threading.Thread(target=fire) for _ in range(callers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        live = {
+            "rows": len(phone_rows()),
+            "capacity": browser_call_manager.used_capacity(),
+            "bridges": phone_call_registry.active_count(),
+        }
+
+    return statuses, live
+
+
+
 def test_concurrent_duplicate_events_produce_exactly_one_call(telephony_on):
     """Two workers, the same event, at the same moment.
 
@@ -550,47 +589,82 @@ def test_concurrent_duplicate_events_produce_exactly_one_call(telephony_on):
     body = event_body(call_id="call-race", event_id="evt-race")
     headers = signed_headers(body)
 
-    results = []
+    # **One application, several callers.** Each thread used to open its own
+    # `TestClient` context, which starts and stops a whole application lifespan
+    # per thread. Phase 7.4A.1 measured what that manufactures: a *startup*
+    # running while another context is mid-admission, so a reconciliation
+    # samples ownership before the row exists, queries after it commits, and
+    # repairs a live call as a crash orphan. FORCED_CLEANUP, about half the time.
+    #
+    # Production cannot do that. `app.main.lifespan` reconciles before its
+    # `yield`, and uvicorn serves nothing until startup returns, so under the
+    # supported topology - one process, one worker, one lifespan - no admission
+    # is ever concurrent with a reconciliation. The overlapping-lifespan case is
+    # the documented, unsolved limitation, not what these tests are for.
+    #
+    # So one lifespan, and the concurrency moves to where it belongs: several
+    # threads posting the same event through the same running application. That
+    # is the race this test exists to describe - two workers reaching the unique
+    # index at once - and it is still genuinely concurrent.
+    statuses, live = _concurrent_duplicates(telephony_on, body, headers, callers=2)
 
-    def fire():
-        with TestClient(telephony_on) as worker:
-            results.append(worker.post(ENDPOINT, content=body, headers=headers).json())
+    assert sorted(statuses) == ["accepted", "duplicate"], statuses
 
-    import threading
+    # Observed while the application was still running, which is the only
+    # moment a slot is meant to be held at all. The old shape could not assert
+    # this: a sibling context's shutdown could release the call first.
+    assert live["rows"] == 1, live
+    assert live["capacity"] == 1, live
+    assert live["bridges"] == 1, live
 
-    threads = [threading.Thread(target=fire) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    statuses = sorted(result["status"] for result in results)
-    assert statuses == ["accepted", "duplicate"], results
-    assert len(phone_rows()) == 1
-    assert browser_call_manager.used_capacity() == 1
+    # And after that one lifespan has stopped: the drain released the call, and
+    # the row says the drain is what did it. `FORCED_CLEANUP` here would mean a
+    # live call had been repaired as a crash orphan.
+    assert browser_call_manager.used_capacity() == 0
+    assert phone_call_registry.active_count() == 0
+    row = phone_rows()[0]
+    assert row.ended_at is not None
+    assert row.disconnect_reason == reasons.SERVICE_SHUTDOWN
 
 
 def test_many_concurrent_duplicates_still_produce_one_call(telephony_on):
     body = event_body(call_id="call-race-8", event_id="evt-race-8")
     headers = signed_headers(body)
-    results = []
 
-    def fire():
-        with TestClient(telephony_on) as worker:
-            results.append(worker.post(ENDPOINT, content=body, headers=headers).json())
+    # **One application, several callers.** Each thread used to open its own
+    # `TestClient` context, which starts and stops a whole application lifespan
+    # per thread. Phase 7.4A.1 measured what that manufactures: a *startup*
+    # running while another context is mid-admission, so a reconciliation
+    # samples ownership before the row exists, queries after it commits, and
+    # repairs a live call as a crash orphan. FORCED_CLEANUP, about half the time.
+    #
+    # Production cannot do that. `app.main.lifespan` reconciles before its
+    # `yield`, and uvicorn serves nothing until startup returns, so under the
+    # supported topology - one process, one worker, one lifespan - no admission
+    # is ever concurrent with a reconciliation. The overlapping-lifespan case is
+    # the documented, unsolved limitation, not what these tests are for.
+    #
+    # So one lifespan, and the concurrency moves to where it belongs: several
+    # threads posting the same event through the same running application. That
+    # is the race this test exists to describe - two workers reaching the unique
+    # index at once - and it is still genuinely concurrent.
+    statuses, live = _concurrent_duplicates(telephony_on, body, headers, callers=8)
 
-    import threading
+    assert statuses.count("accepted") == 1, statuses
+    assert statuses.count("duplicate") == 7, statuses
 
-    threads = [threading.Thread(target=fire) for _ in range(8)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    assert live["rows"] == 1, live
+    assert live["capacity"] == 1, live
+    assert live["bridges"] == 1, live
 
-    accepted = [r for r in results if r["status"] == "accepted"]
-    assert len(accepted) == 1, results
-    assert len(phone_rows()) == 1
-    assert browser_call_manager.used_capacity() == 1
+    # And after that one lifespan has stopped: the drain released the call, and
+    # the row says the drain is what did it. `FORCED_CLEANUP` here would mean a
+    # live call had been repaired as a crash orphan.
+    assert browser_call_manager.used_capacity() == 0
+    assert phone_call_registry.active_count() == 0
+    row = phone_rows()[0]
+    assert row.ended_at is not None
+    assert row.disconnect_reason == reasons.SERVICE_SHUTDOWN
 
 
 # === 4. what did it cost? ===================================================

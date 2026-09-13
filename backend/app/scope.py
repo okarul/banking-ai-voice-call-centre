@@ -31,7 +31,7 @@ cross-customer request, not a balance request. Privacy outranks helpfulness.
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 from app.agents.intents import Domain, Intent, classify, parse_type_reply
@@ -242,6 +242,10 @@ class ScopeDecision:
     domain: Domain = Domain.UNKNOWN
     # True when a supported request arrived with out-of-scope content attached.
     mixed: bool = False
+    # True when the caller has asked to end the call. Carried on the ruling so
+    # that both channels learn it from the one classification they already do,
+    # rather than each deciding separately what counts as goodbye.
+    terminal: bool = False
     # Which account or loan the caller named, if they named one. Carried so the
     # ruling describes the whole enquiry and not just its shape: a turn
     # classified before the caller was verified is the only deterministic record
@@ -282,11 +286,46 @@ def classify_scope(
     authenticated: bool = True,
     customer_id: str | None = None,
     current_domain: str | None = None,
+    clarifying: Domain | None = None,
+) -> ScopeDecision:
+    """See `_classify_scope`. This wrapper stamps terminality on the result.
+
+    Separated so that every branch below gets the flag without any of them
+    having to remember it. A ruling that lost `terminal` on one path would let
+    an outstanding question survive a goodbye said in that particular way,
+    which is exactly the kind of gap this phase exists to close.
+    """
+    decision = _classify_scope(
+        text,
+        authenticated=authenticated,
+        customer_id=customer_id,
+        current_domain=current_domain,
+        clarifying=clarifying,
+    )
+    if classify(text).intent is Intent.END_CALL:
+        return replace(decision, terminal=True)
+    return decision
+
+
+def _classify_scope(
+    text: str,
+    *,
+    authenticated: bool = True,
+    customer_id: str | None = None,
+    current_domain: str | None = None,
+    clarifying: Domain | None = None,
 ) -> ScopeDecision:
     """Decide what a caller turn is, before anything is allowed to answer it.
 
     `customer_id` is the verified caller, so that naming *themselves* is not
     treated as asking about somebody else.
+
+    `clarifying` is the selection this call is already waiting for, if any. It
+    changes nothing about what may be *reached* - every security branch below
+    runs first and none of them consults it - and only lets a reply that is an
+    answer be read as one. A caller who has just been asked "Savings or
+    Current?" and says "both" is engaging with the bank's question, not
+    changing the subject.
     """
     padded = _normalize(text)
 
@@ -372,16 +411,35 @@ def classify_scope(
             speech=SPEECH[ScopeCategory.UNSUPPORTED_BANKING_REQUEST],
         )
 
-    # 6. A bare answer to a question the agent asked — "Savings", "Home loan",
+    # 6. A reply that engages with the bank's own clarifying question without
+    #    picking anything — "both", "what are my options". Recognised only
+    #    while a clarification is genuinely outstanding, so these words carry no
+    #    special meaning here on any other turn. No value is reported, so the
+    #    question stays open and the caller is asked again with the choices.
+    if clarifying is not None and _answers_without_choosing(padded):
+        return ScopeDecision(
+            category=SUPPORTED_CATEGORY_BY_DOMAIN[clarifying],
+            domain=clarifying,
+            speech=None if authenticated else NOT_AUTHENTICATED_SPEECH,
+        )
+
+    # 7. A bare answer to a question the agent asked — "Savings", "Home loan",
     #    "account". It carries no verb of its own, so nothing above recognises
     #    it, but it is the second half of a banking request already in progress
     #    and must not be treated as a new, unrelated one.
-    slot_reply = _slot_reply_domain(text, padded)
+    #
+    #    The value travels with it from Phase 7.4B. It confers no authority by
+    #    itself: `app.pending_clarification` applies it only to a question this
+    #    bank asked, in the domain it asked about, on this session.
+    slot_reply = _slot_reply(text, padded)
     if slot_reply is not None:
+        slot_domain, slot_value = slot_reply
         return ScopeDecision(
-            category=SUPPORTED_CATEGORY_BY_DOMAIN[slot_reply],
-            domain=slot_reply,
+            category=SUPPORTED_CATEGORY_BY_DOMAIN[slot_domain],
+            domain=slot_domain,
             speech=None if authenticated else NOT_AUTHENTICATED_SPEECH,
+            account_type=slot_value if slot_domain is Domain.ACCOUNT else None,
+            loan_type=slot_value if slot_domain is Domain.LOAN else None,
         )
 
     # 7. Ordinary courtesy.
@@ -460,24 +518,65 @@ _BARE_DOMAIN_REPLIES = {
 }
 
 
-def _slot_reply_domain(text: str, padded: str) -> Domain | None:
-    """Which domain a bare reply belongs to, or None if it is not one.
+def _slot_reply(text: str, padded: str) -> tuple[Domain, str | None] | None:
+    """A bare reply's domain **and** the value it names, or None.
 
     Used only after every other reading has been ruled out, so an ordinary
     request containing the word "savings" has already been classified and only
     a genuinely bare answer reaches here.
+
+    Phase 7.4B returns the value as well as the domain. It was always computed
+    - `parse_type_reply` resolves "savings", "the current one" and "no, Current"
+    to the canonical strings the tool layer itself selects on - and it was
+    thrown away one line later, used as nothing but a truthiness test. Every
+    clarified enquiry in this system then had to be completed by the model
+    repeating a word the caller had already said. The value travels on the
+    ruling now; what it is *allowed to do* is decided by
+    `app.pending_clarification`, which will only let it finish a question this
+    bank actually asked.
+
+    A bare domain word - "account", "loan" - names a domain and no value, which
+    is a caller answering a question they were not asked. It is reported with
+    `None` so the clarification stays open.
     """
     stripped = padded.strip()
     if not stripped or len(stripped.split()) > 3:
         return None
 
     if stripped in _BARE_DOMAIN_REPLIES:
-        return _BARE_DOMAIN_REPLIES[stripped]
-    if parse_type_reply(text, Domain.ACCOUNT):
-        return Domain.ACCOUNT
-    if parse_type_reply(text, Domain.LOAN):
-        return Domain.LOAN
+        return _BARE_DOMAIN_REPLIES[stripped], None
+
+    for domain in (Domain.ACCOUNT, Domain.LOAN):
+        value = parse_type_reply(text, domain)
+        if value:
+            return domain, value
     return None
+
+
+# A reply that answers the bank's clarifying question without choosing: the
+# caller wants both, or did not catch the choices. Neither is a change of
+# subject, and neither may be read as one - before Phase 7.4B both classified
+# as NON_BANKING_REQUEST, so a caller who answered the bank's own question was
+# told that the bank only handles banking enquiries.
+#
+# These mean this **only while a clarification is outstanding**. Said out of the
+# blue, "both" still means nothing here.
+_BOTH_REPLIES = frozenset(
+    {"both", "both of them", "both accounts", "both loans", "all of them",
+     "either", "either one", "all"}
+)
+
+_OPTIONS_QUESTIONS = (
+    "what are my options", "what are the options", "what options",
+    "which ones", "which options", "what are the choices", "what choices",
+    "which accounts", "which loans", "what do i have", "what have i got",
+    "what are they", "say them again", "what were the choices",
+)
+
+
+def _answers_without_choosing(padded: str) -> bool:
+    """Whether this reply engages with the question but picks nothing."""
+    return padded.strip() in _BOTH_REPLIES or _has_any(padded, _OPTIONS_QUESTIONS)
 
 
 def _looks_general(padded: str) -> bool:

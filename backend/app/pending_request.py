@@ -136,6 +136,75 @@ def remember(
     )
 
 
+def supply_missing_type(
+    session: Session | None,
+    domain,
+    value: str,
+    *,
+    manager: SessionManager | None = None,
+) -> PendingRequest | None:
+    """Fill in the account or loan a held enquiry never named.
+
+    The other half of a clarification that happens *before* anybody is
+    verified. "What is my account balance?" is held here the moment it is
+    classified, with no account on it, because the caller had not said one. If
+    they then answer the bank's clarifying question — or simply volunteer
+    "Savings" — while still unverified, that answer belongs to the enquiry
+    already being held for them.
+
+    Without this the hold stayed empty, Phase 7.3's post-verification resume ran
+    the enquiry with no account, and a caller who had said which account twice
+    was asked a third time by the bank's own deterministic machinery. There is
+    no model anywhere in that sequence, which is what made it the clearest case
+    in the phase.
+
+    Deliberately narrow, and every bound matters:
+
+    * only while unverified — once the caller is verified,
+      `app.pending_clarification` owns the outstanding question, and mutating a
+      hold whose answer may already be cached would let the two disagree;
+    * only when the held enquiry is in the same domain as the answer, so a
+      "Savings" can never land on a loan enquiry;
+    * only when the slot is genuinely empty, so this can correct nothing the
+      caller already said and can never redirect a request that was complete.
+    """
+    if session is None or not value or session.authenticated:
+        return None
+
+    held = recall(session)
+    if held is None:
+        return None
+
+    from app.pending_clarification import ARGUMENT_BY_DOMAIN
+
+    field = ARGUMENT_BY_DOMAIN.get(domain)
+    if field is None:
+        return None
+    # The held enquiry must be asking for this kind of thing at all.
+    if field == "account_type" and not held.tool.startswith("get_account"):
+        if held.tool != "get_recent_transactions":
+            return None
+    if field == "loan_type" and not held.tool.startswith("get_loan"):
+        if held.tool != "get_next_instalment":
+            return None
+    if getattr(held, field) is not None:
+        return None
+
+    # A different answer is a different question; the answer read for the empty
+    # one is no longer an answer to what is held.
+    forget_answer(session, manager=manager)
+    _store(
+        session,
+        manager,
+        {
+            "tool": held.tool,
+            "account_type": value if field == "account_type" else held.account_type,
+            "loan_type": value if field == "loan_type" else held.loan_type,
+        },
+    )
+    return recall(session)
+
+
 def recall(session: Session | None) -> PendingRequest | None:
     """The held enquiry, or None. Does not clear it."""
     if session is None:

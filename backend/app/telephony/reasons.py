@@ -80,6 +80,15 @@ APPLICATION_ERROR = "APPLICATION_ERROR"
 #: specific name.
 APPLICATION_END = "APPLICATION_END"
 
+#: This process was asked to stop while the call was still running, and
+#: released it on the way out. Kept apart from `APPLICATION_ERROR` because
+#: nothing went wrong: a deployment is a planned event, and an operator
+#: counting failures should not be counting releases. Kept apart from
+#: `APPLICATION_END` too, because that says "no more specific name" and
+#: this one has one — a spike of these is a restart, and the question it
+#: raises is how many callers a deployment interrupts.
+SERVICE_SHUTDOWN = "SERVICE_SHUTDOWN"
+
 #: This call used its three PIN attempts. The customer id is **not** locked;
 #: the caller may ring back and try again immediately. Kept apart from
 #: `AUTH_LOCKOUT` because recording it as a lockout would report an ordinary
@@ -149,6 +158,7 @@ ALL = (
     IDLE_TIMEOUT,
     APPLICATION_ERROR,
     APPLICATION_END,
+    SERVICE_SHUTDOWN,
     AUTH_ATTEMPTS_EXHAUSTED,
     AUTH_LOCKOUT,
     CAPACITY_REJECTED,

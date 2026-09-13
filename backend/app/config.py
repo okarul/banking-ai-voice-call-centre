@@ -68,6 +68,77 @@ class Settings:
         # string comparison a caller happens to write.
         # Optional: the app still imports and serves /health without it.
         self.database_url: str | None = os.getenv("DATABASE_URL") or None
+
+        # --- how long the database may take before a call gives up -------
+        #
+        # Every one of these is a *bound*, not a tuning knob, and they exist
+        # because the failure they prevent is silent. A PostgreSQL that refuses
+        # a connection is handled everywhere in this application: readiness
+        # goes red, `_safe` swallows the write, the call carries on. A
+        # PostgreSQL that *accepts the socket and then never answers* is not,
+        # because nothing here has a deadline — and that is the ordinary shape
+        # of a container that has stopped, a port-forward whose far end is
+        # gone, or a host behind a firewall that drops rather than rejects.
+        #
+        # Phase 7.4 reproduced it on the development machine: Docker Desktop
+        # was down, port 5435 still accepted TCP, and `SELECT 1` never
+        # returned. The test suite hung on its first test for thirty minutes
+        # with no error of any kind. In production the same shape stalls the
+        # realtime event pump, which awaits its trace write inline, so a
+        # database nobody can reach becomes a caller listening to silence.
+        #
+        # Zero disables any of them, matching libpq's own convention.
+
+        # Seconds for the TCP connect and authentication handshake. This is the
+        # one that turns "unreachable" from a hang into an error.
+        self.database_connect_timeout: int = _positive_int(
+            os.getenv("DATABASE_CONNECT_TIMEOUT"), default=5
+        )
+        # Milliseconds a single statement may run. Generous next to the
+        # sub-millisecond writes this application actually makes: it is here to
+        # catch a wedged query, not to police a slow one.
+        self.database_statement_timeout_ms: int = _positive_int(
+            os.getenv("DATABASE_STATEMENT_TIMEOUT_MS"), default=10000
+        )
+        # Milliseconds spent waiting for a row lock. Shorter than the statement
+        # timeout on purpose: two calls ending at once contend on the same
+        # `agent_sessions` row, and waiting is never the right answer there —
+        # `close_phone_call` is conditional, so losing the lock and finding the
+        # row already closed is the correct outcome.
+        self.database_lock_timeout_ms: int = _positive_int(
+            os.getenv("DATABASE_LOCK_TIMEOUT_MS"), default=3000
+        )
+        # Milliseconds a transaction may sit idle holding a connection. A
+        # backstop against a pooled connection that was checked out, opened a
+        # transaction and then lost its thread.
+        self.database_idle_transaction_timeout_ms: int = _positive_int(
+            os.getenv("DATABASE_IDLE_TRANSACTION_TIMEOUT_MS"), default=15000
+        )
+        # Seconds a caller waits for a connection from the pool before failing.
+        # The pool is shared by FastAPI's thread pool and every `to_thread`
+        # database write, so exhaustion is possible; waiting the SQLAlchemy
+        # default of thirty seconds for one is indistinguishable from a hang.
+        self.database_pool_timeout: int = _positive_int(
+            os.getenv("DATABASE_POOL_TIMEOUT"), default=5
+        )
+        # Connections, and how many more may be opened under load.
+        self.database_pool_size: int = _positive_int(
+            os.getenv("DATABASE_POOL_SIZE"), default=10
+        )
+        self.database_max_overflow: int = _positive_int(
+            os.getenv("DATABASE_MAX_OVERFLOW"), default=10
+        )
+
+        # --- shutdown ----------------------------------------------------
+        # How long this process may spend releasing the calls it is carrying
+        # before it stops anyway. A bound rather than a target: the release
+        # itself is fast, and this exists so that one unresponsive provider
+        # socket cannot hold the process open past the grace period its
+        # supervisor allows — after which it is killed, and killed is exactly
+        # the ungraceful stop the drain was added to avoid.
+        self.shutdown_drain_timeout: int = _positive_int(
+            os.getenv("SHUTDOWN_DRAIN_TIMEOUT"), default=10
+        )
         # Backend-only. Never returned by a route, logged, or sent to a client.
         self.openai_api_key: str | None = os.getenv("OPENAI_API_KEY") or None
         self.realtime_model: str = os.getenv("REALTIME_MODEL", "gpt-realtime-2.1")

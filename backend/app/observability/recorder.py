@@ -20,7 +20,7 @@ short-lived database session, writes, and closes.
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.database.connection import session_scope
@@ -322,7 +322,9 @@ def end_session(
 
 
 @_safe("reconcile_active_sessions")
-def reconcile_active_sessions() -> int:
+def reconcile_active_sessions(
+    owned_banking_sessions: set[str] | None = None,
+) -> int:
     """Close out calls that cannot possibly still be running.
 
     Banking sessions live in memory, so a backend restart ends every call it
@@ -332,16 +334,42 @@ def reconcile_active_sessions() -> int:
     never come back down.
 
     Run once at startup. Anything still open at that moment belongs to a
-    process that no longer exists.
+    process that no longer exists — **except** the calls this process is
+    holding right now, which is what `owned_banking_sessions` names.
+
+    That exception is not hypothetical. Phase 7.4A.1 measured a second
+    application context starting while the first still carried a call: the live
+    call was stamped `FORCED_CLEANUP`, meaning "left behind by a crash", while
+    the caller was still talking. An open row is not evidence of a dead owner.
+
+    Ownership is passed in rather than looked up, because this is the
+    observability layer and it must not need to know that telephony exists.
+    `app.process_ownership.reconcile_on_startup` is the caller that knows both,
+    and the entry point a test should drive when it means "a process started".
+
+    Omitting the argument reconciles everything, which is the right default for
+    a caller that genuinely holds nothing — and what every existing test that
+    drives this directly already expects.
     """
     now = _now()
     closed = 0
+    owned = owned_banking_sessions or set()
     with session_scope() as db:
-        stale = db.scalars(
-            select(AgentSession).where(
-                AgentSession.ended_at.is_(None), AgentSession.status != REJECTED
+        conditions = [
+            AgentSession.ended_at.is_(None),
+            AgentSession.status != REJECTED,
+        ]
+        if owned:
+            # A row with no banking session id cannot be one this process is
+            # carrying, and must stay eligible for repair: `NOT IN` over a NULL
+            # evaluates to NULL and would silently exclude it.
+            conditions.append(
+                or_(
+                    AgentSession.banking_session_id.is_(None),
+                    AgentSession.banking_session_id.notin_(owned),
+                )
             )
-        ).all()
+        stale = db.scalars(select(AgentSession).where(*conditions)).all()
 
         for record in stale:
             started = record.started_at

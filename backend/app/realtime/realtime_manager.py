@@ -550,6 +550,23 @@ class RealtimeManager:
                     # has been handed the work, so the row is still written.
                     await asyncio.to_thread(business.record_turn_decision, *turn)
 
+                # The caller may have just finished a question this bank asked.
+                # If so the bank answers it, here, rather than waiting for the
+                # model to ask on their behalf.
+                #
+                # Deliberately *outside* the block above. `turn` is None
+                # whenever this utterance needs no operations row - and the
+                # commonest reason for that is a turn already recorded under
+                # the same item id, which is to say a duplicate or replayed
+                # transcript. That is precisely a turn whose ruling may have
+                # completed a clarification, so gating the answer on the row
+                # would make a caller's balance depend on whether their words
+                # arrived once or twice.
+                #
+                # Costs a dictionary lookup on a session already in memory when
+                # there is nothing outstanding, which is every event but one.
+                await self._answer_completed_clarification(connection)
+
                 if on_event is None:
                     continue
                 result = on_event(connection.banking_session_id, event)
@@ -561,6 +578,71 @@ class RealtimeManager:
             # A failed pump must not take down the banking session.
             logger.error(
                 "realtime[%s] event stream ended: %s",
+                connection.banking_session_id,
+                type(error).__name__,
+            )
+
+    async def _answer_completed_clarification(self, connection) -> None:
+        """Run and deliver an enquiry the caller has just completed.
+
+        The telephone half of Phase 7.4B's determinism, and the seam matters.
+        Channel 1 resolves in its `/scope` route, which is a request the page
+        makes and a response it reads. A telephone has no such round trip: the
+        only thing that happens after a caller speaks is this pump, so this is
+        where the equivalent has to live.
+
+        **One resolver, two seams.** The decision of what to run, whether it may
+        run, and what it costs is `app.pending_clarification.resolve` in both
+        cases - the same function, the same authorisation, the same
+        exactly-once cache. Nothing about the enquiry is decided here. What is
+        decided here is only how the answer reaches a caller who is on a
+        telephone rather than looking at a page.
+
+        **Why not leave it to the model.** Because Phase 7.3 already showed what
+        that costs. Two live calls verified correctly, held an enquiry this
+        backend had classified, authorised and stored, and then sat in silence
+        until the caller gave up, because the model never made the tool call
+        that would have answered it. A bank that has read a customer's balance
+        and says nothing is worse than one that never read it.
+
+        Cheap when there is nothing to do: a dictionary lookup on a session
+        already in memory. Only an enquiry that is genuinely complete and
+        genuinely authorised costs a worker thread.
+        """
+        from app import pending_clarification
+        from app.agents import speech
+
+        session = self._manager.get_session(connection.banking_session_id)
+        if session is None or not session.authenticated:
+            return
+        outstanding = pending_clarification.recall(session)
+        if outstanding is None or not outstanding.complete:
+            return
+
+        try:
+            result = await asyncio.to_thread(
+                pending_clarification.resolve, session, manager=self._manager
+            )
+        except Exception as error:
+            logger.error(
+                "realtime[%s] could not answer a completed clarification: %s",
+                connection.banking_session_id,
+                type(error).__name__,
+            )
+            return
+
+        if not isinstance(result, dict) or not result.get("success"):
+            # A refusal or a failure is the model's to explain in the ordinary
+            # way; pushing one in would put two explanations on the line.
+            return
+
+        try:
+            await connection.session.send_message(speech.clarified_answer_cue(result))
+        except Exception as error:
+            # The answer is read and cached either way, so the model's own call
+            # still completes from it. Nothing is lost but the head start.
+            logger.warning(
+                "realtime[%s] clarified answer could not be delivered: %s",
                 connection.banking_session_id,
                 type(error).__name__,
             )

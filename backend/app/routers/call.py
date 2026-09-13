@@ -27,6 +27,7 @@ import logging
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
+from app import pending_clarification
 from app.agents.registry import FORBIDDEN_ARGUMENTS
 from app.observability import business, recorder
 from app.realtime.browser_calls import browser_call_manager, sweep_idle_calls
@@ -261,6 +262,10 @@ def check_scope(payload: ScopeRequest) -> dict:
         authenticated=session.authenticated,
         customer_id=session.customer_id,
         current_domain=session.current_domain,
+        # The question this call is already waiting on, so "both" and "what are
+        # my options" are read as replies to it rather than as a change of
+        # subject. Both channels pass this; see `turn_gate.record_turn`.
+        clarifying=pending_clarification.awaiting_domain(session),
     )
 
     # Remember the ruling for this turn. The page is expected to act on it, but
@@ -291,7 +296,23 @@ def check_scope(payload: ScopeRequest) -> dict:
         decision.category.value,
         decision.allowed,
     )
-    return decision.to_dict()
+
+    answer = decision.to_dict()
+
+    # If that turn completed a question the bank had asked, answer it here
+    # rather than hoping the page's model asks for it. Same reasoning as the
+    # `pending_result` that rides back with `submit_pin`: once the backend holds
+    # a complete, authorised request, delivering it must not be optional.
+    #
+    # Safe on this endpoint specifically - it is a sync `def`, so FastAPI runs
+    # it on a worker thread where a database read is fine.
+    resolved = pending_clarification.resolve(
+        session_manager.get_session(payload.session_id), manager=session_manager
+    )
+    if resolved is not None:
+        answer["pending_result"] = resolved
+
+    return answer
 
 
 @router.get("/active")

@@ -142,10 +142,26 @@ def record_decision(session: Session | None, decision: ScopeDecision) -> None:
     # agent, forfeits any enquiry being held for them. Without this, the
     # resume exemption in `refusal_for` would still be open on that turn.
     if decision.category in HOSTILE_CATEGORIES:
-        from app import pending_request
+        from app import pending_clarification, pending_request
 
         pending_request.clear(session)
+        # And the outstanding question with it. A caller who turns to another
+        # customer's money forfeits the enquiry being held for them; leaving a
+        # clarification open would leave a completed request one bare word away
+        # on the turn after a refusal.
+        pending_clarification.clear(session)
+    elif decision.terminal:
+        from app import pending_clarification
+
+        # The caller is leaving. An unfinished question stops being the bank's
+        # to answer at the moment they say so, and a slot answer arriving after
+        # it - a late transcript, a repeated word - must complete nothing.
+        # Without this the question survived to session teardown, which is a
+        # window in which a completed request could still execute on a call
+        # that was over.
+        pending_clarification.clear(session)
     else:
+        _apply_slot_answer(session, decision)
         _hold_unverified_enquiry(session, decision)
 
     # Deliberately **no database write here.** This function is called from
@@ -160,6 +176,54 @@ def record_decision(session: Session | None, decision: ScopeDecision) -> None:
     # each channel persists the returned decision from a context where
     # blocking is safe — `/scope` on its threadpool, the telephone through
     # `asyncio.to_thread` in the pump.
+
+
+def _apply_slot_answer(session: Session, decision: ScopeDecision) -> None:
+    """Let a bare answer finish the question this bank actually asked.
+
+    This is the whole of a slot reply's authority and the only place it is
+    exercised. Four things are true of it, and each is a bound rather than a
+    convenience:
+
+    * It applies only a value the deterministic parser produced, from a fixed
+      vocabulary — never free text, never anything the model supplied.
+    * It reaches only a clarification **this session** already had open, in the
+      domain that clarification is waiting for. With nothing outstanding,
+      "Savings" completes nothing and starts nothing.
+    * It confers no authorisation of its own. What it produces is a set of
+      arguments; the request they belong to still goes through authentication,
+      the scope gate, the ownership checks and dispatch exactly as it would
+      have if the caller had said the whole sentence in one breath.
+    * A turn that names a *complete* enquiry of its own is not a slot answer at
+      all. It supersedes the outstanding question, because the caller has moved
+      on, and the old clarification is dropped rather than silently answered.
+
+    Before verification there is a second holder to keep in step: the enquiry
+    itself is held in `pending_request` from the moment it is classified, and an
+    answer given while still unverified belongs to it. See
+    `pending_request.supply_missing_type`.
+    """
+    from app import pending_clarification, pending_request
+    from app.agents.intents import TOOL_BY_INTENT, Domain
+
+    value = None
+    if decision.domain is Domain.ACCOUNT:
+        value = decision.account_type
+    elif decision.domain is Domain.LOAN:
+        value = decision.loan_type
+
+    # A turn that names an enquiry of its own. Whatever else it carries, the
+    # caller has asked a new question and the old one is no longer outstanding.
+    if TOOL_BY_INTENT.get(decision.intent) is not None:
+        pending_clarification.clear(session)
+        return
+
+    if not value:
+        return
+
+    pending_clarification.complete_with(session, decision.domain, value)
+    if not session.authenticated:
+        pending_request.supply_missing_type(session, decision.domain, value)
 
 
 def _hold_unverified_enquiry(session: Session, decision: ScopeDecision) -> None:
@@ -228,11 +292,18 @@ def record_turn(session: Session | None, transcript: str) -> ScopeDecision | Non
     if session is None or not (transcript or "").strip():
         return None
 
+    from app import pending_clarification
+
     decision = classify_scope(
         transcript,
         authenticated=session.authenticated,
         customer_id=session.customer_id,
         current_domain=session.current_domain,
+        # The question this call is already waiting on, so a reply that only
+        # makes sense as an answer to it — "both", "what are my options" — is
+        # read as one instead of as a change of subject. Reports the shape of
+        # the outstanding question and nothing about the caller.
+        clarifying=pending_clarification.awaiting_domain(session),
     )
     record_decision(session, decision)
     return decision
