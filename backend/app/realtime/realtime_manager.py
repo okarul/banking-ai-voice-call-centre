@@ -616,7 +616,37 @@ class RealtimeManager:
         if session is None or not session.authenticated:
             return
         outstanding = pending_clarification.recall(session)
-        if outstanding is None or not outstanding.complete:
+        if outstanding is None:
+            return
+
+        if not outstanding.complete:
+            # The branch that was missing, and the whole of Phase 7.4C. The bank
+            # has decided it needs a selection; until Phase 7.4C nothing here
+            # did anything about that, so whether the caller was ever asked came
+            # down to the model volunteering it from a tool result.
+            #
+            # Asked once. This method runs on every model event, so the flag on
+            # the clarification - not a counter here - is what keeps one decision
+            # from becoming a stream of questions. Set only after the send
+            # returns, so a failed delivery is retried by the next event rather
+            # than lost.
+            if pending_clarification.awaiting_question(session) is None:
+                return
+            try:
+                await connection.session.send_message(
+                    speech.clarification_question_cue(outstanding)
+                )
+            except Exception as error:
+                logger.warning(
+                    "realtime[%s] clarification question could not be "
+                    "delivered: %s",
+                    connection.banking_session_id,
+                    type(error).__name__,
+                )
+                return
+            pending_clarification.mark_question_asked(
+                session, manager=self._manager
+            )
             return
 
         try:

@@ -44,6 +44,12 @@ import asyncio
 import logging
 from enum import Enum
 
+# How many silence windows may be given up to a clarifying question that has
+# not been asked yet. One is ample - the question is delivered on the next model
+# event - and a bound is required either way: a caller must not be held on a
+# line for ever because a question never got out.
+MAX_SILENCE_DEFERRALS = 1
+
 logger = logging.getLogger("app.telephony.lifecycle")
 
 # How long the bank waits for a caller who has stopped speaking, once the
@@ -108,11 +114,24 @@ class CallLifecycle:
         speak,
         hang_up,
         silence_seconds: float = SILENCE_SECONDS,
+        owes_question=None,
     ) -> None:
         self.call_id = call_id
         self._speak = speak
         self._hang_up = hang_up
         self._silence_seconds = silence_seconds
+        # Whether the bank is holding a clarifying question it has not yet put
+        # to this caller. Supplied by the owner, because the lifecycle knows
+        # about turns and timers and deliberately nothing about banking state.
+        #
+        # Defaults to "no", so a lifecycle built without it behaves exactly as
+        # it did before Phase 7.4C.
+        self._owes_question = owes_question
+        # How many silence windows have already been given up to a question
+        # that had not been asked. Bounded: deferring for ever would trade a
+        # caller hung up on too early for one left on a line nobody is going to
+        # speak on, which is worse.
+        self._silence_deferrals = 0
 
         self.state = CallState.OPENING
         self.end_reason: EndReason | None = None
@@ -459,6 +478,31 @@ class CallLifecycle:
         except asyncio.CancelledError:
             return
 
+        # A caller who has not been asked anything has nothing to be silent
+        # about. Live calls `3c1932d1-29d4-…` and `6a6efe0b-29d4-…` were closed
+        # here for silence while the bank was holding a clarifying question it
+        # had decided on and never spoken - the caller was waiting to be asked.
+        #
+        # Deferred rather than disabled, and bounded rather than indefinite: the
+        # question is delivered by the realtime pump on the next model event, so
+        # one further window is normally far more than enough, and a call whose
+        # question genuinely never gets out must still end rather than hold a
+        # line and a capacity slot for ever.
+        if self._defer_for_unasked_question():
+            async with self._lock:
+                if self._closed or self.state is not CallState.WAITING_FOR_CALLER:
+                    return
+                self._silence_deferrals += 1
+                logger.info(
+                    "lifecycle[%s] silence deferred: a clarifying question is "
+                    "owed and has not been asked (deferral %d of %d)",
+                    self.call_id,
+                    self._silence_deferrals,
+                    MAX_SILENCE_DEFERRALS,
+                )
+                self._arm_silence()
+            return
+
         async with self._lock:
             if self._closed or self.state is not CallState.WAITING_FOR_CALLER:
                 return
@@ -473,6 +517,29 @@ class CallLifecycle:
         # lock across a network call would block every other transition on this
         # call behind it.
         await self._speak_closing_line()
+
+    def _defer_for_unasked_question(self) -> bool:
+        """Whether this silence window belongs to a question nobody has asked.
+
+        Synchronous and free of I/O: it reads in-memory session state, and it is
+        consulted from a timer rather than from the audio path. False whenever
+        there is no predicate, no question owed, or the deferral budget is
+        spent - so the ordinary silence close is reached by exactly the same
+        route it always was.
+        """
+        if self._owes_question is None:
+            return False
+        if self._silence_deferrals >= MAX_SILENCE_DEFERRALS:
+            return False
+        try:
+            return bool(self._owes_question())
+        except Exception as error:  # pragma: no cover - a predicate must not close a call
+            logger.error(
+                "lifecycle[%s] could not read whether a question is owed: %s",
+                self.call_id,
+                type(error).__name__,
+            )
+            return False
 
     async def _speak_closing_line(self) -> None:
         try:

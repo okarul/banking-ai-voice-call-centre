@@ -103,6 +103,41 @@ SILENCE_CHECK_SPEECH = "I do not hear anything from you. Do you want to continue
 SILENCE_CLOSING_CUE = "[The caller has been silent. Close the call now.]"
 
 
+def clarification_question_cue(pending) -> str:
+    """What is sent into a telephone session when the bank needs the caller to choose.
+
+    The counterpart to `clarified_answer_cue`, and the half Phase 7.4B left out.
+    That phase made *answering* a clarified enquiry deterministic and left
+    *asking* to the model, which is the same mistake Phase 7.3 fixed one step
+    earlier: three live calls on one build, one where the model happened to ask
+    and two where it did not and the caller was hung up on for silence with the
+    question still owed.
+
+    A cue, not a sentence. The bank owns the decision - "this caller must now be
+    asked which account" - and the agent owns the wording, exactly as it owns
+    the greeting and the closing line. Writing the question here would put a
+    second voice in the system and make the telephone differ from the browser
+    for no reason a caller could see.
+
+    The instruction is deliberately imperative rather than informational. The
+    model has already had this same information handed to it as tool-result
+    metadata and declined to speak it; metadata is evidently not enough.
+    """
+    choices = ", ".join(pending.choices) if pending.choices else ""
+    slot = {"ACCOUNT": "which account", "LOAN": "which loan"}.get(
+        pending.domain.value, "which one"
+    )
+    asking = f"Ask the caller {slot} they mean"
+    if choices:
+        asking += f", offering exactly these and no others: {choices}"
+    return (
+        "[The bank needs one more detail before it can answer the enquiry the "
+        f"caller already made ({pending.tool}). {asking}. Say it now, in your "
+        "own words, as a short question. Do not answer the enquiry yet and do "
+        "not call any tool.]"
+    )
+
+
 def clarified_answer_cue(result) -> str:
     """What is sent into a telephone session when the bank has answered itself.
 

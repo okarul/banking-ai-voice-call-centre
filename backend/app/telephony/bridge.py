@@ -173,6 +173,7 @@ class PhoneCallBridge:
             provider_call_id,
             speak=self._speak_silence_line,
             hang_up=self._end_call,
+            owes_question=self._owes_unasked_clarification,
         )
 
         # Everything this call knows about itself, in one typed place.
@@ -952,6 +953,20 @@ class PhoneCallBridge:
         task.add_done_callback(self._transitions.discard)
 
     # --- what the lifecycle asks for ----------------------------------------
+
+    def _owes_unasked_clarification(self) -> bool:
+        """Whether the bank has a clarifying question it has not yet asked.
+
+        Read by the silence timer, which must not hang up on a caller who is
+        waiting to be asked something. In-memory only and synchronous: the
+        clarification lives on the banking session.
+        """
+        from app import pending_clarification
+
+        return (
+            pending_clarification.awaiting_question(self.conversation._session())
+            is not None
+        )
 
     async def _speak_silence_line(self) -> None:
         """Prompt the model to say the closing line to a silent caller."""

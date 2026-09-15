@@ -99,6 +99,16 @@ class PendingClarification:
     arguments: dict = field(default_factory=dict)
     # The caller's answer, once they have given one. None while still owed.
     answer: str | None = None
+    # Whether the caller has actually been *asked*. Phase 7.4C: the bank
+    # deciding it needs a selection and the caller hearing the question are two
+    # different events, and only the first was ever recorded. Three live calls
+    # on one build proved the difference - on one the model happened to ask, on
+    # two it did not and the caller was hung up on for silence with the question
+    # still owed.
+    #
+    # Set only after a delivery has actually succeeded, so a send that raises
+    # leaves it false and the next eligible event tries again.
+    question_asked: bool = False
 
     @property
     def complete(self) -> bool:
@@ -128,6 +138,7 @@ class PendingClarification:
             payload["choices"] = list(self.choices)
         if self.answer:
             payload["answer"] = self.answer
+        payload["question_asked"] = self.question_asked
         return payload
 
 
@@ -192,6 +203,7 @@ def open_for(
             "choices": list(choices or ()),
             "arguments": carried,
             "answer": None,
+            "question_asked": False,
         },
     )
 
@@ -221,6 +233,7 @@ def recall(session: Session | None) -> PendingClarification | None:
         choices=tuple(raw.get("choices") or ()),
         arguments=dict(arguments) if isinstance(arguments, dict) else {},
         answer=raw.get("answer") or None,
+        question_asked=bool(raw.get("question_asked")),
     )
 
 
@@ -273,6 +286,9 @@ def complete_with(
         "choices": list(pending.choices),
         "arguments": dict(pending.arguments),
         "answer": answer,
+        # Carried, not reset. A caller who has answered was asked, and a
+        # completion must never make the question look owed again.
+        "question_asked": pending.question_asked,
     }
     _store(session, manager, completed)
     return recall(session)
@@ -329,6 +345,49 @@ def resolve(session: Session | None, *, manager: SessionManager | None = None):
         # the turn it arrived on. The clarification stays as it is, so the
         # model's own call still completes it through `_carried`.
         return None
+
+
+def mark_question_asked(
+    session: Session | None, *, manager: SessionManager | None = None
+) -> None:
+    """Record that the caller has now actually been asked.
+
+    Called only *after* a delivery has succeeded. That ordering is the whole of
+    the idempotency: the pump reaches this on every model event, so the flag is
+    what stops one decision becoming a stream of questions - and leaving it
+    unset when a send raises is what lets the next event try again without any
+    retry bookkeeping of its own.
+    """
+    if session is None:
+        return
+    pending = recall(session)
+    if pending is None or pending.question_asked:
+        return
+    _store(
+        session,
+        manager,
+        {
+            "tool": pending.tool,
+            "domain": pending.domain.value,
+            "choices": list(pending.choices),
+            "arguments": dict(pending.arguments),
+            "answer": pending.answer,
+            "question_asked": True,
+        },
+    )
+
+
+def awaiting_question(session: Session | None) -> PendingClarification | None:
+    """A clarification the bank has decided on and not yet put to the caller.
+
+    None when nothing is outstanding, when it has already been asked, or when
+    the caller has already answered - the three cases in which there is no
+    question to deliver.
+    """
+    pending = recall(session)
+    if pending is None or pending.complete or pending.question_asked:
+        return None
+    return pending
 
 
 def clear(session: Session | None, *, manager: SessionManager | None = None) -> None:
