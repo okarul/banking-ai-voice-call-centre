@@ -208,6 +208,11 @@ class PhoneCallBridge:
         # Item ids already written to the trace. A finished turn is
         # finished: see `_note_agent_text`.
         self._agent_written: set[str] = set()
+        # Output items whose audio was refused, so the replay says what the
+        # caller actually heard. Without this the trace records a sentence the
+        # bank suppressed, which is the same disagreement between the board and
+        # the line that made the live duplicate hard to place.
+        self._suppressed_items: set[str] = set()
         # Caller frames received after the call decided to end. Drained, never
         # forwarded - see `_pump_caller_to_model`.
         self.frames_after_closing = 0
@@ -239,7 +244,13 @@ class PhoneCallBridge:
         if kind == "audio":
             payload = getattr(event, "audio", None)
             data = getattr(payload, "data", None)
-            if data and self._admit_response(getattr(payload, "response_id", None)):
+            # `item_id` lives on the event and `response_id` on the inner
+            # payload. Reading only the second is what let a second output item
+            # of one response reach the caller.
+            if data and self._admit_response(
+                getattr(payload, "response_id", None),
+                getattr(event, "item_id", None),
+            ):
                 self.outbound.put(data)
                 self.conversation.assistant_speaking = True
                 # More audio for this turn, so any boundary already asked about
@@ -264,6 +275,7 @@ class PhoneCallBridge:
             # than a second voice — without this, barge-in would leave a response
             # active for ever and every later answer would be suppressed.
             self.conversation.active_response_id = None
+            self.conversation.active_item_id = None
             self.conversation.assistant_speaking = False
             # The turn is abandoned, so any boundary outstanding for it is
             # stale. A late acknowledgement must not complete a turn the
@@ -348,24 +360,42 @@ class PhoneCallBridge:
 
     # --- one turn, one response ---------------------------------------------
 
-    def _admit_response(self, response_id: str | None) -> bool:
-        """Whether this audio belongs to the response this call is playing.
+    def _admit_response(
+        self, response_id: str | None, item_id: str | None = None
+    ) -> bool:
+        """Whether this audio is the answer this call is already playing.
 
-        The model can be prompted more than once for a single caller turn — a
-        retried cue, a racing trigger, a duplicated SDK callback — and each
-        extra prompt is a second response generating audio at the same time as
-        the first. Played out, that is two assistants talking over each other
-        down one telephone line.
+        **The unit a caller hears is an item, not a response.** The model can be
+        prompted more than once for a single caller turn — a retried cue, a
+        racing trigger, a duplicated SDK callback — and each extra prompt is a
+        second response generating audio at the same time as the first. It can
+        also, from a single response, emit two output *items*: two separately
+        generated sentences that mean the same thing. Both are two assistants
+        talking over each other down one telephone line, and only the first was
+        ever guarded.
 
-        The first response id seen becomes this turn's answer; audio from any
-        other id is dropped until that one ends. Identity comes from the model
-        rather than from our own counter, so a duplicated callback carrying the
-        same id is admitted (it is the same answer) while a genuinely second
-        response is not.
+        Live call `56f012b6-2b4e-1240-4790-eaa5afddeeef` is the second kind. The
+        agent asked for the demo customer ID, and six milliseconds later a
+        second item of the same response asked again - wording differing only in
+        punctuation, so two generations of one intention. Both were admitted,
+        both were queued, and because playout is sequential the second arrived
+        over the caller part-way through saying their ID. They hung up:
+        `authenticated=false`, `tool_call_count=0`, `CUSTOMER_ENDED`.
+
+        So the owner is the pair. The first identifiable `(response_id,
+        item_id)` becomes this turn's answer; every later frame of that same
+        item is the same answer and is admitted, and anything else is dropped
+        until the turn genuinely ends.
+
+        **Fails open.** Identity comes from the model, and a stream that cannot
+        be identified is still a stream somebody may be waiting to hear -
+        dropping it would silence real answers on any SDK shape that omits
+        these fields. Missing either half admits.
         """
         if response_id is None:
-            # Nothing to distinguish responses by. Admit it: dropping audio on
-            # a stream that cannot be identified would silence real answers.
+            # Nothing to distinguish answers by at all. Admit it: dropping
+            # audio on a stream that cannot be identified would silence real
+            # answers, and silence is the worse failure.
             return True
 
         if response_id in self.conversation.rejected_response_ids:
@@ -376,11 +406,37 @@ class PhoneCallBridge:
             return False
 
         active = self.conversation.active_response_id
+        active_item = self.conversation.active_item_id
+
         if active is None:
             self.conversation.active_response_id = response_id
+            self.conversation.active_item_id = item_id
             return True
+
         if active == response_id:
-            return True
+            if item_id is None or active_item is None or active_item == item_id:
+                # The same utterance, streamed. A sentence is hundreds of
+                # frames and every one of them belongs to the caller.
+                #
+                # Fails open at the *item* level only: an SDK shape that omits
+                # `item_id` loses the ability to tell two items apart, and must
+                # still behave exactly as it did before - which is why a
+                # missing item id lands here rather than short-circuiting the
+                # response rules below.
+                if active_item is None and item_id is not None:
+                    self.conversation.active_item_id = item_id
+                return True
+
+            # Same response, a different output item: a second answer to a turn
+            # that has already been answered. Not rejected by response id -
+            # the admitted item shares it - so it is counted here and dropped.
+            self.conversation.duplicate_responses_suppressed += 1
+            self._suppressed_items.add(item_id)
+            logger.warning(
+                "bridge[%s] suppressed a second output item for one turn",
+                self.provider_call_id,
+            )
+            return False
 
         self.conversation.rejected_response_ids.add(response_id)
         self.conversation.duplicate_responses_suppressed += 1
@@ -771,10 +827,20 @@ class PhoneCallBridge:
         return held
 
     def _flush_agent_turn(self) -> None:
-        """Write the held assistant turn, if there is one. Never twice."""
+        """Write the held assistant turn, if there is one. Never twice.
+
+        An item whose audio was refused is not written at all: the replay is a
+        record of the call, and a sentence the caller never heard did not
+        happen to them. The suppression itself stays visible in
+        `duplicate_responses_suppressed` and in the warning log, which is where
+        an operator should look for it.
+        """
         held = self._take_agent_turn()
-        if held is not None:
-            self._schedule_agent_turn(held["text"])
+        if held is None:
+            return
+        if held["item_id"] is not None and held["item_id"] in self._suppressed_items:
+            return
+        self._schedule_agent_turn(held["text"])
 
     async def _flush_agent_turn_now(self) -> None:
         """The same, awaited, for teardown.

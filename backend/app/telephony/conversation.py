@@ -68,6 +68,20 @@ class ConversationState:
     # two assistants talking at once — see `app.telephony.bridge`.
     active_response_id: str | None = None
 
+    # The model's identifier for the *output item* currently being spoken.
+    #
+    # A response is not the unit a caller hears; an item is. One response may
+    # carry several output items, and every one of them shares the response's
+    # id - so a guard that knows only the response admits all of them and the
+    # caller is answered twice. Live call `56f012b6-2b4e-1240-4790-eaa5afddeeef`
+    # was asked for its demo customer ID twice, six milliseconds apart, from one
+    # response, the second arriving over the caller's answer. They hung up.
+    #
+    # Held beside the response id and cleared at the same boundaries, because
+    # the two together are one owner: the first identifiable item of the active
+    # response owns caller-visible playback until the turn genuinely ends.
+    active_item_id: str | None = None
+
     # Responses already refused on this turn. Without this, a suppressed
     # response resumes the moment the admitted one ends: its remaining audio
     # finds `active_response_id` back at None, gets adopted, and the caller
@@ -183,7 +197,11 @@ class ConversationState:
     def complete_turn(self) -> None:
         self.last_completed_turn_id = self.turn_counter
         self.assistant_speaking = False
+        # Both halves of the owner, together. Generation for this turn has
+        # ended, so the next response - and the next item - is a legitimate
+        # answer to whatever comes next.
         self.active_response_id = None
+        self.active_item_id = None
 
     def advance_stage(self) -> None:
         """Move the stage to match what the banking session now says.
