@@ -39,6 +39,23 @@ from app.realtime.turn_gate import (
 from app.sessions import SessionManager, SessionNotFoundError
 from app.sessions import session_manager as default_manager
 
+# How much the bank's own question response is allowed to say.
+#
+# Phase 7.4F. One short question - "may I have your demo customer ID?" - is a
+# handful of tokens, and the ceiling exists so that a model which starts
+# improvising on an owned response cannot hold the line with it. Generous enough
+# that a natural phrasing is never cut off mid-word, small enough that it cannot
+# become a monologue.
+#
+# Applies only to the three state-machine questions. Ordinary conversation is
+# untouched and keeps the session's own limits.
+OWNED_QUESTION_MAX_TOKENS = 120
+
+# What the metadata calls each question, and the only spellings the media
+# boundary will adopt. Kept here rather than built at the call site so the
+# sender and `PhoneCallBridge._on_raw_server_event` cannot drift apart.
+OWNED_QUESTION_KINDS = frozenset({"CUSTOMER_ID", "PIN", "ACCOUNT", "LOAN"})
+
 logger = logging.getLogger("app.realtime")
 
 # Where the per-call set of already-recorded turns lives on the session.
@@ -565,6 +582,7 @@ class RealtimeManager:
                 #
                 # Costs a dictionary lookup on a session already in memory when
                 # there is nothing outstanding, which is every event but one.
+                await self._ask_for_credential(connection)
                 await self._answer_completed_clarification(connection)
 
                 if on_event is None:
@@ -581,6 +599,154 @@ class RealtimeManager:
                 connection.banking_session_id,
                 type(error).__name__,
             )
+
+    async def _ask_for_credential(self, connection) -> None:
+        """Put the verification question to a caller who is owed one.
+
+        The authentication counterpart of `_answer_completed_clarification`,
+        and it is here for the same reason and at the same seam. A protected
+        enquiry is being held for a caller who is not verified, so the bank has
+        decided they must be asked for their demo customer ID or their PIN. Who
+        *delivers* that question decides whether anything downstream can tell
+        the question apart from the rest of what the model says, and Phase
+        7.4E's first pass left it to the model: the media boundary then counted
+        a harmless preface as the question and withheld the real one, so the
+        caller was asked nothing and waited in silence.
+
+        Delivered as a response the backend creates and owns - see
+        `_create_owned_question_response`. The wording still belongs to the
+        agent, exactly as the greeting and the closing line do:
+        `speech.credential_question_instructions` says what to ask, not what to
+        say.
+
+        Asked once. This method runs on every model event, so the mark on the
+        session - not a counter here - is what keeps one decision from becoming
+        a stream of questions. Set only after the send returns, so a failed
+        delivery is retried by the next event rather than lost, and released
+        only by a completed caller turn.
+
+        Cheap when there is nothing to do: a dictionary lookup on a session
+        already in memory.
+        """
+        from app import pending_credential
+        from app.agents import speech
+
+        session = self._manager.get_session(connection.banking_session_id)
+        owed = pending_credential.awaiting_question(session)
+        if owed is None:
+            return
+
+        instructions = speech.credential_question_instructions(owed)
+        if not instructions:
+            return
+
+        token = pending_credential.issue_owned_question(
+            session, owed, manager=self._manager
+        )
+        if token is None:
+            return
+
+        try:
+            await self._create_owned_question_response(
+                connection, kind=owed, token=token, instructions=instructions
+            )
+        except (AttributeError, TypeError):
+            # Not a delivery failure - a broken session object. Re-raised
+            # deliberately, and this is a lesson paid for: catching it here
+            # turned "the model session cannot accept a response.create at all"
+            # into a warning, and the question was then silently never asked on
+            # every call. Twenty of twenty-one test doubles lacked `.model`, so
+            # the whole suite went on passing while credential and clarification
+            # delivery was disabled, and only the four tests that actually
+            # assert the question reaches the model noticed.
+            #
+            # A transient send failure is worth recovering from. A session that
+            # is the wrong shape is a programming error and must be loud.
+            pending_credential.forget_owned_question(
+                session, manager=self._manager
+            )
+            raise
+        except Exception as error:
+            # The correlation is dropped, not left behind: a token nobody can
+            # confirm would refuse the next attempt's response as "already
+            # adopted". The question stays owed, so the next event tries again.
+            pending_credential.forget_owned_question(
+                session, manager=self._manager
+            )
+            logger.warning(
+                "realtime[%s] credential question could not be delivered: %s",
+                connection.banking_session_id,
+                type(error).__name__,
+            )
+            return
+
+        pending_credential.mark_question_asked(
+            session, owed, manager=self._manager
+        )
+
+    async def _create_owned_question_response(
+        self, connection, *, kind: str, token: str, instructions: str
+    ) -> None:
+        """Create the one response that carries a state-machine question.
+
+        Phase 7.4F. The bank asks its own questions through a response it
+        creates and can identify, rather than by injecting a cue as a caller
+        turn and hoping to recognise the result.
+
+        Every field is load-bearing:
+
+        `conversation: "none"`
+            Out-of-band. The question does not write to the default
+            conversation, so it cannot become the input that triggers a further
+            continuation.
+        `tool_choice: "none"` and `tools: []`
+            The installed API contract says a response contains at least one
+            item "and may have two, in which case the second will be a function
+            call". With tools off there is no function call, so the response
+            carries one assistant item - which is what removes the
+            preface-versus-duplicate ambiguity without inspecting a word of it.
+        `output_modalities: ["audio"]`
+            A telephone caller cannot read.
+        `max_output_tokens`
+            One short question needs very little, and a bound means a model that
+            starts improvising cannot hold the line.
+        `metadata`
+            The correlation. `response.created` echoes it, which is how the
+            backend learns the authoritative `response.id` - see
+            `PhoneCallBridge._on_raw_server_event`. Values are strings and carry
+            nothing about the caller: the question kind, our own token, and the
+            banking session id.
+
+        Sent through `session.model.send_event`, which the SDK documents as the
+        surface for direct interaction. A raw `response.create` routed this way
+        is registered `manual=True` by the SDK's own sequencer, so it is tracked
+        apart from the automatic responses turn detection and tool results
+        create.
+        """
+        from agents.realtime.model_inputs import RealtimeModelSendRawMessage
+
+        await connection.session.model.send_event(
+            RealtimeModelSendRawMessage(
+                message={
+                    "type": "response.create",
+                    "other_data": {
+                        "response": {
+                            "conversation": "none",
+                            "tool_choice": "none",
+                            "tools": [],
+                            "output_modalities": ["audio"],
+                            "max_output_tokens": OWNED_QUESTION_MAX_TOKENS,
+                            "instructions": instructions,
+                            "metadata": {
+                                "bank_question": kind,
+                                "token": token,
+                                "session": connection.banking_session_id,
+                            },
+                        }
+                    },
+                }
+            )
+        )
 
     async def _answer_completed_clarification(self, connection) -> None:
         """Run and deliver an enquiry the caller has just completed.
@@ -632,11 +798,39 @@ class RealtimeManager:
             # than lost.
             if pending_clarification.awaiting_question(session) is None:
                 return
+
+            instructions = speech.clarification_question_instructions(outstanding)
+            if not instructions:
+                return
+
+            token = pending_clarification.issue_owned_question(
+                session, manager=self._manager
+            )
+            if token is None:
+                return
+
             try:
-                await connection.session.send_message(
-                    speech.clarification_question_cue(outstanding)
+                await self._create_owned_question_response(
+                    connection,
+                    kind=outstanding.domain.value,
+                    token=token,
+                    instructions=instructions,
                 )
+            except (AttributeError, TypeError):
+                # A session that cannot accept a `response.create` is a
+                # programming error, not a delivery failure. See the credential
+                # branch: swallowing this silently disabled question delivery
+                # everywhere and left the suite green.
+                pending_clarification.forget_owned_question(
+                    session, manager=self._manager
+                )
+                raise
             except Exception as error:
+                # Drop the correlation so the next attempt can mint its own;
+                # a token nobody confirmed would refuse the next response.
+                pending_clarification.forget_owned_question(
+                    session, manager=self._manager
+                )
                 logger.warning(
                     "realtime[%s] clarification question could not be "
                     "delivered: %s",

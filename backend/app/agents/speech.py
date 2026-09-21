@@ -103,39 +103,75 @@ SILENCE_CHECK_SPEECH = "I do not hear anything from you. Do you want to continue
 SILENCE_CLOSING_CUE = "[The caller has been silent. Close the call now.]"
 
 
-def clarification_question_cue(pending) -> str:
-    """What is sent into a telephone session when the bank needs the caller to choose.
+# --- instructions for the bank's own question responses ---------------------
+#
+# Phase 7.4F. These are not cues injected as a caller turn any more. They are
+# the `instructions` field of a dedicated `response.create` the backend issues
+# and owns - see `app.pending_credential` and
+# `RealtimeManager._ask_for_credential`.
+#
+# The difference is the whole architecture. A cue asked the model to speak and
+# left the media boundary guessing which of its utterances had been the
+# question; two shapes were indistinguishable there:
+#
+#     one response, items [preface,  question]   item 2 must be heard
+#     one response, items [question, question]   item 2 must be dropped
+#
+# An owned response has a `response.id` the backend learns from
+# `response.created`, so the question needs no guessing - and with
+# `tool_choice: "none"` and `tools: []` the installed API contract says the
+# response carries one assistant item, because the documented second item is a
+# function call.
+#
+# The wording still belongs to the agent. These say *what to ask*, not what to
+# say, and they forbid the preamble that made the old shape ambiguous.
 
-    The counterpart to `clarified_answer_cue`, and the half Phase 7.4B left out.
-    That phase made *answering* a clarified enquiry deterministic and left
-    *asking* to the model, which is the same mistake Phase 7.3 fixed one step
-    earlier: three live calls on one build, one where the model happened to ask
-    and two where it did not and the caller was hung up on for silence with the
-    question still owed.
+_QUESTION_ASK = {
+    "CUSTOMER_ID": "Ask the caller for their demo customer ID.",
+    "PIN": "Ask the caller for their four-digit demo banking PIN.",
+    "ACCOUNT": "Ask the caller whether they mean Savings or Current.",
+    "LOAN": "Ask the caller which loan they mean.",
+}
 
-    A cue, not a sentence. The bank owns the decision - "this caller must now be
-    asked which account" - and the agent owns the wording, exactly as it owns
-    the greeting and the closing line. Writing the question here would put a
-    second voice in the system and make the telephone differ from the browser
-    for no reason a caller could see.
+# Appended to every one of them. The constraints are what keep the response to a
+# single spoken question, and they are stated as prohibitions because that is
+# what the old failure was made of: a preface, an acknowledgement, an
+# explanation, or a repeat.
+_QUESTION_ONLY = (
+    " Ask only that question. No greeting. No acknowledgement. No explanation. "
+    "No preamble. Do not call any tool. Do not repeat yourself. Say nothing "
+    "else."
+)
 
-    The instruction is deliberately imperative rather than informational. The
-    model has already had this same information handed to it as tool-result
-    metadata and declined to speak it; metadata is evidently not enough.
+
+def credential_question_instructions(credential: str) -> str:
+    """Instructions for the backend-owned credential question response.
+
+    Returns "" for anything that is not a credential this bank asks for, so a
+    caller can never be asked something the state machine did not decide on.
     """
+    asking = _QUESTION_ASK.get(credential)
+    if asking is None or credential not in ("CUSTOMER_ID", "PIN"):
+        return ""
+    return asking + _QUESTION_ONLY
+
+
+def clarification_question_instructions(pending) -> str:
+    """Instructions for the backend-owned clarification question response.
+
+    The choices come from the clarification the tool layer opened, so the caller
+    is offered exactly what the bank found and nothing invented.
+    """
+    asking = _QUESTION_ASK.get(getattr(pending.domain, "value", None))
+    if asking is None:
+        return ""
     choices = ", ".join(pending.choices) if pending.choices else ""
-    slot = {"ACCOUNT": "which account", "LOAN": "which loan"}.get(
-        pending.domain.value, "which one"
-    )
-    asking = f"Ask the caller {slot} they mean"
     if choices:
-        asking += f", offering exactly these and no others: {choices}"
-    return (
-        "[The bank needs one more detail before it can answer the enquiry the "
-        f"caller already made ({pending.tool}). {asking}. Say it now, in your "
-        "own words, as a short question. Do not answer the enquiry yet and do "
-        "not call any tool.]"
-    )
+        asking = (
+            f"Ask the caller which one they mean, offering exactly these and no "
+            f"others: {choices}."
+        )
+    return asking + _QUESTION_ONLY
 
 
 def clarified_answer_cue(result) -> str:

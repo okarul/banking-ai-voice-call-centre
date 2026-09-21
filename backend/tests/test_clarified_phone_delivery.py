@@ -135,6 +135,35 @@ def transcription_event(text, item_id="item-1"):
 _ITEM_IDS = iter(range(1, 10_000))
 
 
+class _RecordingModel:
+    """The `session.model` surface, recording what the backend sent.
+
+    Raw client events are kept rather than interpreted, so a test can assert on
+    what the bank asked for without this double deciding what it meant.
+    """
+
+    def __init__(self) -> None:
+        self.events: list = []
+
+    async def send_event(self, event) -> None:
+        self.events.append(event)
+
+    def payloads(self) -> list[dict]:
+        bodies = []
+        for event in self.events:
+            message = getattr(event, "message", None) or {}
+            if message.get("type") != "response.create":
+                continue
+            bodies.append((message.get("other_data") or {}).get("response") or {})
+        return bodies
+
+    def instructions(self) -> list[str]:
+        return [body.get("instructions", "") for body in self.payloads()]
+
+    def metadata(self) -> list[dict]:
+        return [body.get("metadata") or {} for body in self.payloads()]
+
+
 class ScriptedSession:
     """A model session that says what it is told and remembers what it is sent.
 
@@ -146,6 +175,13 @@ class ScriptedSession:
         self._transcripts = list(transcripts)
         self.sent: list[str] = []
         self.closed = False
+        # Phase 7.4F. The bank's own questions go out as a `response.create`
+        # through `session.model.send_event`, not as a caller turn through
+        # `send_message`. Every test here opens a clarification, so every one of
+        # them reaches that path - and production re-raises a missing `.model`
+        # rather than logging it, because a session of the wrong shape is a
+        # programming error, not a delivery failure.
+        self.model = _RecordingModel()
 
     async def __aiter__(self):
         for text in self._transcripts:
@@ -175,8 +211,16 @@ def pump(manager, session_id, transcripts):
 
 
 def delivered(scripted):
-    """Everything the backend pushed into the model session, as one string."""
-    return "\n".join(scripted.sent)
+    """Everything the backend pushed into the model session, as one string.
+
+    Both mechanisms, deliberately. Clarified *answers* still ride `send_message`;
+    the bank's own *questions* are Phase 7.4F `response.create` instructions. A
+    test asking "what did the backend put on this caller's behalf" means both,
+    and folding them together also means the privacy assertion in
+    `test_the_delivery_payload_carries_no_credential` now covers the new payload
+    as well as the old one.
+    """
+    return "\n".join(list(scripted.sent) + scripted.model.instructions())
 
 
 # --- the conversation, as production drives it ------------------------------

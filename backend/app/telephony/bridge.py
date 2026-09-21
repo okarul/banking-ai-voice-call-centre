@@ -93,6 +93,30 @@ _FINISHED_STATUSES = frozenset({"completed", "incomplete"})
 # `conversation.item.input_audio_transcription.failed`.
 FINAL_AGENT_TRANSCRIPT = "response.output_audio_transcript.done"
 
+# The server confirming a response exists, and the only event carrying its
+# authoritative id together with the metadata whoever created it supplied.
+#
+# Phase 7.4F reads it from the raw stream for the same reason the transcript
+# above is read there: the installed SDK consumes this event for its own
+# response sequencing and exposes no handle - `send_event` returns None - but
+# `_handle_ws_event` forwards every server event to listeners before filtering,
+# so both the id and our own correlation token do reach us.
+OWNED_RESPONSE_CREATED = "response.created"
+
+
+def _event_field(source, name: str):
+    """One field of a server event, whether it arrived as a dict or an object.
+
+    The raw stream is the provider's own JSON in some SDK versions and a parsed
+    model in others, and this area has already been bitten once by reading only
+    one of the two shapes. Neither form is trusted to be present.
+    """
+    if source is None:
+        return None
+    if isinstance(source, dict):
+        return source.get(name)
+    return getattr(source, name, None)
+
 
 class PhoneCallBridge:
     """The live audio path for exactly one telephone call."""
@@ -252,6 +276,13 @@ class PhoneCallBridge:
                 getattr(event, "item_id", None),
             ):
                 self.outbound.put(data)
+                # Nothing is marked here any more. The first pass of Phase
+                # 7.4E recorded "a credential prompt has been delivered" at
+                # this point, on the reasoning that this is where audio
+                # genuinely reaches the line - which is true, and still not the
+                # fact that was needed. It cannot tell a preface from the
+                # question. Ownership is taken in `_admit_response`, and only
+                # while the backend says a question is outstanding.
                 self.conversation.assistant_speaking = True
                 # More audio for this turn, so any boundary already asked about
                 # is stale: it was asked before this arrived.
@@ -276,6 +307,24 @@ class PhoneCallBridge:
             # active for ever and every later answer would be suppressed.
             self.conversation.active_response_id = None
             self.conversation.active_item_id = None
+            # And release the delivered-question owner, for exactly the reason
+            # above. An abandoned response must not keep a question owned: if it
+            # did, a response cut off before the caller heard a word would
+            # withhold every later attempt at that question, and the bank would
+            # never ask again.
+            #
+            # Safe in both directions. If the question *was* heard before the
+            # caller talked over it, they are answering it - which is the one
+            # event that legitimately ends the wait. If it was not heard, the
+            # question is still owed and the backend is free to put it again.
+            self.conversation.delivered_question_kind = None
+            self.conversation.delivered_question_response = None
+            self.conversation.delivered_question_item = None
+            # The owned response is abandoned too. Its id must not keep refusing
+            # everything else for the rest of the call, and a retry of the
+            # question will be a new response with a new token.
+            self.conversation.owned_question_kind = None
+            self.conversation.owned_question_response = None
             self.conversation.assistant_speaking = False
             # The turn is abandoned, so any boundary outstanding for it is
             # stale. A late acknowledgement must not complete a turn the
@@ -392,6 +441,145 @@ class PhoneCallBridge:
         dropping it would silence real answers on any SDK shape that omits
         these fields. Missing either half admits.
         """
+        # --- Phase 7.4E: the bank has asked, and is waiting ------------------
+        #
+        # Checked before anything else, because it is the only rule here that
+        # is not about telling one response from another. `_admit_response`
+        # otherwise reasons entirely within a turn, and this failure lives
+        # *between* turns: the bank asked for the demo customer ID, the turn
+        # ended properly, `get_authentication_status` ran, and the model
+        # started a new response saying the same thing. Every 7.4D guard was
+        # working and none of them had anything to say about it.
+        #
+        # **Refuse first, record second.** The order is the whole design.
+        #
+        # Recording is what makes this safe: the delivering response becomes
+        # the owner, and it is only ever taken while the *backend* says a
+        # question is genuinely outstanding. A harmless preface - spoken before
+        # the bank has decided to ask, or after the caller has answered - finds
+        # nothing outstanding, records nothing, and is heard. The first pass of
+        # this phase armed on "the bank spoke", could not tell a preface from
+        # the question, and withheld the real one; `app.pending_credential`
+        # explains why nothing at this boundary can recover that distinction.
+        #
+        # Refusing first is what keeps the question's own audio. Both
+        # `pending_credential.mark_question_asked` and 7.4C's
+        # `pending_clarification.mark_question_asked` fire when the *cue* is
+        # sent, before the model has generated a word - so by the time the
+        # question itself arrives a question is already outstanding, and a gate
+        # that asked only "is one outstanding" would silence it. It is admitted
+        # because no owner has been taken yet; everything after it is refused
+        # because one has.
+        #
+        # Continuing the response already playing is untouched either way,
+        # which is what keeps a streamed sentence whole. No text is examined.
+        # A closing call is no longer waiting for an answer, so a question the
+        # caller is never going to answer must not take its last words away.
+        #
+        # `_wait_for_silence` enters `CallState.CLOSING` *before* it asks the
+        # model for the closing line, so by the time that audio arrives here the
+        # call has genuinely decided to end - and without this the bank would
+        # ask a caller for their demo customer ID, get silence, and then sign
+        # off inaudibly. The same applies to an authentication ending, which
+        # arms its closure the same way.
+        #
+        # Read from the authoritative pair the rest of this class uses. It is
+        # state, not wording: a sentence that merely *reads* like a farewell,
+        # spoken while the call is still waiting, is the duplicate this phase
+        # exists to suppress and is still refused. An earlier draft of the test
+        # for this got that backwards and would have reinstated live call
+        # `ca88679d-2c32-1240-4790-eaa5afddeeef`.
+        closing = self.conversation.closing or self.lifecycle.closing
+
+        # --- Phase 7.4F: the bank's own question response ---------------------
+        #
+        # When the backend created the response that asks a state-machine
+        # question, identity is known rather than inferred, and that is what
+        # ends the ambiguity nothing at this boundary could resolve:
+        #
+        #     one response, items [preface,  question]   item 2 must be heard
+        #     one response, items [question, question]   item 2 must be dropped
+        #
+        # Those are indistinguishable when the boundary has to guess which
+        # utterance was the question. They are not remotely alike when the
+        # question has an id the bank was told at creation.
+        #
+        # Two states, deliberately different:
+        #
+        # *Before* `response.created` has been matched, the owned id is unknown.
+        # Foreign audio is still admitted - refusing it would risk silence on a
+        # call where the bank simply has not been confirmed yet - but it is not
+        # allowed to *become* the question, which is what the ownership record
+        # below is for.
+        #
+        # *After* the id is known, anything else is refused for as long as the
+        # question is being delivered or waited on. That covers the SDK's own
+        # tool-continuation response, which cannot be suppressed at its source:
+        # it may exist, it simply may not reach the caller as a second question.
+        owned_id = self.conversation.owned_question_response
+        if (
+            owned_id is not None
+            and not closing
+            and response_id is not None
+            and response_id != owned_id
+            and self.conversation.outstanding_question() is not None
+        ):
+            self.conversation.credential_prompts_suppressed += 1
+            logger.warning(
+                "bridge[%s] refused a foreign response while the bank's own %s "
+                "question was outstanding",
+                self.provider_call_id,
+                self.conversation.owned_question_kind,
+            )
+            return False
+
+        if (
+            owned_id is not None
+            and response_id == owned_id
+            and item_id is not None
+            and self.conversation.delivered_question_item is not None
+            and self.conversation.delivered_question_item != item_id
+        ):
+            # A second assistant item inside the owned response. The installed
+            # API contract says this cannot happen while `tool_choice` is "none"
+            # and `tools` is empty, because the documented second item is a
+            # function call. Counted loudly rather than accommodated: Phase
+            # 7.4D refuses it below exactly as it refuses any second item, no
+            # text is examined, and nothing here redefines that guard.
+            self.conversation.owned_question_contract_violations += 1
+            logger.error(
+                "bridge[%s] PROTOCOL CONTRACT VIOLATION: the owned %s question "
+                "response carried a second assistant item (%s after %s); it is "
+                "refused, and delivery falls back to the bounded retry",
+                self.provider_call_id,
+                self.conversation.owned_question_kind,
+                item_id,
+                self.conversation.delivered_question_item,
+            )
+
+        owner = self.conversation.delivered_question_kind
+        if (
+            owner is not None
+            and not closing
+            and response_id is not None
+            and response_id != self.conversation.delivered_question_response
+        ):
+            self.conversation.credential_prompts_suppressed += 1
+            logger.warning(
+                "bridge[%s] withheld a repeat of the %s question: the caller "
+                "has not answered yet",
+                self.provider_call_id,
+                owner,
+            )
+            return False
+
+        if owner is None:
+            outstanding = self.conversation.outstanding_question()
+            if outstanding is not None:
+                self.conversation.delivered_question_kind = outstanding
+                self.conversation.delivered_question_response = response_id
+                self.conversation.delivered_question_item = item_id
+
         if response_id is None:
             # Nothing to distinguish answers by at all. Admit it: dropping
             # audio on a stream that cannot be identified would silence real
@@ -488,6 +676,24 @@ class PhoneCallBridge:
         held = self._agent_turn
         if held is not None and held.get("status") in _FINISHED_STATUSES:
             self._flush_agent_turn()
+        # A question the bank cued and the caller never heard becomes owed
+        # again, so the pump can put it once more. Checked here because this is
+        # the end of a model turn: if no caller-visible audio claimed the
+        # question by now, none is coming for this turn.
+        #
+        # Before `on_generation_ended`, deliberately. That call can arm the
+        # silence timer, whose `_defer_for_unasked_question` predicate reads
+        # whether a question is still owed - so the revocation has to be visible
+        # to it rather than racing it.
+        recovered = self.conversation.question_delivery_failed()
+        if recovered is not None:
+            logger.warning(
+                "bridge[%s] the %s question reached no audio; it may be asked "
+                "again",
+                self.provider_call_id,
+                recovered,
+            )
+
         await self.lifecycle.on_generation_ended()
         await self._close_if_authentication_is_over()
         await self._request_playback_boundary()
@@ -613,6 +819,16 @@ class PhoneCallBridge:
             transcript = getattr(server_event, "transcript", None)
             item_id = getattr(server_event, "item_id", None)
 
+        if kind == OWNED_RESPONSE_CREATED:
+            # Phase 7.4F. The server confirming a response the *bank* created,
+            # and the only place its authoritative id can be learned. Read from
+            # the raw stream because the installed SDK consumes this event for
+            # its own sequencing and surfaces no handle - `send_event` returns
+            # None - but `_handle_ws_event` forwards every server event here
+            # before filtering, so the id and our metadata do arrive.
+            self._adopt_owned_question_response(server_event)
+            return
+
         if kind == FINAL_AGENT_TRANSCRIPT:
             self._note_agent_final_text(item_id, transcript or "")
             return
@@ -620,6 +836,82 @@ class PhoneCallBridge:
         if kind != "conversation.item.input_audio_transcription.completed":
             return
         self._on_caller_text(transcript or "")
+
+    def _adopt_owned_question_response(self, server_event) -> None:
+        """Bind a `response.created` to the question the bank asked, if it is ours.
+
+        Ownership is proved, never inferred from arrival order. Two responses can
+        exist at once - the SDK creates one of its own after every tool result,
+        and turn detection creates more - so "the next `response.created`" is
+        evidence of nothing.
+
+        Four things must agree before an id is adopted:
+
+        * the event carries a `response.id`;
+        * its metadata carries a token;
+        * the metadata names **this** banking session, so a response belonging to
+          another call can never be adopted here; and
+        * the token matches the attempt currently outstanding, which is what
+          rejects a stale token from an abandoned earlier attempt.
+
+        Anything else is ignored in silence. Refusing to adopt is safe: the
+        question simply stays undelivered, and the bounded recovery in
+        `app.pending_credential` asks again.
+        """
+        response = _event_field(server_event, "response")
+        response_id = _event_field(response, "id")
+        metadata = _event_field(response, "metadata") or {}
+
+        if isinstance(metadata, dict):
+            token = metadata.get("token")
+            claimed_session = metadata.get("session")
+            kind = metadata.get("bank_question")
+        else:
+            token = _event_field(metadata, "token")
+            claimed_session = _event_field(metadata, "session")
+            kind = _event_field(metadata, "bank_question")
+
+        if not response_id or not token:
+            return
+        if claimed_session != self.banking_session_id:
+            # Not this call's question. Never adopt across sessions.
+            return
+
+        from app import pending_clarification, pending_credential
+
+        session = self.conversation._session()
+
+        if kind in ("CUSTOMER_ID", "PIN"):
+            adopted = pending_credential.adopt_owned_response(
+                session,
+                token=token,
+                response_id=response_id,
+                manager=self.conversation.session_manager,
+            )
+        elif kind in ("ACCOUNT", "LOAN"):
+            adopted = pending_clarification.adopt_owned_response(
+                session,
+                token=token,
+                response_id=response_id,
+                manager=self.conversation.session_manager,
+            )
+        else:
+            return
+
+        if adopted is None:
+            logger.warning(
+                "bridge[%s] declined a %s response that did not match the "
+                "outstanding question",
+                self.provider_call_id,
+                kind,
+            )
+            return
+
+        self.conversation.owned_question_kind = kind
+        self.conversation.owned_question_response = adopted
+        logger.info(
+            "bridge[%s] owns the %s question response", self.provider_call_id, kind
+        )
 
     def _on_caller_text(self, text: str) -> None:
         """Everything the caller said, however it reached us.
@@ -641,6 +933,23 @@ class PhoneCallBridge:
         """
         if not text:
             return
+
+        # A completed caller turn, and therefore the one event that releases
+        # the bank to speak again when it has been waiting for a credential.
+        #
+        # Here rather than on the transcription branch, which is where Phase
+        # 7.4E first put it. This method's own docstring is the reason: the
+        # same sentence arrives as a raw transcription event, a `history_added`
+        # user item, or a `history_updated` snapshot with no `history_added` at
+        # all. A release wired to one representation would leave a caller whose
+        # words came by another route waiting on a bank that had decided to
+        # stop speaking to them - which is a worse failure than the duplicate
+        # this phase set out to fix.
+        #
+        # Empty text returns above, so an unintelligible turn is not an answer
+        # and does not release anything.
+        self.conversation.caller_supplied_a_turn()
+
         self.conversation.last_user_turn = text
         self._read_caller_intent(text)
 

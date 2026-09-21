@@ -122,6 +122,38 @@ def transcription_event(text):
     )
 
 
+class _RecordingModel:
+    """The `session.model` surface the SDK exposes for direct interaction.
+
+    Records the raw client events the backend sends rather than interpreting
+    them, so a test can assert on what the bank actually asked for.
+    """
+
+    def __init__(self) -> None:
+        self.events: list = []
+
+    async def send_event(self, event) -> None:
+        self.events.append(event)
+
+    def payloads(self) -> list[dict]:
+        """The `response.create` bodies, in order."""
+        bodies = []
+        for event in self.events:
+            message = getattr(event, "message", None) or {}
+            if message.get("type") != "response.create":
+                continue
+            body = (message.get("other_data") or {}).get("response") or {}
+            bodies.append(body)
+        return bodies
+
+    def instructions(self) -> list[str]:
+        """What each owned question response was told to ask."""
+        return [body.get("instructions", "") for body in self.payloads()]
+
+    def metadata(self) -> list[dict]:
+        return [body.get("metadata") or {} for body in self.payloads()]
+
+
 class SilentModel:
     """A model that produces events but never asks and never calls a tool.
 
@@ -140,6 +172,14 @@ class SilentModel:
     def __init__(self, transcripts=()):
         self._transcripts = list(transcripts)
         self.sent: list[str] = []
+        # Phase 7.4F. The bank's own questions are no longer injected as a
+        # caller turn through `send_message`; they are a `response.create` the
+        # backend issues and owns, sent through `session.model.send_event`. A
+        # double without this attribute does not merely miss the new path - it
+        # raises `AttributeError` inside the pump, which production now re-raises
+        # rather than logging, because a session of the wrong shape is a
+        # programming error and not a delivery failure.
+        self.model = _RecordingModel()
 
     async def __aiter__(self):
         if self._transcripts:
@@ -174,7 +214,20 @@ def pump(manager, session_id, transcripts=()):
 
 
 def delivered(model):
-    return "\n".join(model.sent)
+    """Everything the backend pushed to the model, however it pushed it.
+
+    Two mechanisms now, and both belong here because these tests are about
+    whether the *caller* is served, not about which call the backend made:
+
+    * `send_message` - still how a clarified **answer** is handed back.
+    * `session.model.send_event` - Phase 7.4F, how the bank's own **questions**
+      are asked, as a dedicated `response.create` whose instructions say what to
+      ask and whose metadata carries the correlation token.
+
+    Flattened into one string so the assertions read the same as they always
+    did: what reached the model on this caller's behalf.
+    """
+    return "\n".join(list(model.sent) + model.model.instructions())
 
 
 def tool(manager, session_id, name, arguments=None):
@@ -232,15 +285,63 @@ def test_the_bank_asks_which_account_without_another_caller_turn(
     # was none - the caller was waiting to be asked.
     spoken = pump(manager, session_id)
 
-    assert spoken.sent, (
+    payload = delivered(spoken)
+    assert payload, (
         "the bank decided it needed to know which account and said nothing. "
         "The caller waited, the silence timer armed, and they were hung up on "
         "with the question still owed - live calls B and C."
     )
-    payload = delivered(spoken)
     assert "Savings" in payload and "Current" in payload, (
         f"the caller was not offered the choices: {payload!r}"
     )
+
+
+def test_the_owned_question_response_carries_the_constraints_it_relies_on(manager):
+    """Phase 7.4F's payload contract, asserted rather than assumed.
+
+    The whole architecture rests on one documented API guarantee: a response
+    "will include at least one Item, and may have two, in which case the second
+    will be a function call". With tools switched off there is no function call,
+    so the response carries a single assistant item - and that is what removes
+    the preface-versus-duplicate ambiguity without reading a word of what was
+    said.
+
+    Every field below is what buys that, so every field is checked. Until this
+    test existed the constraints were asserted only in prose, which is worth
+    nothing if a later edit quietly drops one.
+    """
+    session_id, _ = held_enquiry_then_verify(
+        manager, "DEMO001", "I want to know my account balance."
+    )
+
+    spoken = pump(manager, session_id)
+
+    payloads = spoken.model.payloads()
+    assert payloads, "the bank's question did not go out as a response.create"
+    body = payloads[-1]
+
+    # Out-of-band: the question must not become input that triggers a further
+    # continuation of its own.
+    assert body["conversation"] == "none"
+    # No tools, so no function-call item, so one assistant item.
+    assert body["tool_choice"] == "none"
+    assert body["tools"] == []
+    # A telephone caller cannot read.
+    assert body["output_modalities"] == ["audio"]
+    # Bounded, so a model that starts improvising cannot hold the line.
+    assert isinstance(body["max_output_tokens"], int)
+    assert 0 < body["max_output_tokens"] <= 4096
+    # And the correlation the media boundary needs to prove the response is ours.
+    metadata = body["metadata"]
+    assert metadata["bank_question"] == "ACCOUNT"
+    assert metadata["session"] == session_id
+    assert isinstance(metadata["token"], str) and metadata["token"]
+
+    # The instructions say what to ask and forbid the preamble that made the old
+    # shape ambiguous. No credential, and nothing the caller said, ever appears.
+    instructions = body["instructions"]
+    assert "Savings" in instructions and "Current" in instructions
+    assert PINS["DEMO001"] not in instructions
 
 
 def test_the_question_is_asked_before_silence_can_close_the_call(manager):

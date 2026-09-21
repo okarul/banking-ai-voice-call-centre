@@ -377,6 +377,268 @@ def mark_question_asked(
     )
 
 
+# Attempts already made at delivering a clarification question and revoked as
+# undelivered. Held beside the clarification rather than inside it, because
+# `question_asked` is Phase 7.4C's committed state and its meaning is not being
+# changed: it records that the *cue was submitted to the model*, which is what
+# its own docstring says and what the retry-on-failed-send ordering depends on.
+#
+# What it cannot say is whether the caller heard anything. That is the gap this
+# budget covers, and the same bound as `pending_credential.MAX_QUESTION_ATTEMPTS`
+# applies for the same reason in both directions: without it an undelivered
+# question is never asked again, and with an unlimited one it is asked for ever.
+CLARIFICATION_ATTEMPTS_KEY = "clarification_question_attempts"
+
+# The backend-owned clarification question response, and the token that proves
+# it is ours. Phase 7.4F, and the exact counterpart of
+# `pending_credential._OWNED_KEY` - see that module for why correlation lives in
+# its own key rather than inside the clarification record.
+#
+# Kept out of the record deliberately: `PendingClarification` is a frozen
+# dataclass reconstructed field-by-field by `recall`, and two of the four
+# writers build the stored dict as a literal. A new field inside it would be
+# silently dropped by those two, which is exactly the class of bug this phase
+# has been chasing. Phase 7.4C's committed record is untouched.
+CLARIFICATION_OWNED_KEY = "clarification_question_owned"
+
+MAX_QUESTION_ATTEMPTS = 2
+
+
+def issue_owned_question(
+    session: Session | None, *, manager: SessionManager | None = None
+) -> str | None:
+    """Mint the correlation token for the owned clarification response."""
+    if session is None:
+        return None
+    pending = recall(session)
+    if pending is None or pending.complete:
+        return None
+
+    import uuid
+
+    token = uuid.uuid4().hex
+    _write(
+        session,
+        manager,
+        {"domain": pending.domain.value, "token": token, "response_id": None},
+    )
+    return token
+
+
+def owned_question(session: Session | None) -> dict | None:
+    """The owned clarification response for this call, or None."""
+    if session is None:
+        return None
+    value = session.conversation_context.get(CLARIFICATION_OWNED_KEY)
+    if not isinstance(value, dict):
+        return None
+    token = value.get("token")
+    if not isinstance(token, str) or not token:
+        return None
+    response_id = value.get("response_id")
+    return {
+        "domain": value.get("domain"),
+        "token": token,
+        "response_id": response_id if isinstance(response_id, str) else None,
+    }
+
+
+def adopt_owned_response(
+    session: Session | None,
+    *,
+    token: str | None,
+    response_id: str | None,
+    manager: SessionManager | None = None,
+) -> str | None:
+    """Bind `response.created`'s id to the clarification question, if ours.
+
+    Refuses on a missing, stale or foreign token, on a missing id, and on an
+    attempt that has already adopted one. Never assigns from event order.
+    """
+    owned = owned_question(session)
+    if owned is None or not token or not response_id:
+        return None
+    if owned["token"] != token:
+        return None
+    if owned["response_id"] is not None:
+        return None
+
+    _write(
+        session,
+        manager,
+        {
+            "domain": owned["domain"],
+            "token": owned["token"],
+            "response_id": response_id,
+        },
+    )
+    return response_id
+
+
+def forget_owned_question(
+    session: Session | None, *, manager: SessionManager | None = None
+) -> None:
+    """Drop the correlation, because this attempt is over."""
+    if session is None:
+        return
+    if CLARIFICATION_OWNED_KEY not in session.conversation_context:
+        return
+    _write(session, manager, None)
+
+
+def _write(session: Session, manager: SessionManager | None, value) -> None:
+    """Write or remove the owned-question key."""
+    context = dict(session.conversation_context)
+    if value is None:
+        context.pop(CLARIFICATION_OWNED_KEY, None)
+    else:
+        context[CLARIFICATION_OWNED_KEY] = value
+
+    if manager is None:
+        session.conversation_context = context
+        return
+    try:
+        manager.update_session(session.session_id, conversation_context=context)
+    except SessionNotFoundError:
+        # The call ended mid-turn. There is nothing left to remember it for.
+        return
+
+
+def question_attempts(session: Session | None) -> int:
+    """How many times this clarification question has been cued to the model."""
+    if session is None:
+        return 0
+    value = session.conversation_context.get(CLARIFICATION_ATTEMPTS_KEY)
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def delivery_failed(
+    session: Session | None, *, manager: SessionManager | None = None
+) -> bool:
+    """A turn ended without the caller hearing the clarification. Allow one more.
+
+    Additive to Phase 7.4C rather than a change to it. `question_asked` stays
+    exactly what it was - the cue was submitted - and this revokes it only when
+    a turn has ended with nothing caller-visible delivered, and only while the
+    attempt budget lasts.
+
+    Returns whether the question became owed again.
+    """
+    if session is None:
+        return False
+
+    pending = recall(session)
+    if pending is None or pending.complete or not pending.question_asked:
+        return False
+
+    spent = question_attempts(session) or 1
+    if spent >= MAX_QUESTION_ATTEMPTS:
+        return False
+
+    context = dict(session.conversation_context)
+    context[CLARIFICATION_ATTEMPTS_KEY] = spent + 1
+    raw = context.get(PENDING_CLARIFICATION_KEY)
+    if not isinstance(raw, dict):
+        return False
+    revoked = dict(raw)
+    revoked["question_asked"] = False
+    context[PENDING_CLARIFICATION_KEY] = revoked
+
+    if manager is None:
+        session.conversation_context = context
+    else:
+        try:
+            manager.update_session(
+                session.session_id, conversation_context=context
+            )
+        except SessionNotFoundError:
+            return False
+    return True
+
+
+def reset_delivery_attempts(
+    session: Session | None, *, manager: SessionManager | None = None
+) -> bool:
+    """A caller turn ended one waiting period, so start the next one clean.
+
+    Called on every completed caller turn. It touches **only** the delivery
+    bookkeeping - the clarification itself, its choices, its carried arguments
+    and any answer already supplied are left exactly as they are.
+
+    Two things happen, and only while the question is still genuinely
+    unanswered:
+
+    * the undelivered-attempt budget is dropped, because it belongs to the
+      waiting period that has just ended; and
+    * `question_asked` is re-armed, so the bank may put the question once more.
+
+    **Why re-arming is necessary rather than tidy.** Trace an unusable answer:
+
+        bank    "Which account would you like, Savings or Current?"
+        caller  "I don't know."
+
+    `scope.classify_scope` reports no value for that turn - it is neither a
+    choice nor one of the non-choosing replies - so `turn_gate._apply_slot_answer`
+    returns having changed nothing. The clarification stays open and
+    `question_asked` stays True, which makes `awaiting_question` return None, so
+    `RealtimeManager._answer_completed_clarification` declines to act and the
+    bank never asks again. `scope.py` says outright that the caller should be
+    "asked again with the choices"; nothing implemented that. Only
+    `delivery_failed` revoked the flag, and that is for a question the caller
+    never *heard*, which is a different situation entirely.
+
+    **Why it is safe on the other outcomes.**
+
+    * A valid answer has already been applied by `record_decision`, which the
+      pump runs before the bridge sees the transcript, so `complete` is True and
+      `awaiting_question` returns None whatever this flag says. Nothing is
+      re-asked and the completed result is untouched.
+    * A goodbye or a hostile turn has already had the whole clarification
+      cleared by `record_decision`, so there is nothing here to re-arm.
+    * A turn naming a new enquiry cleared it too, for the same reason.
+
+    Returns whether the question was re-armed.
+    """
+    if session is None:
+        return False
+
+    context = dict(session.conversation_context)
+    raw = context.get(PENDING_CLARIFICATION_KEY)
+    had_attempts = CLARIFICATION_ATTEMPTS_KEY in context
+
+    pending = recall(session)
+    re_arm = (
+        pending is not None
+        and not pending.complete
+        and pending.question_asked
+        and isinstance(raw, dict)
+    )
+
+    if not re_arm and not had_attempts:
+        return False
+
+    context.pop(CLARIFICATION_ATTEMPTS_KEY, None)
+    # The previous attempt's owned response is finished with: the caller has
+    # spoken, and a re-ask is a new response with a new token.
+    context.pop(CLARIFICATION_OWNED_KEY, None)
+    if re_arm:
+        revoked = dict(raw)
+        revoked["question_asked"] = False
+        context[PENDING_CLARIFICATION_KEY] = revoked
+
+    if manager is None:
+        session.conversation_context = context
+    else:
+        try:
+            manager.update_session(
+                session.session_id, conversation_context=context
+            )
+        except SessionNotFoundError:
+            # The call ended mid-turn. Nothing left to ask, nobody to ask it.
+            return False
+    return re_arm
+
+
 def awaiting_question(session: Session | None) -> PendingClarification | None:
     """A clarification the bank has decided on and not yet put to the caller.
 
@@ -391,12 +653,40 @@ def awaiting_question(session: Session | None) -> PendingClarification | None:
 
 
 def clear(session: Session | None, *, manager: SessionManager | None = None) -> None:
-    """Forget the outstanding question. Safe when there is none."""
+    """Forget the outstanding question. Safe when there is none.
+
+    The undelivered-delivery budget goes with it, because it belongs to this
+    clarification's waiting period and to nothing else. Left behind, it outlived
+    the question it was counting: `CLARIFICATION_ATTEMPTS_KEY` had no reader that
+    ever removed it, so one clarification that failed to reach the caller spent
+    the budget for **every** later clarification on the call - each one then got
+    `delivery_failed() -> False` on its first failure and no recovery at all.
+    """
     if session is None:
         return
-    if PENDING_CLARIFICATION_KEY not in session.conversation_context:
+
+    context = dict(session.conversation_context)
+    had_pending = PENDING_CLARIFICATION_KEY in context
+    had_attempts = CLARIFICATION_ATTEMPTS_KEY in context
+    had_owned = CLARIFICATION_OWNED_KEY in context
+    if not had_pending and not had_attempts and not had_owned:
         return
-    _store(session, manager, None)
+
+    context.pop(PENDING_CLARIFICATION_KEY, None)
+    context.pop(CLARIFICATION_ATTEMPTS_KEY, None)
+    # And the owned response correlation, for the same reason the credential
+    # side drops its own: a response created for a question that no longer
+    # exists must not be admitted later.
+    context.pop(CLARIFICATION_OWNED_KEY, None)
+
+    if manager is None:
+        session.conversation_context = context
+        return
+    try:
+        manager.update_session(session.session_id, conversation_context=context)
+    except SessionNotFoundError:
+        # The call ended mid-turn. There is nothing left to remember it for.
+        return
 
 
 def take(
